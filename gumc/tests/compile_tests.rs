@@ -1946,6 +1946,23 @@ fn a_fixed_array_of_structs_across_the_abi_is_rejected() {
 }
 
 #[test]
+fn an_enum_param_decodes_from_one_word() {
+    // An enum is a uint8 on the wire but [tag][payload] in memory, so it is rebuilt from one word rather than copied out of two.
+    // Copying 64 bytes read the next argument as the payload, and left the argument after it reading past the end of calldata as zero.
+    let src = "enum S:\n    A\n    B\n\ncontract C:\n    export fn f(S s, u256 x) -> u256:\n        return x\n";
+    assert_output_contains(src, "let param_s := make_enum(and(calldataload(4), 0xff), 0)");
+    assert_output_contains(src, "let param_x := calldataload(36)");
+}
+
+#[test]
+fn an_enum_with_a_payload_across_the_abi_is_rejected() {
+    // uint8 carries the tag and nothing else, so a payload has nowhere to go.
+    assert_compile_fails("enum E:\n    Bare\n    Carrying(u256)\n\ncontract C:\n    export fn f(E e) -> u256:\n        return 1\n");
+    // A plain enum stays fine.
+    assert_compiles("enum S:\n    A\n    B\n\ncontract C:\n    export fn f(S s) -> S:\n        return s\n");
+}
+
+#[test]
 fn a_struct_across_the_abi_is_accepted() {
     // Declaration order is ABI order while memory order is widest-first, so this also pins that the two are allowed to disagree.
     assert_compiles("use gum.defaults.Account

@@ -352,6 +352,8 @@ const GUM_STRUCT_CTOR: &str = include_str!("fixtures/gum_struct_ctor.gum");
 const GUM_STRUCT_DEPLOY: &str = include_str!("fixtures/gum_struct_deploy.gum");
 const GUM_IFACE_CALL: &str = include_str!("fixtures/gum_iface_call.gum");
 const GUM_MSG_BLOCK: &str = include_str!("fixtures/gum_msg_block.gum");
+const GUM_ENUM_ABI: &str = include_str!("fixtures/gum_enum_abi.gum");
+const SOL_ENUM_ABI: &str = include_str!("fixtures/sol_enum_abi.sol");
 const SOL_MSG_BLOCK: &str = include_str!("fixtures/sol_msg_block.sol");
 const GUM_STARR_ABI: &str = include_str!("fixtures/gum_starr_abi.gum");
 const SOL_STARR_ABI: &str = include_str!("fixtures/sol_starr_abi.sol");
@@ -4635,5 +4637,65 @@ fn message_and_block_read_the_same_state_as_solidity() {
         let sr = call(&mut sdb, s, encode(f, &[]));
         assert!(gr.success, "gum {} reverted", f);
         assert_eq!(gr.output, sr.output, "{} differs from solidity", f);
+    }
+}
+
+// An enum is one uint8 word on the wire but a pointer to [tag][payload] in memory, so every boundary converts.
+// The decoder used to copy size_of(enum) = 64 bytes, which ate the *next* argument as the payload and left every later one reading past calldata as zero, and the return handed back the memory pointer instead of the tag. Both looked fine: right selector, right ABI, wrong numbers.
+#[test]
+fn enums_cross_the_abi_like_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(GUM_ENUM_ABI, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(SOL_ENUM_ABI, &solc));
+
+    // An argument after an enum. This is the one that returned 0.
+    for tag in [0u64, 1, 2] {
+        let d = encode("after_enum(uint8,uint256)", &[U256::from(tag), U256::from(42u64)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert!(gr.success, "after_enum reverted");
+        assert_eq!(gr.output, sr.output, "after_enum({}) differs from solidity", tag);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(42u64), "the argument after an enum survives");
+    }
+
+    // An enum between two arguments: both neighbours have to land.
+    let d = encode("between(uint256,uint8,uint256)", &[U256::from(7u64), U256::from(1u64), U256::from(9u64)]);
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert_eq!(gr.output, sr.output, "between differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(16u64), "7 + 9 across an enum");
+
+    // The tag itself still reaches match.
+    for (tag, want) in [(0u64, 10u64), (1, 20), (2, 30)] {
+        let d = encode("tag(uint8)", &[U256::from(tag)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.output, sr.output, "tag({}) differs from solidity", tag);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "match on tag {}", tag);
+    }
+
+    // Returning an enum: the tag, not a memory pointer.
+    for tag in [0u64, 1, 2] {
+        let d = encode("echo(uint8)", &[U256::from(tag)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.output, sr.output, "echo({}) differs from solidity", tag);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(tag), "echo returns the tag");
+    }
+
+    for (x, want) in [(0u64, 0u64), (5, 2)] {
+        let d = encode("pick(uint256)", &[U256::from(x)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.output, sr.output, "pick({}) differs from solidity", x);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "pick returns a tag");
     }
 }

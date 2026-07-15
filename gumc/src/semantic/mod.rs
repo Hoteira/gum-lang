@@ -613,7 +613,26 @@ impl TypeChecker {
                 }
                 None
             };
+            // An enum crosses as uint8, which carries the tag and nothing else, so a variant with a payload has nowhere to put it.
+            let payload_enum = |t: &Type| -> bool {
+                match t {
+                    Type::Primitive(n) => self
+                        .loaded_enums
+                        .get(n)
+                        .map(|e| e.variants.iter().any(|v| v.payload.is_some()))
+                        .unwrap_or(false),
+                    _ => false,
+                }
+            };
             let check = |t: &Type, what: String, errors: &mut Vec<String>| {
+                if payload_enum(t) {
+                    errors.push(format!(
+                        "Semantic Error: {} has no ABI encoding: an enum crosses the ABI as a uint8 tag, and '{}' has a variant carrying a payload, which there is nowhere to put. Pass the payload as its own parameter.",
+                        what,
+                        type_name(t)
+                    ));
+                    return;
+                }
                 if let Some(fs) = struct_fields(t) {
                     if fs.is_empty() || !fs.iter().all(&elem_ok) {
                         errors.push(format!(

@@ -5,7 +5,7 @@ pub mod abi;
 use crate::ast::*;
 use crate::semantic::TypeChecker;
 use layout::{immutable_key, LayoutEngine};
-use translator::{immutable_deploy_local, immutable_local, is_str_type, is_struct_type, Ctx, SelfCtx, Translator};
+use translator::{immutable_deploy_local, immutable_local, is_enum_type, is_str_type, is_struct_type, Ctx, SelfCtx, Translator};
 use abi::AbiGenerator;
 use std::collections::{HashMap, HashSet};
 
@@ -572,6 +572,16 @@ impl EvmYulBackend {
                         offset += 32;
                         continue;
                     }
+                    // Same as the dispatcher: one wire word holding the tag, rebuilt into the [tag][payload] pair the body expects.
+                    if is_enum_type(layout_engine.type_checker, &p.type_def) {
+                        translator.require_make_enum();
+                        yul.push_str(&format!(
+                            "    let {} := make_enum(and(mload(add(args_mem, {})), 0xff), 0)\n",
+                            arg_name, offset
+                        ));
+                        offset += 32;
+                        continue;
+                    }
                     if let Type::Primitive(name) = &p.type_def {
                         if is_struct_type(layout_engine.type_checker, &p.type_def) {
                             if let Some((helper, wire)) = translator.ensure_abi_struct_mem(name) {
@@ -780,6 +790,18 @@ impl EvmYulBackend {
                                 offset += 32;
                                 continue;
                             }
+                        }
+
+                        // An enum is one uint8 word on the wire holding the tag, but a pointer to [tag][payload] in memory, so it is rebuilt rather than copied.
+                        // Copying size_of(enum) = 64 bytes instead read the *next* argument as the payload and then read every later one past the end of calldata as zero.
+                        if is_enum_type(layout_engine.type_checker, &p.type_def) {
+                            translator.require_make_enum();
+                            yul.push_str(&format!(
+                                "          let {} := make_enum(and(calldataload({}), 0xff), 0)\n",
+                                arg_name, offset
+                            ));
+                            offset += 32;
+                            continue;
                         }
 
                         // A static struct is inline in the head, so it advances the cursor by its whole wire width rather than the one word an offset would take.

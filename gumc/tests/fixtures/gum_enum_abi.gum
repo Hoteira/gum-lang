@@ -1,0 +1,29 @@
+enum Status:
+    Active
+    Paused
+    Closed
+
+contract C:
+    export fn after_enum(Status s, u256 x) -> u256:
+        return x
+
+    export fn between(u256 a, Status s, u256 b) -> u256:
+        return a + b
+
+    export fn tag(Status s) -> u256:
+        match s:
+            Active:
+                return 10
+            Paused:
+                return 20
+            Closed:
+                return 30
+        return 0
+
+    export fn echo(Status s) -> Status:
+        return s
+
+    export fn pick(u256 x) -> Status:
+        if x == 0:
+            return Status.Active
+        return Status.Closed

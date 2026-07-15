@@ -67,6 +67,11 @@ pub fn is_str_type(t: &Type) -> bool {
     matches!(t, Type::Primitive(n) if n == "String" || n == "Bytes")
 }
 
+// Whether t is a user enum. An enum value is a pointer to [tag: 32][payload: 32] in memory, but it crosses the ABI as a single uint8 word holding the tag, so every boundary has to convert rather than pass the pointer through.
+pub fn is_enum_type(tc: &TypeChecker, t: &Type) -> bool {
+    matches!(t, Type::Primitive(n) if tc.loaded_enums.contains_key(n))
+}
+
 // Materializes a compile-time-known string into ptr as a String value.
 //
 // The content is written a **word at a time** (one mstore per 32 chars),
@@ -1767,6 +1772,11 @@ impl<'a> Translator<'a> {
         self.ensure_helper("bytes_copy", bytes_copy_helper_src);
     }
 
+    // For the dispatcher's parameter loop, which builds an enum from its wire word rather than going through translate_expr.
+    pub fn require_make_enum(&self) {
+        self.ensure_helper("make_enum", make_enum_helper_src);
+    }
+
     // Exposed for codegen/mod.rs's dispatcher parameter-loading loop, which
     // masks each incoming narrow-int argument down to its declared width in
     // case a non-conforming caller sent dirty high bits (see mask_for_type).
@@ -1995,6 +2005,8 @@ impl<'a> Translator<'a> {
                 let mut fixed_array: Option<(usize, usize)> = None;
                 let mut struct_ret: Option<(String, usize)> = None;
                 let mut struct_arr_ret: Option<(String, String)> = None;
+                // An enum returns as its uint8 tag. val_expr is a pointer to [tag][payload], so returning it raw handed the caller a memory address.
+                let mut enum_ret = false;
                 if let Some(ret_ty) = &ctx.return_type {
                     val_expr = mask_for_type(&val_expr, ret_ty);
                     if let Type::Primitive(name) = ret_ty {
@@ -2003,6 +2015,9 @@ impl<'a> Translator<'a> {
                         }
                         if ctx.is_entry && is_struct_type(self.type_checker(), ret_ty) {
                             struct_ret = self.ensure_abi_struct_put(name);
+                        }
+                        if ctx.is_entry && is_enum_type(self.type_checker(), ret_ty) {
+                            enum_ret = true;
                         }
                     }
                     if let Type::Array(inner) = ret_ty {
@@ -2091,6 +2106,8 @@ impl<'a> Translator<'a> {
                             val = val_expr,
                             lock_clear = lock_clear
                         )
+                    } else if enum_ret {
+                        format!("mstore(0, mload({}))\n{}return(0, 32)\n", val_expr, lock_clear)
                     } else {
                         format!("mstore(0, {})\n{}return(0, 32)\n", val_expr, lock_clear)
                     }
@@ -4389,6 +4406,14 @@ impl<'a> Translator<'a> {
             o
         };
 
+        // A returned enum arrives as its uint8 tag and has to be rebuilt into the [tag][payload] pair, or the caller would use the tag itself as a memory address.
+        if is_enum_type(self.type_checker(), t) {
+            self.ensure_helper("make_enum", make_enum_helper_src);
+            let mut o = String::from("    if lt(returndatasize(), 32) { revert(0, 0) }\n");
+            o.push_str("    returndatacopy(0, 0, 32)\n");
+            o.push_str("    result := make_enum(and(mload(0), 0xff), 0)\n");
+            return o;
+        }
         if is_str_type(t) {
             self.ensure_helper("gum_abi_str_mem", gum_abi_str_mem_helper_src);
             return decode(
