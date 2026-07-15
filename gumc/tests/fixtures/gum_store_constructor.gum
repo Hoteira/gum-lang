@@ -1,0 +1,8 @@
+contract Store:
+    u256 value
+
+    fn new(u256 x):
+        self.value = x
+
+    export fn get() -> u256:
+        return Store.value

@@ -1,0 +1,34 @@
+# Rust build output. Large and fully reproducible from source.
+/gumc/target/
+**/*.rs.bk
+
+# Cargo.lock is committed: gumc is a binary, and a pinned dependency graph is
+# what makes a build reproducible for whoever clones this.
+
+# The Solidity compiler, used to assemble Yul into bytecode and to build the
+# reference contracts the differential tests diff against. It is a ~10 MB
+# third-party binary, not part of this source tree: fetch your own and drop it
+# at tools/solc.exe, or pass --solc. Tests that need it skip when it is absent.
+/tools/*
+!/tools/README.md
+
+# Compiler output
+*.yul
+*.abi.json
+*.hex
+yul_output.txt
+
+# Storage layout lockfiles are per-deployment, not per-repo. Commit the one for
+# a contract you have actually deployed, deliberately, and not by accident.
+*.lock.json
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code local state
+.claude/

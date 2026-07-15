@@ -1,0 +1,17 @@
+contract C:
+    [u256] items
+
+    export fn push_val(u256 v):
+        C.items.push(v)
+
+    export fn set_at(u256 i, u256 v):
+        C.items[i] = v
+
+    export fn get(u256 i) -> u256:
+        return C.items[i]
+
+    export fn len() -> u256:
+        return C.items.length
+
+    export fn pop_val():
+        C.items.pop()

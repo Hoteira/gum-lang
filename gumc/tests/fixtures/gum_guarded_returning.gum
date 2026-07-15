@@ -1,0 +1,12 @@
+use gum.defaults.Account
+
+interface ICallback:
+    fn ping() -> bool
+
+contract V:
+    u256 counter
+
+    export fn poke(Account cb) -> u256:
+        V.counter = V.counter + 1
+        assert(ICallback(cb).ping(), "cb failed")
+        return V.counter

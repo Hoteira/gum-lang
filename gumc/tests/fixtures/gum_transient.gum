@@ -1,0 +1,61 @@
+use gum.defaults.Account
+use gum.defaults.String
+
+contract T:
+    u256 a
+    String pstr
+    [u256] parr
+    HashMap(Account, u256) pmap
+
+    transient u256 t
+    transient String tstr
+    transient [u256] tarr
+    transient HashMap(Account, u256) tmap
+
+    export fn set_all(Account who, String s):
+        T.a = 11
+        T.pstr = s
+        T.parr.push(101)
+        T.pmap[who] = 1001
+
+        T.t = 22
+        T.tstr = s
+        T.tarr.push(202)
+        T.tmap[who] = 2002
+
+    export fn read_t() -> u256:
+        return T.t
+
+    export fn read_a() -> u256:
+        return T.a
+
+    export fn tarr_len() -> u256:
+        return T.tarr.length
+
+    export fn parr_len() -> u256:
+        return T.parr.length
+
+    export fn tmap_of(Account who) -> u256:
+        return T.tmap[who]
+
+    export fn pmap_of(Account who) -> u256:
+        return T.pmap[who]
+
+    export fn tstr_of() -> String:
+        return T.tstr
+
+    export fn pstr_of() -> String:
+        return T.pstr
+
+    // Everything the transient half holds, summed, so one call can observe it
+    // all *within* the transaction that wrote it.
+    export fn write_then_read(Account who, String s) -> u256:
+        T.t = 22
+        T.tstr = s
+        T.tarr.push(202)
+        T.tarr.push(303)
+        T.tmap[who] = 2002
+        mut u256 acc = T.t + T.tmap[who] + T.tarr.length + T.tstr.length
+        for x in T.tarr:
+            acc = acc + x
+        return acc

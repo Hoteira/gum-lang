@@ -1,0 +1,25 @@
+use gum.defaults.Account
+
+contract Holder:
+    u256 total
+    u256 count
+
+    fn new([u256] xs, u256 extra):
+        mut u256 s = extra
+        for x in xs:
+            s = s + x
+        self.total = s
+        self.count = xs.length
+
+    export fn total() -> u256:
+        return Holder.total
+
+    export fn count() -> u256:
+        return Holder.count
+
+contract Maker:
+    Account last
+
+    export fn make([u256] xs, u256 extra) -> Account:
+        Maker.last = new Holder(xs, extra)
+        return Maker.last

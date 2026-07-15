@@ -1,0 +1,10 @@
+contract C:
+    [u256; 3] items
+    u256 total
+
+    export fn setit(u256 i, u256 v):
+        C.items[i] = v
+        C.total = C.total + v
+
+    export fn getit(u256 i) -> u256:
+        return C.items[i]

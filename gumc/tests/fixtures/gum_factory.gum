@@ -1,0 +1,21 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+contract F:
+    u256 made
+
+    export fn deploy(Bytes code) -> Account:
+        F.made = F.made + 1
+        return Account.create(code, 0)
+
+    export payable fn deploy_funded(Bytes code) -> Account:
+        return Account.create(code, Message.value())
+
+    export fn deploy2(Bytes code, u256 salt) -> Account:
+        return Account.create2(code, 0, salt)
+
+    export fn predict(Bytes code, u256 salt) -> Account:
+        return Account.create2_address(code, salt)
+
+    export fn made() -> u256:
+        return F.made

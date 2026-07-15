@@ -1,0 +1,26 @@
+contract C:
+    u256 total
+
+    export fn sum3([u256; 3] xs) -> u256:
+        mut u256 s = 0
+        for x in xs:
+            s = s + x
+        return s
+
+    export fn echo3([u256; 3] xs) -> [u256; 3]:
+        return xs
+
+    export fn sum3_8([u8; 3] xs) -> u256:
+        mut u256 s = 0
+        for x in xs:
+            s = s + x
+        return s
+
+    export fn echo3_8([u8; 3] xs) -> [u8; 3]:
+        return xs
+
+    export fn mixed(u256 a, [u8; 3] xs, u256 b) -> u256:
+        mut u256 s = a + b
+        for x in xs:
+            s = s + x
+        return s

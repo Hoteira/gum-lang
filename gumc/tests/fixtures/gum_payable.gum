@@ -1,0 +1,13 @@
+use gum.defaults.Message
+
+contract Vault:
+    u256 total
+
+    export payable fn deposit():
+        Vault.total = Vault.total + Message.value()
+
+    export fn poke():
+        Vault.total = Vault.total + 1
+
+    export fn total_of() -> u256:
+        return Vault.total

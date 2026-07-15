@@ -1,0 +1,34 @@
+contract C:
+    [u256] arr
+    [u8] small
+
+    export fn fill():
+        C.arr.push(7)
+        C.arr.push(8)
+        C.arr.push(9)
+        C.small.push(1)
+        C.small.push(2)
+        C.small.push(3)
+        C.small.push(4)
+
+    export fn copy_sum() -> u256:
+        var a = C.arr
+        mut u256 t = 0
+        for x in a:
+            t = t + x
+        return t
+
+    export fn copy_len() -> u256:
+        var a = C.arr
+        return a.length
+
+    export fn copy_at(u256 i) -> u256:
+        var a = C.arr
+        return a[i]
+
+    export fn copy_small_sum() -> u256:
+        var s = C.small
+        mut u256 t = 0
+        for x in s:
+            t = t + x
+        return t

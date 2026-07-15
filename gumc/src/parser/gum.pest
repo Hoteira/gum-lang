@@ -1,0 +1,204 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+
+// Note: "new" is deliberately not reserved here, it's also used as a plain
+// constructor method name (`fn new(...)`); instantiation's literal "new"
+// prefix is matched positionally before type_keyword, so it doesn't need
+// exclusion from ident.
+keyword = @{
+    ("use" | "export" | "extern" | "interface" | "contract" | "once" | "payable" | "fn" | "class" |
+     "enum" | "error" | "const" | "mut" | "var" |
+     "assert" | "revert" | "match" | "for" | "in" | "if" | "else" | "return" | "while" |
+     "unsafe" | "call" | "delete" | "transient") ~ !(ASCII_ALPHANUMERIC | "_")
+}
+ident = @{ !keyword ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+// Type names are always capitalized by convention in this language (Account,
+// Vec, HashMap, TokenState, ...) while values never are (snake_case params
+// and locals), exploited here to break a real grammar ambiguity: without
+// this restriction, `new Counter(start)` is indistinguishable from
+// instantiating a *generic* class named Counter with `start` as its type
+// argument, since a bare lowercase identifier is syntactically valid in
+// either position. Requiring an uppercase first letter for anything used as
+// a type means `start` can never be mistaken for one, so `generic_type`
+// only matches when there's a genuine type argument list.
+type_ident = @{ !keyword ~ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+number = @{ "0x" ~ ASCII_HEX_DIGIT+ | ASCII_DIGIT+ }
+string_literal = { "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+// f-strings are captured whole (including the f"..." delimiters) and split
+// into literal/interpolation segments in parser/mod.rs, which re-invokes the
+// `expr` rule on each `{...}` span. Doing the split there instead of here
+// avoids fighting pest's automatic whitespace-skipping inside a string body.
+fstring_literal = @{ "f\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+
+primitive_type = {
+    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
+    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
+    "f32" | "f64" | "bool" | "Account"
+}
+
+// e.g. Vec(u256) or HashMap(Account, Vec(u256))
+generic_type = { type_ident ~ "(" ~ type_keyword ~ ("," ~ type_keyword)* ~ ")" }
+array_type = { "[" ~ type_keyword ~ (";" ~ number)? ~ "]" }
+
+// A type can be primitive, generic, array, or just a standard class identifier
+type_keyword = { primitive_type | generic_type | array_type | type_ident }
+
+// `export` marks a public, externally-dispatched entry point. A bare `fn` is
+// internal (callable only from other gum functions). `payable` lets a function
+// receive ETH; without it the dispatcher rejects any value-bearing call.
+modifier = { "export" | "payable" | "once" | "unsafe" }
+
+// Modules
+path = { ident ~ ("." ~ ident)* }
+use_decl = { "use" ~ path ~ ";" }
+
+// Expressions
+// "**" must be tried before "*", pest's alternation is ordered-choice, not
+// longest-match, so "*" would otherwise consume the first "*" of "**" and
+// leave a dangling second one.
+binary_op = {
+    "**" | "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<=" | ">=" | "<" | ">" |
+    "&&" | "||" | "<<" | ">>" | "&" | "|" | "^"
+}
+
+fn_call = { ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+instantiation = { "new" ~ type_keyword ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+paren_expr = { "(" ~ expr ~ ")" }
+array_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+
+atom = { instantiation | fn_call | paren_expr | fstring_literal | array_literal | number | string_literal | ident }
+
+property_access = { "." ~ ident }
+method_access = { "." ~ fn_call }
+index_access = { "[" ~ expr ~ "]" }
+suffix = { method_access | property_access | index_access }
+
+// Unary prefix, e.g. `-3`, `-x.field`, `!done`, binds to a whole term (atom
+// plus its suffixes), so `-x.field` means `-(x.field)`, not `(-x).field`.
+unary_op = { "-" | "!" }
+term = { unary_op? ~ atom ~ suffix* }
+expr = { term ~ (binary_op ~ term)* }
+
+// Statements
+is_mut = { "mut" }
+is_const = { "const" }
+
+// Spellings, in order:
+//   u256 x = 5        type-first, mutable
+//   mut u256 x = 5    type-first, explicitly mutable
+//   const u256 x = 5  type-first, immutable
+//   var x = 5         inferred, immutable (default)
+//   mut var x = 5     inferred, mutable
+//   const x = 5       inferred, immutable (explicit synonym of bare `var`)
+// `mut` always comes first, before the type or before `var`. The inferred
+// forms take the variable's type from the initializer, so they always
+// require one.
+var_kw = { "var" }
+var_decl = {
+    (is_mut | is_const)? ~ type_keyword ~ ident ~ ("=" ~ expr)? ~ ";"
+  | is_mut? ~ var_kw ~ ident ~ "=" ~ expr ~ ";"
+  | is_const ~ ident ~ "=" ~ expr ~ ";"
+}
+assignment = { term ~ "=" ~ expr ~ ";" }
+// `x += y` / `x -= y` desugar to `x = x + y` / `x = x - y` in parser/mod.rs,
+// so they get overflow-checking and lvalue handling for free by reusing
+// Statement::Assignment rather than needing their own codegen path.
+compound_op = { "+=" | "-=" }
+compound_assignment = { term ~ compound_op ~ expr ~ ";" }
+assert_stmt = { "assert" ~ "(" ~ expr ~ ("," ~ expr)* ~ ")" ~ ";" }
+revert_stmt = { "revert" ~ ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" ~ ";" }
+// The value is optional: a function with no declared return type may `return`
+// bare to exit early.
+return_stmt = { "return" ~ expr? ~ ";" }
+call_stmt = { "call" ~ ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" ~ ";" }
+// `delete x` resets x to its type's zero value, like Solidity's. The target is
+// a `term` rather than an `expr` because only an lvalue (a name, field, index,
+// or a chain of them) can be deleted, never a computed expression.
+delete_stmt = { "delete" ~ term ~ ";" }
+expr_stmt = { expr ~ ";" }
+
+if_stmt = { "if" ~ expr ~ fn_body ~ ("else" ~ fn_body)? }
+for_stmt = { "for" ~ ident ~ "in" ~ expr ~ fn_body }
+
+// Special syntax sugar for bitwise flipping
+bitwise_flip = { ident ~ ".as_bits()[" ~ expr ~ "]" ~ "=" ~ expr ~ ";" }
+
+// Raw Yul passthrough. Needs real brace-balancing (not just "stop at the
+// first }") since the embedded Yul itself may contain nested if/for blocks.
+unsafe_inner = @{ (("{" ~ unsafe_inner ~ "}") | (!("{" | "}") ~ ANY))* }
+unsafe_block = { "unsafe" ~ "{" ~ unsafe_inner ~ "}" }
+
+while_stmt = { "while" ~ expr ~ fn_body }
+match_arm = { ident ~ ("(" ~ ident ~ ")")? ~ fn_body }
+match_stmt = { "match" ~ expr ~ "{" ~ match_arm* ~ "}" }
+
+statement = { match_stmt | unsafe_block | bitwise_flip | if_stmt | for_stmt | while_stmt | var_decl | assignment | compound_assignment | assert_stmt | revert_stmt | call_stmt | delete_stmt | return_stmt | expr_stmt }
+
+// Parameters
+param = { is_mut? ~ type_keyword ~ ident }
+param_list = { param ~ ("," ~ param)* }
+
+// Function
+fn_body = { "{" ~ statement* ~ "}" }
+fn_decl = { modifier* ~ "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ( "->" ~ type_keyword )? ~ (fn_body | ";") }
+
+// Class
+parents = { "[" ~ ident ~ ("," ~ ident)* ~ "]" }
+generic_bound = { ident ~ (("&&" | "||") ~ ident)* }
+generic_param = { generic_bound ~ "<" ~ ident ~ ">" }
+generic_params = { "(" ~ generic_param ~ ("," ~ generic_param)* ~ ")" }
+// The contract's persistent state singleton (`contract Name:`): its fields
+// live at fixed storage slots.
+is_global = { "contract" }
+// An interface: a class with no fields of its own, whose methods have no
+// bodies here because they belong to *another* deployed contract. Calling one
+// of its methods compiles to a real external CALL rather than a local function
+// call, see Translator::translate_external_call. `interface Name:` is the
+// preferred spelling; `extern class Name:` is still accepted.
+is_extern = { "extern" | "interface" }
+// `transient u256 x` puts a `contract` field in transient storage (EIP-1153):
+// the same slot/keccak layout, but tstore/tload, and it clears at the end of
+// the *transaction* rather than persisting. Its keyspace is separate from
+// persistent storage, so a transient field's slot 0 is not the same location as
+// a persistent field's slot 0.
+is_transient = { "transient" }
+// On a `contract` field, `const` means the value is fixed once the contract is
+// deployed and never changes, the same promise it makes on a local. How that
+// is achieved is the compiler's business: a value it can work out at compile
+// time is inlined at each use, and one that only exists at deploy (a
+// constructor argument) is written into the runtime bytecode by the deploy
+// code. Either way there is no storage slot and no SLOAD.
+//
+// `transient` and `const` contradict each other (one is storage that clears per
+// transaction, the other is not storage at all), but both are accepted here so
+// that semantic analysis can say so in those words. Refusing the combination in
+// the grammar instead yields a bare "syntax error" pointing at a column, which
+// tells the author nothing about why.
+class_field = { is_transient? ~ is_mut? ~ is_const? ~ type_keyword ~ ident ~ ";" }
+class_body = { "{" ~ (fn_decl | class_field)* ~ "}" }
+// `contract`/`interface` carry their own noun, so the `class` keyword is
+// optional after a prefix; a bare struct still needs the `class` keyword.
+class_decl = {
+    (is_global | is_extern) ~ "class"? ~ ident ~ generic_params? ~ parents? ~ (class_body | ";")
+  | "class" ~ ident ~ generic_params? ~ parents? ~ (class_body | ";")
+}
+
+enum_variant = { ident ~ ("(" ~ type_keyword ~ ")")? ~ ";" }
+enum_decl = { "enum" ~ ident ~ "{" ~ enum_variant* ~ "}" }
+
+error_decl = { "error" ~ ident ~ "(" ~ param_list? ~ ")" ~ ";" }
+
+// Program
+declaration = { use_decl | error_decl | enum_decl | class_decl | fn_decl }
+program = { SOI ~ declaration* ~ EOI }
+// One declaration, parsed on its own. This is what error recovery uses: the
+// source is split into top-level declarations and each is parsed separately,
+// so one bad declaration doesn't hide the rest (see parser::parse_program).
+// The EOI matters, without it a declaration rule would happily match a valid
+// *prefix* of a chunk and silently drop whatever followed.
+decl_unit = { SOI ~ declaration ~ EOI }
+// One member of a class/contract body, parsed on its own. Entry points live
+// inside a `contract`, which makes the whole contract a single top-level
+// declaration, so recovery has to go one level deeper than decl_unit or a
+// typical file would only ever report its first error.
+member_unit = { SOI ~ (fn_decl | class_field) ~ EOI }

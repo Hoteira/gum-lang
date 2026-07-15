@@ -1,0 +1,17 @@
+contract S:
+    u256 big
+    u128 a
+    u128 b
+
+    export fn set_ab(u128 x, u128 y):
+        S.a = x
+        S.b = y
+
+    export fn get_a() -> u128:
+        return S.a
+
+    export fn get_b() -> u128:
+        return S.b
+
+    export fn get_big() -> u256:
+        return S.big

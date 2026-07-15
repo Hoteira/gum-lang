@@ -1,0 +1,23 @@
+class P:
+    u128 a
+    u256 b
+    Account d
+
+contract C:
+    u256 sa
+    u256 sb
+    Account sd
+
+    fn new(P p):
+        C.sa = p.a
+        C.sb = p.b
+        C.sd = p.d
+
+    export fn get_a() -> u256:
+        return C.sa
+
+    export fn get_b() -> u256:
+        return C.sb
+
+    export fn get_d() -> Account:
+        return C.sd

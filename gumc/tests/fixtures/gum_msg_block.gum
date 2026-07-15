@@ -1,0 +1,19 @@
+use gum.defaults.Account
+use gum.defaults.Message
+use gum.defaults.Block
+
+contract C:
+    export payable fn who() -> Account:
+        return Message.sender()
+
+    export payable fn amount() -> u256:
+        return Message.value()
+
+    export fn me() -> Account:
+        return Message.address()
+
+    export fn when() -> u256:
+        return Block.timestamp()
+
+    export fn height() -> u256:
+        return Block.number()

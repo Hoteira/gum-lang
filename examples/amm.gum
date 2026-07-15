@@ -1,0 +1,76 @@
+use gum.defaults.Account
+use gum.defaults.Message
+use gum.defaults.Block
+
+enum AMMLogs:
+    LiquidityAdded
+    SwapExecuted
+
+extern class IERC20:
+    fn transfer(Account to, u256 amount) -> bool
+    fn transfer_from(Account from, Account to, u256 amount) -> bool
+
+contract AMMState:
+    // Ordinary storage fields rather than `const`: `initialize` sets them
+    // after deploy (the upgradeable-proxy pattern), and a `const` field is
+    // fixed at construction. A proxy never runs a constructor against its
+    // own storage, so these addresses cannot be known at deploy time.
+    Account token_a
+    Account token_b
+
+    u256 reserve_a
+    u256 reserve_b
+    u256 total_shares
+    HashMap(Account, u256) shares
+
+    export once fn initialize(Account _token_a, Account _token_b):
+        AMMState.token_a = _token_a
+        AMMState.token_b = _token_b
+
+    export fn add_liquidity(u256 amount_a, u256 amount_b):
+        Account sender = Message.sender()
+
+        assert(IERC20(AMMState.token_a).transfer_from(sender, Message.address(), amount_a), "Transfer A failed")
+        assert(IERC20(AMMState.token_b).transfer_from(sender, Message.address(), amount_b), "Transfer B failed")
+
+        AMMState.reserve_a = AMMState.reserve_a + amount_a
+        AMMState.reserve_b = AMMState.reserve_b + amount_b
+
+        u256 shares_to_mint = amount_a // In reality, this uses a square root formula
+        AMMState.shares[sender] = AMMState.shares[sender] + shares_to_mint
+        AMMState.total_shares = AMMState.total_shares + shares_to_mint
+
+        log(AMMLogs.LiquidityAdded, indexed(sender), amount_a, amount_b, shares_to_mint)
+
+    export fn swap(Account token_in, u256 amount_in):
+        Account sender = Message.sender()
+
+        assert(token_in == AMMState.token_a || token_in == AMMState.token_b, "Invalid token")
+
+        mut u256 reserve_in
+        mut u256 reserve_out
+        mut Account token_out
+
+        if token_in == AMMState.token_a:
+            reserve_in = AMMState.reserve_a
+            reserve_out = AMMState.reserve_b
+            token_out = AMMState.token_b
+        else:
+            reserve_in = AMMState.reserve_b
+            reserve_out = AMMState.reserve_a
+            token_out = AMMState.token_a
+
+        u256 amount_out = (reserve_out * amount_in) / (reserve_in + amount_in)
+
+        assert(amount_out > 0, "Insufficient output amount")
+        assert(IERC20(token_in).transfer_from(sender, Message.address(), amount_in), "Transfer in failed")
+        assert(IERC20(token_out).transfer(sender, amount_out), "Transfer out failed")
+
+        if token_in == AMMState.token_a:
+            AMMState.reserve_a = AMMState.reserve_a + amount_in
+            AMMState.reserve_b = AMMState.reserve_b - amount_out
+        else:
+            AMMState.reserve_b = AMMState.reserve_b + amount_in
+            AMMState.reserve_a = AMMState.reserve_a - amount_out
+
+        log(AMMLogs.SwapExecuted, indexed(sender), indexed(token_in), amount_in, token_out, amount_out)

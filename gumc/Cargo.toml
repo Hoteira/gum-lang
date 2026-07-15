@@ -1,0 +1,23 @@
+[package]
+name = "gumc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+clap = "4.6.1"
+logos = "0.16.1"
+pest = "2.8.7"
+pest_derive = "2.8.7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+
+[dev-dependencies]
+# Execution-level differential testing: run gum-compiled bytecode and the
+# Solidity reference bytecode in the same in-process EVM and diff behavior.
+revm = "41"
+hex = "0.4"
+# Used only to generate a real P-256 signature for the secp256r1 precompile
+# test, the same crate revm itself verifies with.
+p256 = { version = "0.13", features = ["ecdsa"] }

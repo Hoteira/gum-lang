@@ -1,0 +1,28 @@
+class Stake:
+    u256 amount
+    u256 since
+
+contract V:
+    u256 total
+    [Stake] stakes
+
+    export fn add(u256 a, u256 s):
+        V.stakes.push()
+        V.stakes[V.stakes.length - 1].amount = a
+        V.stakes[V.stakes.length - 1].since = s
+        V.total = V.total + a
+
+    export fn set_amount(u256 i, u256 a):
+        V.stakes[i].amount = a
+
+    export fn get_amount(u256 i) -> u256:
+        return V.stakes[i].amount
+
+    export fn get_since(u256 i) -> u256:
+        return V.stakes[i].since
+
+    export fn len() -> u256:
+        return V.stakes.length
+
+    export fn drop():
+        V.stakes.pop()

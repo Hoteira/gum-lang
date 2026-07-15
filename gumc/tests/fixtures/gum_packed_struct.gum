@@ -1,0 +1,18 @@
+use gum.defaults.hashable
+
+class Pair:
+    u128 lo
+    u128 hi
+
+contract C:
+    HashMap(Account, Pair) m
+
+    export fn setp(Account k, u128 a, u128 b):
+        C.m[k].lo = a
+        C.m[k].hi = b
+
+    export fn getlo(Account k) -> u128:
+        return C.m[k].lo
+
+    export fn gethi(Account k) -> u128:
+        return C.m[k].hi

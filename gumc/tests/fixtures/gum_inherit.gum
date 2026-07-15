@@ -1,0 +1,38 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+class Ledger:
+    u256 total
+
+    export fn credit(u256 v):
+        self.total = self.total + v
+
+    fn cap() -> u256:
+        return 100
+
+class Owned [Ledger]:
+    Account owner
+
+    export fn claim():
+        self.owner = Message.sender()
+
+contract Bank [Owned]:
+    u256 fee
+
+    fn cap() -> u256:
+        return 250
+
+    export fn set_fee(u256 v):
+        Bank.fee = v
+
+    export fn total() -> u256:
+        return Bank.total
+
+    export fn owner() -> Account:
+        return Bank.owner
+
+    export fn fee() -> u256:
+        return Bank.fee
+
+    export fn cap_of() -> u256:
+        return Bank.cap()

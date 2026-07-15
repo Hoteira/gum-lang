@@ -1,0 +1,40 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+// A minimal but real ERC20-shaped contract, chosen to exercise the nested
+// mapping (allowances) that token.gum/amm.gum never touched. Storage layout:
+// total_supply=slot0, balances=slot1, allowances=slot2.
+contract Erc20:
+    u256 total_supply
+    HashMap(Account, u256) balances
+    HashMap(Account, HashMap(Account, u256)) allowances
+
+    export fn init(u256 supply):
+        Account s = Message.sender()
+        Erc20.total_supply = supply
+        Erc20.balances.set(s, supply)
+
+    export fn balance_of(Account who) -> u256:
+        return Erc20.balances.get(who)
+
+    export fn approve(Account spender, u256 amount):
+        Account owner = Message.sender()
+        Erc20.allowances.get(owner).set(spender, amount)
+
+    export fn allowance(Account owner, Account spender) -> u256:
+        return Erc20.allowances.get(owner).get(spender)
+
+    export fn transfer(Account to, u256 amount):
+        Account from = Message.sender()
+        assert(Erc20.balances.get(from) >= amount, "insufficient balance")
+        Erc20.balances.set(from, Erc20.balances.get(from) - amount)
+        Erc20.balances.set(to, Erc20.balances.get(to) + amount)
+
+    export fn transfer_from(Account from, Account to, u256 amount):
+        Account spender = Message.sender()
+        assert(Erc20.allowances.get(from).get(spender) >= amount, "insufficient allowance")
+        assert(Erc20.balances.get(from) >= amount, "insufficient balance")
+        Erc20.allowances.get(from).set(spender, Erc20.allowances.get(from).get(spender) - amount)
+        Erc20.balances.set(from, Erc20.balances.get(from) - amount)
+        Erc20.balances.set(to, Erc20.balances.get(to) + amount)
+

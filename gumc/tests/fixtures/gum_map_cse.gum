@@ -1,0 +1,7 @@
+use gum.defaults.hashable
+
+contract Bench:
+    HashMap(Account, u256) m
+
+    export fn sum5(Account k) -> u256:
+        return Bench.m.get(k) + Bench.m.get(k) + Bench.m.get(k) + Bench.m.get(k) + Bench.m.get(k)

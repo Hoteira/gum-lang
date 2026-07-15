@@ -1,0 +1,44 @@
+use gum.defaults.Account
+
+class Stake:
+    u256 amount
+    u256 since
+
+contract D:
+    u256 n
+    u8 packed_a
+    u8 packed_b
+    String name
+    [u256] arr
+    [u8; 4] fixed
+    HashMap(Account, u256) bal
+    HashMap(Account, Stake) stakes
+
+    export fn fill(Account who, String s):
+        D.n = 42
+        D.packed_a = 7
+        D.packed_b = 9
+        D.name = s
+        D.arr.push(1)
+        D.arr.push(2)
+        D.arr.push(3)
+        D.fixed[0] = 1
+        D.fixed[1] = 2
+        D.bal[who] = 500
+        D.stakes[who].amount = 10
+        D.stakes[who].since = 20
+
+    export fn wipe(Account who):
+        delete D.n
+        delete D.packed_a
+        delete D.name
+        delete D.arr
+        delete D.fixed
+        delete D.bal[who]
+        delete D.stakes[who]
+
+    export fn len() -> u256:
+        return D.arr.length
+
+    export fn packed_b() -> u8:
+        return D.packed_b

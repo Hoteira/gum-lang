@@ -1,0 +1,10 @@
+use gum.defaults.String
+
+contract App:
+    export fn pick(u256 which, String a, String b) -> String:
+        if which == 0:
+            return a
+        return b
+
+    export fn total_len(String a, String b) -> u256:
+        return a.length + b.length

@@ -1,0 +1,8 @@
+use gum.defaults.Account
+
+interface IToken:
+    fn transfer(Account to, u256 amount) -> bool
+
+contract App:
+    export fn send(Account token, Account to, u256 amount) -> bool:
+        return IToken(token).transfer(to, amount)

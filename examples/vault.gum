@@ -1,0 +1,31 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+// A staking vault. Exercises a struct stored inside a mapping
+// (mapping(address => Stake)), the pattern behind vaults, orders, positions.
+class Stake:
+    u256 amount
+    u256 since
+
+contract Vault:
+    u256 total
+    HashMap(Account, Stake) stakes
+
+    export fn deposit(u256 amt, u256 t):
+        Account who = Message.sender()
+        Vault.stakes[who].amount = Vault.stakes[who].amount + amt
+        Vault.stakes[who].since = t
+        Vault.total = Vault.total + amt
+
+    export fn amount_of(Account who) -> u256:
+        return Vault.stakes[who].amount
+
+    export fn since_of(Account who) -> u256:
+        return Vault.stakes[who].since
+
+    export fn withdraw(u256 amt):
+        Account who = Message.sender()
+        assert(Vault.stakes[who].amount >= amt, "insufficient stake")
+        Vault.stakes[who].amount = Vault.stakes[who].amount - amt
+        Vault.total = Vault.total - amt
+

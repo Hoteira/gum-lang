@@ -1,0 +1,27 @@
+class P:
+    u128 a
+    u256 b
+    Account c
+
+contract S:
+    export fn count([P] xs) -> u256:
+        return xs.length
+
+    export fn sum_b([P] xs) -> u256:
+        mut u256 t = 0
+        for x in xs:
+            t = t + x.b
+        return t
+
+    export fn at_a([P] xs, u256 i) -> u128:
+        return xs[i].a
+
+    export fn at_c([P] xs, u256 i) -> Account:
+        return xs[i].c
+
+    export fn echo([P] xs) -> [P]:
+        return xs
+
+    export fn bump([P] xs, u256 i, u128 v) -> u128:
+        xs[i].a = v
+        return xs[i].a

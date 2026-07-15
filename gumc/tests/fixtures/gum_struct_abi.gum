@@ -1,0 +1,28 @@
+class P:
+    u128 a
+    u256 b
+    u8 c
+    Account d
+    bool e
+
+contract S:
+    export fn fa(P p) -> u128:
+        return p.a
+
+    export fn fb(P p) -> u256:
+        return p.b
+
+    export fn fc(P p) -> u8:
+        return p.c
+
+    export fn fd(P p) -> Account:
+        return p.d
+
+    export fn fe(P p) -> bool:
+        return p.e
+
+    export fn echo(P p) -> P:
+        return p
+
+    export fn mix(u256 x, P p, u256 y) -> u256:
+        return x + p.b + y

@@ -1,0 +1,28 @@
+contract P:
+    [u8] a
+    [u8; 4] f
+    u256 sentinel
+
+    export fn push(u8 v):
+        P.a.push(v)
+
+    export fn pop():
+        P.a.pop()
+
+    export fn setf(u256 i, u8 v):
+        P.f[i] = v
+
+    export fn getf(u256 i) -> u8:
+        return P.f[i]
+
+    export fn get(u256 i) -> u8:
+        return P.a[i]
+
+    export fn len() -> u256:
+        return P.a.length
+
+    export fn sum() -> u256:
+        mut u256 s = 0
+        for x in P.a:
+            s = s + x
+        return s

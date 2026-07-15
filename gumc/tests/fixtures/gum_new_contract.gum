@@ -1,0 +1,32 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+contract Child:
+    u256 v
+    Account parent
+
+    fn new(u256 x):
+        self.v = x
+        self.parent = Message.sender()
+
+    export fn get() -> u256:
+        return Child.v
+
+    export fn parent_of() -> Account:
+        return Child.parent
+
+contract Factory:
+    u256 count
+    Account last
+
+    export fn make(u256 x) -> Account:
+        Factory.count = Factory.count + 1
+        var c = new Child(x)
+        Factory.last = c
+        return c
+
+    export fn count() -> u256:
+        return Factory.count
+
+    export fn last() -> Account:
+        return Factory.last

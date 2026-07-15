@@ -1,0 +1,5 @@
+use gum.defaults.Crypto
+
+contract App:
+    export fn v(u256 h, u256 r, u256 s, u256 qx, u256 qy) -> bool:
+        return Crypto.verify_p256(h, r, s, qx, qy)

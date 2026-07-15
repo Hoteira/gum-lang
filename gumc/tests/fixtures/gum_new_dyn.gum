@@ -1,0 +1,27 @@
+use gum.defaults.Account
+
+contract Token:
+    String name
+    String symbol
+    u256 supply
+
+    fn new(String n, u256 s, String sym):
+        self.name = n
+        self.supply = s
+        self.symbol = sym
+
+    export fn name() -> String:
+        return Token.name
+
+    export fn symbol() -> String:
+        return Token.symbol
+
+    export fn supply() -> u256:
+        return Token.supply
+
+contract Deployer:
+    Account last
+
+    export fn make(String n, u256 s, String sym) -> Account:
+        Deployer.last = new Token(n, s, sym)
+        return Deployer.last

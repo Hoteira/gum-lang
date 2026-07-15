@@ -1,0 +1,48 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+// The indexed fields become searchable LOG topics, so wallets and indexers can
+// filter transfers by account.
+enum TokenLogs:
+    Transfer
+    Mint
+
+contract TokenState:
+    Account owner
+    u256 total_supply
+    HashMap(Account, u256) balances
+
+    export once fn initialize(u256 initial_supply):
+        var sender = Message.sender()
+
+        TokenState.owner = sender
+        TokenState.total_supply = initial_supply
+        TokenState.balances[sender] = initial_supply
+
+    export fn transfer(Account to, u256 amount):
+        var sender = Message.sender()
+
+        assert(TokenState.balances[sender] >= amount, "Insufficient balance")
+
+        TokenState.balances[sender] = TokenState.balances[sender] - amount
+        TokenState.balances[to] = (TokenState.balances[to] + amount).saturate()
+
+        log(TokenLogs.Transfer, indexed(sender), indexed(to), amount)
+
+    export fn mint(Account to, u256 amount):
+        assert(Message.sender() == TokenState.owner, "Only owner can mint")
+
+        TokenState.balances[to] = (TokenState.balances[to] + amount).saturate()
+        TokenState.total_supply = (TokenState.total_supply + amount).saturate()
+
+        log(TokenLogs.Mint, indexed(to), amount)
+
+    // No `export`, so this is internal and gets no ABI selector.
+    fn calculate_bonus(u256 amount) -> u256:
+        return amount / 100
+
+    export fn airdrop_and_notify(Account to, u256 amount, Account target_contract):
+        transfer(to, amount)
+
+        var payload = amount.as_bytes()
+        call target_contract(payload)

@@ -1,0 +1,13 @@
+use gum.defaults.hashable
+
+contract Reg:
+    HashMap(Account, HashMap(Account, u256)) m
+
+    export fn setv(Account a, Account b, u256 v):
+        Reg.m[a][b] = v
+
+    export fn getv(Account a, Account b) -> u256:
+        return Reg.m[a][b]
+
+    export fn incv(Account a, Account b, u256 d):
+        Reg.m[a][b] = Reg.m[a][b] + d

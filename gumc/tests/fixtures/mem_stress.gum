@@ -1,0 +1,11 @@
+contract App:
+    export fn mem_stress(u256 rounds) -> u256:
+        mut [u256; 4] a = [1, 2, 3, 4]
+        mut [u256; 4] b = [10, 20, 30, 40]
+        mut u256 acc = 0
+        mut u256 i = 0
+        while i < rounds:
+            mut [u256; 4] tmp = [i, i, i, i]
+            acc = acc + tmp[i % 4] + a[i % 4] + b[i % 4]
+            i = i + 1
+        return acc

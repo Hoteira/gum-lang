@@ -1,0 +1,9 @@
+contract Packed:
+    u128 a
+    u256 big
+    u128 b
+
+    export fn setall(u128 x, u256 y, u128 z):
+        Packed.a = x
+        Packed.big = y
+        Packed.b = z

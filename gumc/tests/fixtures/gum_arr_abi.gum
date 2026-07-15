@@ -1,0 +1,34 @@
+contract C:
+    u256 total
+
+    export fn sum([u256] xs) -> u256:
+        mut u256 s = 0
+        for x in xs:
+            s = s + x
+        return s
+
+    export fn echo([u256] xs) -> [u256]:
+        return xs
+
+    export fn at([u256] xs, u256 i) -> u256:
+        return xs[i]
+
+    export fn len_of([u256] xs) -> u256:
+        return xs.length
+
+    export fn sum8([u8] xs) -> u256:
+        mut u256 s = 0
+        for x in xs:
+            s = s + x
+        return s
+
+    export fn echo8([u8] xs) -> [u8]:
+        return xs
+
+    export fn two([u256] a, u256 n, [u8] b) -> u256:
+        mut u256 s = n
+        for x in a:
+            s = s + x
+        for y in b:
+            s = s + y
+        return s

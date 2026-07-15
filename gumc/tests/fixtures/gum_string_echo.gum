@@ -1,0 +1,8 @@
+use gum.defaults.String
+
+contract App:
+    export fn echo(String s) -> String:
+        return s
+
+    export fn get_len(String s) -> u256:
+        return s.length

@@ -1,0 +1,29 @@
+use gum.defaults.vec
+
+contract S:
+    Vec(u256) items
+    u256 sentinel
+
+    export fn add(u256 v):
+        S.items.push(v)
+
+    export fn drop():
+        S.items.pop()
+
+    export fn get(u256 i) -> u256:
+        return S.items.get(i)
+
+    export fn at(u256 i) -> u256:
+        return S.items[i]
+
+    export fn len() -> u256:
+        return S.items.len()
+
+    export fn length() -> u256:
+        return S.items.length
+
+    export fn wipe():
+        delete S.items
+
+    export fn set_sentinel(u256 v):
+        S.sentinel = v

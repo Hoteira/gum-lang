@@ -1,0 +1,20 @@
+class P:
+    u128 a
+    u256 b
+
+interface IChild:
+    fn get_b() -> u256
+
+contract Child:
+    u256 stored
+
+    fn new(P p):
+        Child.stored = p.b
+
+    export fn get_b() -> u256:
+        return Child.stored
+
+contract Parent:
+    export fn make_and_read(P p) -> u256:
+        var c = new Child(p)
+        return IChild(c).get_b()

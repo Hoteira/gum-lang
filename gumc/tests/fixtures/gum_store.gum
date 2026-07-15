@@ -1,0 +1,11 @@
+contract Store:
+    u256 value
+
+    export fn set(u256 x):
+        Store.value = x
+
+    export fn add(u256 y):
+        Store.value = Store.value + y
+
+    export fn get() -> u256:
+        return Store.value

@@ -1,0 +1,17 @@
+use gum.defaults.Message
+
+contract V:
+    u256 received
+    u256 fell
+
+    export payable fn receive():
+        V.received = V.received + Message.value()
+
+    export payable fn fallback():
+        V.fell = V.fell + 1
+
+    export fn total() -> u256:
+        return V.received
+
+    export fn fell() -> u256:
+        return V.fell

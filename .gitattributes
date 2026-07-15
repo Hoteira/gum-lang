@@ -1,0 +1,11 @@
+# Normalize to LF in the repository. Working copies still get the platform's
+# native endings on checkout. Without this, the mix of CRLF and LF already in
+# this tree would land in history as-is and every cross-platform clone would
+# show phantom whole-file diffs.
+* text=auto eol=lf
+
+# Binary, never touch.
+*.svg text eol=lf
+*.exe binary
+*.png binary
+*.jpg binary

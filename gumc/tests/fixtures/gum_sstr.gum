@@ -1,0 +1,17 @@
+use gum.defaults.String
+
+contract Meta:
+    String name
+    u256 supply
+
+    export fn set_name(String n):
+        Meta.name = n
+
+    export fn name_of() -> String:
+        return Meta.name
+
+    export fn set_supply(u256 s):
+        Meta.supply = s
+
+    export fn supply_of() -> u256:
+        return Meta.supply

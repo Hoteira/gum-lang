@@ -1,0 +1,42 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+// A core ERC721. Exercises mapping(uint256 => address) (address-valued
+// mapping), address balances, and nested operator approvals.
+contract Erc721:
+    HashMap(u256, Account) owners
+    HashMap(Account, u256) balances
+    HashMap(u256, Account) approvals
+    HashMap(Account, HashMap(Account, bool)) operator_approvals
+
+    export fn mint(Account to, u256 id):
+        assert(Erc721.owners[id] == 0, "already minted")
+        Erc721.owners[id] = to
+        Erc721.balances[to] = Erc721.balances[to] + 1
+
+    export fn owner_of(u256 id) -> Account:
+        return Erc721.owners[id]
+
+    export fn balance_of(Account who) -> u256:
+        return Erc721.balances[who]
+
+    export fn approve(Account to, u256 id):
+        Erc721.approvals[id] = to
+
+    export fn get_approved(u256 id) -> Account:
+        return Erc721.approvals[id]
+
+    export fn set_approval_for_all(Account op, bool ok):
+        Account owner = Message.sender()
+        Erc721.operator_approvals[owner][op] = ok
+
+    export fn is_approved_for_all(Account owner, Account op) -> bool:
+        return Erc721.operator_approvals[owner][op]
+
+    export fn transfer_from(Account from, Account to, u256 id):
+        assert(Erc721.owners[id] == from, "not owner")
+        Erc721.owners[id] = to
+        Erc721.balances[from] = Erc721.balances[from] - 1
+        Erc721.balances[to] = Erc721.balances[to] + 1
+        Erc721.approvals[id] = 0
+

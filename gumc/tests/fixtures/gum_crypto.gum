@@ -1,0 +1,11 @@
+use gum.defaults.Account
+use gum.defaults.keccak256
+use gum.defaults.ecrecover
+use gum.defaults.String
+
+contract App:
+    export fn hash_str(String s) -> u256:
+        return keccak256(s)
+
+    export fn rec(u256 h, u8 v, u256 r, u256 s) -> Account:
+        return ecrecover(h, v, r, s)

@@ -1,0 +1,50 @@
+use gum.defaults.String
+
+class P:
+    u128 a
+    u256 b
+
+interface ISink:
+    fn take(P p) -> u256
+    fn take_str(String s) -> u256
+    fn take_arr([u256] xs) -> u256
+    fn take_starr([P] xs) -> u256
+    fn mk(u256 x) -> P
+    fn name() -> String
+    fn nums() -> [u256]
+    fn pairs() -> [P]
+
+contract Caller:
+    export fn fwd(Account t, P p) -> u256:
+        return ISink(t).take(p)
+
+    export fn fwd_str(Account t, String s) -> u256:
+        return ISink(t).take_str(s)
+
+    export fn fwd_arr(Account t, [u256] xs) -> u256:
+        return ISink(t).take_arr(xs)
+
+    export fn fwd_starr(Account t, [P] xs) -> u256:
+        return ISink(t).take_starr(xs)
+
+    export fn fwd_mk(Account t, u256 x) -> u256:
+        var p = ISink(t).mk(x)
+        return p.b
+
+    export fn fwd_name(Account t) -> String:
+        return ISink(t).name()
+
+    export fn fwd_name_len(Account t) -> u256:
+        var s = ISink(t).name()
+        return s.length
+
+    export fn fwd_nums_sum(Account t) -> u256:
+        var xs = ISink(t).nums()
+        mut u256 s = 0
+        for x in xs:
+            s = s + x
+        return s
+
+    export fn fwd_pairs_b(Account t, u256 i) -> u256:
+        var ps = ISink(t).pairs()
+        return ps[i].b
