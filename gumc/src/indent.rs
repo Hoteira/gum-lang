@@ -78,6 +78,8 @@ pub fn preprocess(source: &str) -> Result<String, String> {
             } else {
                 pending_open = true;
             }
+        } else if is_attribute(code_trimmed) {
+            emitted.push_str(code_trimmed);
         } else {
             emitted.push_str(code_trimmed);
             emitted.push(';');
@@ -108,6 +110,13 @@ pub fn preprocess(source: &str) -> Result<String, String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+// A parent-list attribute, `[Owned]` on its own line above a class.
+// It gets no trailing ';' unlike every other code line: parser/mod.rs splits top-level declarations at ';', so one here would tear the attribute off the class it annotates.
+// Nothing else is written as a line that both opens with '[' and closes with ']', so this cannot swallow a real statement.
+fn is_attribute(code: &str) -> bool {
+    code.starts_with('[') && code.ends_with(']')
 }
 
 fn leading_indent(line: &str) -> usize {

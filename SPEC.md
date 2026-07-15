@@ -250,9 +250,18 @@ constructor invoked by `new ClassName(args)`.
 
 ### Inheritance (`[Parent]`)
 
-`class Child [Parent]:` gives Child a copy of Parent's fields and methods.
-It is resolved by flattening at compile time: there is no vtable, no dynamic
-dispatch, and no runtime cost.
+Parents are an attribute **above** the declaration, the way Rust writes
+`#[derive(...)]`:
+
+```python
+[Parent]
+class Child:
+```
+
+That gives Child a copy of Parent's fields and methods. It is resolved by
+flattening at compile time: there is no vtable, no dynamic dispatch, and no
+runtime cost. There is no trailing form; `class Child [Parent]:` is a syntax
+error.
 
 ```python
 class Ledger:
@@ -264,7 +273,8 @@ class Ledger:
     fn cap() -> u256:
         return 100
 
-contract Bank [Ledger]:
+[Ledger]
+contract Bank:
     u256 fee
 
     fn cap() -> u256:      # overrides Ledger.cap()
@@ -278,16 +288,17 @@ contract Bank [Ledger]:
 * **Methods**: inherited unless the child declares one of the same name, which
   overrides it. `new` is inherited like any other method.
 * **Transitive**: a parent is fully resolved before its children, so a chain
-  (`contract C [Mid]`, `class Mid [Base]`) inherits from the whole chain.
-* **Multiple parents** are allowed (`class C [A, B]`).
+  (`[Mid] contract C`, `[Base] class Mid`) inherits from the whole chain.
+* **Multiple parents** are allowed: `[A, B]`.
 
 Errors, all at compile time: an unknown parent; an inheritance cycle;
 re-declaring an inherited *field* (shadowing would silently give it a second
 slot); inheriting the same method from two parents without the child declaring
 which; and inheriting from a `contract` or from a generic class.
 
-There is no `super`: an override replaces the parent's method, it cannot
-extend it.
+`super.method()` calls the parent's version from an override, so a child can
+extend rather than only replace. It is a compile error where there is nothing to
+call: outside a method, or on a method the parent does not declare.
 
 ### Interfaces as parents (`implements`)
 
@@ -299,14 +310,15 @@ define every method it declares, with a matching signature:
 interface IThing:
     fn ping(u256 x) -> bool
 
-class Impl [IThing]:      # compile error unless Impl defines ping(u256) -> bool
+[IThing]
+class Impl:               # compile error unless Impl defines ping(u256) -> bool
     fn ping(u256 x) -> bool:
         return true
 ```
 
 Marker parents (`Serializable`, `Hashable`) are just classes with no fields or
 methods, so they inherit nothing and oblige nothing. They propagate down a
-chain: if `A [Serializable]` and `B [A]`, then B is serializable too.
+chain: if A has `[Serializable]` and B has `[A]`, then B is serializable too.
 
 ---
 

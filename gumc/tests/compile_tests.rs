@@ -125,6 +125,26 @@ fn amm_gum_compiles() {
     assert_compiles(&read_repo_file("examples/amm.gum"));
 }
 
+// The banner names the temp file gumc was handed, which is unique per run, so it is dropped before comparing. Everything after it is the Yul.
+fn yul_only(out: &str) -> String {
+    out.lines().filter(|l| !l.starts_with("--> Compiling")).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn compiling_the_same_source_twice_gives_the_same_output() {
+    // A build has to be reproducible or a deployed contract cannot be verified against its source.
+    // Two HashMaps decided emission order (the helper thunks, and the class-method loop), and Rust randomizes HashMap iteration per process, so every compile produced different but equivalent bytecode. Separate processes here, because that is where the randomness lives.
+    let src = read_repo_file("examples/amm.gum");
+    let (ok, first) = run_gumc(&src);
+    assert!(ok, "amm failed to compile:\n{}", first);
+    let first = yul_only(&first);
+    for i in 0..3 {
+        let (ok2, again) = run_gumc(&src);
+        assert!(ok2, "amm failed to compile on run {}", i);
+        assert_eq!(first, yul_only(&again), "compile {} differed from the first: output is not reproducible", i);
+    }
+}
+
 #[test]
 fn the_standard_library_module_compiles() {
     // The module gumc embeds, compiled through gumc itself. include_str! is the same path stdlib.rs uses, so this cannot pass against a file the binary does not ship.
@@ -741,7 +761,7 @@ fn a_transient_only_contract_never_touches_persistent_storage() {
 fn super_resolves_to_the_overridden_method() {
     let (ok, out) = run_gumc(
         "class Base:\n    u256 v\n\n    fn label() -> u256:\n        return 10\n\n\
-         class Child [Base]:\n    fn label() -> u256:\n        return super.label() + 5\n\n\
+         [Base]\nclass Child:\n    fn label() -> u256:\n        return super.label() + 5\n\n\
          contract C:\n    u256 z\n\n    export fn r():\n        C.z = 1\n",
     );
     assert!(ok, "expected success, got:\n{}", out);
@@ -754,7 +774,7 @@ fn super_resolves_to_the_overridden_method() {
 fn super_without_an_override_is_rejected() {
     let (ok, out) = run_gumc(
         "class Base:\n    u256 v\n\n    fn a() -> u256:\n        return 1\n\n\
-         class Child [Base]:\n    fn b() -> u256:\n        return super.a()\n\n\
+         [Base]\nclass Child:\n    fn b() -> u256:\n        return super.a()\n\n\
          contract C:\n    u256 z\n\n    export fn r():\n        C.z = 1\n",
     );
     assert!(!ok, "expected a compile error, got success:\n{}", out);
@@ -1373,20 +1393,20 @@ fn delete_on_a_storage_string_releases_its_data_slots() {
 fn inherited_fields_come_before_the_child_s_own() {
     // Ancestors first, so adding a field to a child can never move an
     // inherited one to a different slot.
-    let src = "class Base:\n    u256 a\n    u256 b\n\ncontract C [Base]:\n    u256 d\n\n    export fn get() -> u256:\n        return C.d\n";
+    let src = "class Base:\n    u256 a\n    u256 b\n\n[Base]\ncontract C:\n    u256 d\n\n    export fn get() -> u256:\n        return C.d\n";
     // a->0, b->1, d->2
     assert_output_contains(src, "sload(2)");
 }
 
 #[test]
 fn a_child_inherits_its_parent_s_methods() {
-    let src = "class Base:\n    u256 a\n\n    fn twice() -> u256:\n        return self.a * 2\n\ncontract C [Base]:\n    u256 z\n\n    export fn go() -> u256:\n        return C.twice()\n";
+    let src = "class Base:\n    u256 a\n\n    fn twice() -> u256:\n        return self.a * 2\n\n[Base]\ncontract C:\n    u256 z\n\n    export fn go() -> u256:\n        return C.twice()\n";
     assert_output_contains(src, "function C_twice()");
 }
 
 #[test]
 fn a_child_method_overrides_its_parent_s() {
-    let src = "class Base:\n    fn label() -> u256:\n        return 1\n\nclass Mid [Base]:\n    fn label() -> u256:\n        return 2\n\ncontract C [Mid]:\n    u256 z\n\n    export fn go() -> u256:\n        return C.label()\n";
+    let src = "class Base:\n    fn label() -> u256:\n        return 1\n\n[Base]\nclass Mid:\n    fn label() -> u256:\n        return 2\n\n[Mid]\ncontract C:\n    u256 z\n\n    export fn go() -> u256:\n        return C.label()\n";
     let (ok, output) = run_gumc(src);
     assert!(ok, "expected success, got:\n{}", output);
     // The override, not Base's body.
@@ -1399,7 +1419,7 @@ fn a_child_method_overrides_its_parent_s() {
 
 #[test]
 fn inheritance_is_transitive() {
-    let src = "class Base:\n    u256 a\n\nclass Mid [Base]:\n    u256 b\n\ncontract C [Mid]:\n    u256 c\n\n    export fn go() -> u256:\n        return C.a + C.b + C.c\n";
+    let src = "class Base:\n    u256 a\n\n[Base]\nclass Mid:\n    u256 b\n\n[Mid]\ncontract C:\n    u256 c\n\n    export fn go() -> u256:\n        return C.a + C.b + C.c\n";
     assert_compiles(src);
 }
 
@@ -1407,63 +1427,63 @@ fn inheritance_is_transitive() {
 fn a_contract_inherits_its_parent_s_constructor() {
     // new is inherited like any other method, so a contract whose own
     // declaration has no new still gets a deploy-time constructor.
-    let src = "class Base:\n    u256 a\n\n    fn new(u256 v):\n        self.a = v\n\ncontract C [Base]:\n    u256 z\n";
+    let src = "class Base:\n    u256 a\n\n    fn new(u256 v):\n        self.a = v\n\n[Base]\ncontract C:\n    u256 z\n";
     assert_output_contains(src, "// --- Deployment Code ---");
     assert_output_contains(src, "C_new");
 }
 
 #[test]
 fn inheriting_from_an_unknown_class_fails() {
-    assert_compile_fails("class A [Nope]:\n    u256 x\n");
+    assert_compile_fails("[Nope]\nclass A:\n    u256 x\n");
 }
 
 #[test]
 fn an_inheritance_cycle_fails() {
-    assert_compile_fails("class A [B]:\n    u256 x\n\nclass B [A]:\n    u256 y\n");
+    assert_compile_fails("[B]\nclass A:\n    u256 x\n\n[A]\nclass B:\n    u256 y\n");
 }
 
 #[test]
 fn re_declaring_an_inherited_field_fails() {
     // Shadowing a field would silently give it a second slot.
-    assert_compile_fails("class A:\n    u256 x\n\nclass B [A]:\n    u256 x\n");
+    assert_compile_fails("class A:\n    u256 x\n\n[A]\nclass B:\n    u256 x\n");
 }
 
 #[test]
 fn an_ambiguous_inherited_method_fails() {
     assert_compile_fails(
-        "class A:\n    fn f() -> u256:\n        return 1\n\nclass B:\n    fn f() -> u256:\n        return 2\n\nclass C [A, B]:\n    u256 z\n",
+        "class A:\n    fn f() -> u256:\n        return 1\n\nclass B:\n    fn f() -> u256:\n        return 2\n\n[A, B]\nclass C:\n    u256 z\n",
     );
 }
 
 #[test]
 fn inheriting_from_a_contract_fails() {
-    assert_compile_fails("contract K:\n    u256 x\n\nclass B [K]:\n    u256 y\n");
+    assert_compile_fails("contract K:\n    u256 x\n\n[K]\nclass B:\n    u256 y\n");
 }
 
 #[test]
 fn an_interface_parent_requires_every_method() {
     // class C [ISomething] means "implements".
-    assert_compile_fails("interface IThing:\n    fn ping(u256 x) -> bool\n\nclass Impl [IThing]:\n    u256 v\n");
+    assert_compile_fails("interface IThing:\n    fn ping(u256 x) -> bool\n\n[IThing]\nclass Impl:\n    u256 v\n");
 }
 
 #[test]
 fn an_interface_parent_requires_matching_signatures() {
     assert_compile_fails(
-        "interface IThing:\n    fn ping(u256 x) -> bool\n\nclass Impl [IThing]:\n    u256 v\n    fn ping(u256 x) -> u256:\n        return 1\n",
+        "interface IThing:\n    fn ping(u256 x) -> bool\n\n[IThing]\nclass Impl:\n    u256 v\n    fn ping(u256 x) -> u256:\n        return 1\n",
     );
 }
 
 #[test]
 fn a_conforming_class_satisfies_its_interface_parent() {
     assert_compiles(
-        "interface IThing:\n    fn ping(u256 x) -> bool\n\nclass Impl [IThing]:\n    u256 v\n    fn ping(u256 x) -> bool:\n        return true\n",
+        "interface IThing:\n    fn ping(u256 x) -> bool\n\n[IThing]\nclass Impl:\n    u256 v\n    fn ping(u256 x) -> bool:\n        return true\n",
     );
 }
 
 #[test]
 fn a_marker_parent_propagates_through_a_chain() {
     // B is [A], A is [Serializable]; B must still be serializable.
-    let src = "use gum.defaults.Serializable\n\nclass A [Serializable]:\n    u256 x\n\n    fn new(u256 v):\n        self.x = v\n\nclass B [A]:\n    u256 y\n\ncontract App:\n    export fn go() -> [u8]:\n        var b = new B(7)\n        return b.serialize()\n";
+    let src = "use gum.defaults.Serializable\n\n[Serializable]\nclass A:\n    u256 x\n\n    fn new(u256 v):\n        self.x = v\n\n[A]\nclass B:\n    u256 y\n\ncontract App:\n    export fn go() -> [u8]:\n        var b = new B(7)\n        return b.serialize()\n";
     assert_output_contains(src, "function B_serialize");
 }
 

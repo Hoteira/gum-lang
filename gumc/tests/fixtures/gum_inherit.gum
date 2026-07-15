@@ -10,13 +10,15 @@ class Ledger:
     fn cap() -> u256:
         return 100
 
-class Owned [Ledger]:
+[Ledger]
+class Owned:
     Account owner
 
     export fn claim():
         self.owner = Message.sender()
 
-contract Bank [Owned]:
+[Owned]
+contract Bank:
     u256 fee
 
     fn cap() -> u256:

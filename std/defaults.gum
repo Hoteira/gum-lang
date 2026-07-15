@@ -24,7 +24,8 @@ class Hashable:
 //   a.transfer(amount)             send ETH; reverts on failure
 //   a.delegated_to()   -> Account  EIP-7702 delegate, or 0 if none
 //   a.is_delegated()   -> bool
-class Account [Serializable]:
+[Serializable]
+class Account:
     u256 address
 
     fn new(mut u256 starting_balance):

@@ -1503,7 +1503,12 @@ pub struct Translator<'a> {
     // call thunks, constructor thunks), keyed by function name so repeated
     // call sites share one definition. Emitted once, after translation, by
     // whoever drains them.
-    helper_thunks: RefCell<HashMap<String, String>>,
+    //
+    // BTreeMap, not HashMap: the drain order is the emission order, and Rust
+    // randomizes HashMap iteration per process, so a HashMap here made the same
+    // source compile to different (equivalent) bytecode on every run. Ordering
+    // by name costs nothing and is what makes a build reproducible.
+    helper_thunks: RefCell<BTreeMap<String, String>>,
     // Each f-string/plain-string literal gets its own uniquely-named
     // assembly thunk (its content is fixed at compile time), so this just
     // hands out unique suffixes.
@@ -1548,7 +1553,7 @@ impl<'a> Translator<'a> {
             layout_engine,
             abi_gen,
             top_level_fns,
-            helper_thunks: RefCell::new(HashMap::new()),
+            helper_thunks: RefCell::new(BTreeMap::new()),
             literal_counter: RefCell::new(0),
             rich_reverts,
             events: RefCell::new(BTreeMap::new()),
@@ -1602,11 +1607,10 @@ impl<'a> Translator<'a> {
         *c
     }
 
+    // Drained in name order, which BTreeMap gives for free, so the emitted helpers land in the same order on every run.
     pub fn drain_helper_thunks(&self) -> Vec<String> {
-        self.helper_thunks
-            .borrow_mut()
-            .drain()
-            .map(|(_, body)| body)
+        std::mem::take(&mut *self.helper_thunks.borrow_mut())
+            .into_values()
             .collect()
     }
 

@@ -437,10 +437,25 @@ non-exhaustive `match` is already rejected.
 
 ## Determinism
 
-The layout is a deterministic function of the source: field placement walks
-classes in registration order (declaration, then import order), never a
-randomized hash-map iteration. The same source always compiles to the same
-slots, required for reproducible builds and for the upgrade lock below.
+Compilation is a deterministic function of the source: the same input always
+produces byte-identical output. That is what lets a deployed contract be
+verified against the code it came from.
+
+Three places decide an order, and none of them may be a hash map:
+
+- **Field placement** walks classes in registration order (declaration, then
+  import order), so the same source always gets the same slots. The upgrade
+  lock below is built on this.
+- **Helper functions** are emitted in name order.
+- **Class methods** are emitted in that same registration order.
+
+Rust randomizes hash-map iteration per process, so a hash map in any of these
+paths means the same source compiles to different, though equivalent, bytecode
+on every run. Field placement always avoided that; the two codegen paths did
+not, and were fixed once a test caught it.
+`compiling_the_same_source_twice_gives_the_same_output` compiles a reference
+contract in four separate processes, since that is where the randomness lives,
+and diffs the output.
 
 ---
 

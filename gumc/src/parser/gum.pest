@@ -178,9 +178,16 @@ class_field = { is_transient? ~ is_mut? ~ is_const? ~ type_keyword ~ ident ~ ";"
 class_body = { "{" ~ (fn_decl | class_field)* ~ "}" }
 // `contract`/`interface` carry their own noun, so the `class` keyword is
 // optional after a prefix; a bare struct still needs the `class` keyword.
+// Parents are an attribute *above* the declaration, like Rust's #[derive(...)]:
+//
+//     [Owned]
+//     contract Vault:
+//
+// There is no trailing form. One spelling only, so a reader never has to look
+// in two places to see what a class is made of.
 class_decl = {
-    (is_global | is_extern) ~ "class"? ~ ident ~ generic_params? ~ parents? ~ (class_body | ";")
-  | "class" ~ ident ~ generic_params? ~ parents? ~ (class_body | ";")
+    parents? ~ (is_global | is_extern) ~ "class"? ~ ident ~ generic_params? ~ (class_body | ";")
+  | parents? ~ "class" ~ ident ~ generic_params? ~ (class_body | ";")
 }
 
 enum_variant = { ident ~ ("(" ~ type_keyword ~ ")")? ~ ";" }

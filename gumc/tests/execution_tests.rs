@@ -4252,7 +4252,7 @@ fn super_calls_the_overridden_method() {
         }
     };
     let src = "class Base:\n    u256 v\n\n    fn label() -> u256:\n        return 10\n\n\
-               class Child [Base]:\n    fn label() -> u256:\n        return super.label() + 5\n\n\
+               [Base]\nclass Child:\n    fn label() -> u256:\n        return super.label() + 5\n\n\
                contract C:\n    u256 out\n\n    export fn run() -> u256:\n        \
                mut Child c = new Child()\n        return c.label()\n";
     let mut db: Db = CacheDB::new(EmptyDB::default());

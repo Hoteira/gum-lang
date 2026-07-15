@@ -150,7 +150,7 @@ f"balance: {amt}"                     // interpolation, produces a String
 |---------|-------|
 | `contract Name:` | the persistent on-chain state singleton: fields sit at fixed storage slots, `export fn`s are its entry points. A file may declare several |
 | `class Name:` | a plain struct, a value with no storage slot of its own |
-| `class Child [Parent]:` | inherits Parent's fields and methods. An `interface` parent instead means *implements*: the child must define its methods |
+| `[Parent]` *(above a class)* | inherits Parent's fields and methods, written as an attribute above the declaration like Rust's `#[derive(...)]`. Several parents go in one list, `[A, B]`. An `interface` parent instead means *implements*: the child must define its methods |
 | `interface Name:` | an external contract's ABI; method calls compile to `CALL` (`extern class` also accepted) |
 | `export fn` | a public entry point, declared inside a `contract`. A bare `fn` is internal, with no ABI selector |
 | `export payable fn` | a public entry point that may receive ETH. Without `payable`, any value-bearing call reverts |
@@ -216,7 +216,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | Other scalars | `bool`, `Account` (EVM address, masked to 160 bits at boundaries) |
 | Mappings | `HashMap(K, V)`, scalar-valued, nested (`HashMap(K, HashMap(K, V))`), struct-valued |
 | Structs | user `class`, in memory and in storage, as a mapping value or as an array element. `arr[i].field` and `m[k].field` compile to the same slot arithmetic; a struct array element occupies whole slots and never packs with its neighbours, exactly as Solidity lays it out |
-| Inheritance | `class Child [Parent]` inherits fields (ancestors first, as Solidity orders them) and methods, transitively; a child method overrides, and `super.method()` calls the parent's. An `interface` parent means *implements*, checked signature by signature |
+| Inheritance | an `[Parent]` attribute above a class inherits its fields (ancestors first, as Solidity orders them) and methods, transitively; a child method overrides, and `super.method()` calls the parent's. An `interface` parent means *implements*, checked signature by signature |
 | Storage strings | `String`/`Bytes` `contract` fields use Solidity's exact storage layout (short packed inline, long at `keccak256(slot)`), slot for slot |
 | Storage arrays | fixed `[T; N]` and dynamic `[T]` with `.push()`, `.pop()`, `.length`, indexing, all bounds-checked, and packed like Solidity's (32 `u8`s to a slot) |
 | Storage vectors | a `Vec(T)` `contract` field is a storage vector: the same layout as `[T]`, and it takes either spelling (`v[i]`/`v.get(i)`, `.length`/`.len()`) |
@@ -231,6 +231,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | Modern EVM | transient-storage reentrancy guards (EIP-1153), `MCOPY` for memory copies (EIP-5656), `keccak256(...)`, `ecrecover(...)`, and `Crypto.verify_p256(...)` via the secp256r1 precompile (EIP-7951 / RIP-7212), `a.delegated_to()` / `a.is_delegated()` for EIP-7702 accounts |
 | Safety | checked arithmetic, reentrancy guards on by default (transient storage; `unsafe fn` opts out), nonpayable guard, calldata-length validation, address masking, returndata checks, array-bounds `Panic(0x32)` in memory and storage |
 | Upgrades | storage-layout lockfile (`--lock`) pins committed fields and errors on unsafe changes |
+| Reproducible builds | the same source always compiles to byte-identical bytecode, which is what lets a deployed contract be verified against its source. Emission order is stable everywhere (slots, helpers, class methods), never a randomized hash-map walk. Asserted by a test that compiles a reference contract in separate processes and diffs the output |
 | ABI | standard 4-byte selectors; `address`/`uintN`/`bool`, `string`/`bytes`, `T[]`, a `class` of scalar fields as a `tuple`, and `T[]` of those tuples. Each works in every direction: arguments, returns, constructor arguments, `new Child(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied |
 
 Reference contracts live in [`examples/`](examples/): [`token`](examples/token.gum),

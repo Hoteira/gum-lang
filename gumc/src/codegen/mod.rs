@@ -920,7 +920,15 @@ impl EvmYulBackend {
         shared_functions.push_str("      function Block_number() -> ret {\n          ret := number()\n      }\n\n");
 
         let instantiations = collect_generic_instantiations(program, type_checker);
-        for (class_name, class_decl) in &type_checker.loaded_classes {
+        // Walk class_order, the order classes were registered in, rather than loaded_classes directly.
+        // loaded_classes is a HashMap and Rust randomizes its iteration per process, so iterating it here emitted these functions in a different order on every run: same source, different (equivalent) bytecode, and no way to verify a deployed contract against its source.
+        // layout.rs already walks class_order for the same reason; this is the other half of it.
+        let ordered: Vec<(&String, &ClassDecl)> = type_checker
+            .class_order
+            .iter()
+            .filter_map(|n| type_checker.loaded_classes.get(n).map(|c| (n, c)))
+            .collect();
+        for (class_name, class_decl) in ordered {
             if type_checker.loaded_interfaces.contains(class_name) || class_name == "Message" || class_name == "Block" {
                 continue;
             }
