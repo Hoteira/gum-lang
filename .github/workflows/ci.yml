@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A test that skips is not a test that passes. Without solc the 68 differential
+  # tests, which are the entire basis for "behaves like Solidity", quietly skip
+  # and the run still goes green. This makes a missing solc a failure.
+  GUM_REQUIRE_SOLC: 1
+  # Pinned rather than "latest": the differential tests diff gum's output against
+  # this compiler's, and the size table is measured against it. A silent bump
+  # would move those numbers with no commit to blame.
+  SOLC_VERSION: "0.8.36"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gumc
+
+      - name: Install solc ${{ env.SOLC_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          curl -fsSL -o tools/solc \
+            "https://github.com/ethereum/solidity/releases/download/v${SOLC_VERSION}/solc-static-linux"
+          chmod +x tools/solc
+          # Fail here rather than let the tests report a confusing mismatch later.
+          tools/solc --version | grep -q "${SOLC_VERSION}"
+
+      - name: Build
+        working-directory: gumc
+        run: cargo build --locked --verbose
+
+      - name: Test
+        working-directory: gumc
+        run: cargo test --locked --verbose
+
+      - name: Reference contract sizes
+        working-directory: gumc
+        run: cargo test --locked --test execution_tests size_report -- --nocapture
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gumc
+
+      # Not --deny warnings: the tree has warnings today, and a lint job that
+      # fails on day one is a lint job everyone learns to ignore.
+      - name: Clippy
+        working-directory: gumc
+        run: cargo clippy --locked --all-targets

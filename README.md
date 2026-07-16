@@ -4,6 +4,8 @@
 
 # gum
 
+[![CI](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml)
+
 **Smart contracts that read like Python.**
 
 Write Ethereum contracts in a language you already know how to read.

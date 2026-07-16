@@ -17,6 +17,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+// Same lookup as the execution tests: $SOLC, then tools/solc(.exe), then PATH.
+// GUM_REQUIRE_SOLC=1 makes a missing solc an error rather than a skip, so CI cannot go green while quietly asserting nothing.
+fn find_solc() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SOLC") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for name in ["solc.exe", "solc"] {
+        let p = repo_root().join("tools").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if Command::new("solc").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return Some(PathBuf::from("solc"));
+    }
+    assert!(
+        std::env::var("GUM_REQUIRE_SOLC").is_err(),
+        "GUM_REQUIRE_SOLC is set but no solc was found: checked $SOLC, tools/solc(.exe), and PATH"
+    );
+    None
+}
+
 fn repo_root() -> PathBuf {
     // gumc/tests/ -> gumc/ -> gum/ (where std/ and examples/ live)
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -50,14 +75,16 @@ fn run_gumc_with_args(source: &str, extra_args: &[&str]) -> (bool, String) {
 /// Asserts the source compiles all the way down to EVM bytecode via
 /// --bytecode. Doubles as a *Yul validity* check: gumc itself never parses
 /// the Yul it emits, so solc's strict-assembly front-end is the only thing
-/// that can catch malformed Yul. Skips silently when tools/solc.exe isn't
-/// present (solc is optional tooling, not a build dependency).
+/// that can catch malformed Yul. Skips silently when no solc is present
+/// (solc is optional tooling, not a build dependency).
 fn assert_assembles(source: &str) {
-    let solc = repo_root().join("tools").join("solc.exe");
-    if !solc.exists() {
-        eprintln!("skipping bytecode assertion: {} not found", solc.display());
-        return;
-    }
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping bytecode assertion: no solc found");
+            return;
+        }
+    };
     let solc_arg = solc.to_string_lossy().into_owned();
     let (ok, output) = run_gumc_with_args(source, &["--bytecode", "--solc", &solc_arg]);
     assert!(ok, "expected bytecode assembly to succeed, got:\n{}", output);
@@ -685,11 +712,13 @@ fn a_persistent_only_contract_has_no_transient_opcodes_in_its_bytecode() {
     // This asserts on the *bytecode* rather than the Yul because that is where
     // the claim lives: the emitted Yul is what we control, but only the
     // assembled bytecode proves nothing crept in through a helper.
-    let solc = repo_root().join("tools").join("solc.exe");
-    if !solc.exists() {
-        eprintln!("skipping: no solc");
-        return;
-    }
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
     let solc_arg = solc.to_string_lossy().into_owned();
     let (ok, out) = run_gumc_with_args(
         "contract S:\n    u256 t\n\n    export fn a():\n        S.t = 1\n\n    export fn b() -> u256:\n        return S.t\n",
@@ -718,11 +747,13 @@ fn a_transient_only_contract_never_touches_persistent_storage() {
     // covered (scalar, dynamic array, mapping, and storage string) because
     // each has its own helper family, and the guarantee is only as good as its
     // weakest one.
-    let solc = repo_root().join("tools").join("solc.exe");
-    if !solc.exists() {
-        eprintln!("skipping: no solc");
-        return;
-    }
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
     let solc_arg = solc.to_string_lossy().into_owned();
     let (ok, out) = run_gumc_with_args(
         "contract T:\n    transient u256 a\n    transient [u256] xs\n    \
@@ -810,11 +841,13 @@ fn a_const_field_is_read_from_code_and_never_from_storage() {
     //
     // counter is a real storage field, so exactly one SLOAD and one SSTORE
     // are expected. Two immutables read via SLOAD would make it three.
-    let solc = repo_root().join("tools").join("solc.exe");
-    if !solc.exists() {
-        eprintln!("skipping: no solc");
-        return;
-    }
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
     let solc_arg = solc.to_string_lossy().into_owned();
     let (ok, out) = run_gumc_with_args(const_field_src(), &["--bytecode", "--solc", &solc_arg]);
     assert!(ok, "expected success, got:\n{}", out);
@@ -869,10 +902,7 @@ fn a_const_field_is_absent_from_the_storage_lock() {
 
 /// The assembled runtime hex for a source, or None when solc is absent.
 fn bytecode_of(src: &str) -> Option<String> {
-    let solc = repo_root().join("tools").join("solc.exe");
-    if !solc.exists() {
-        return None;
-    }
+    let solc = find_solc()?;
     let solc_arg = solc.to_string_lossy().into_owned();
     let (ok, out) = run_gumc_with_args(src, &["--bytecode", "--solc", &solc_arg]);
     assert!(ok, "expected success, got:\n{}", out);
@@ -2079,11 +2109,13 @@ fn transient_fields_are_absent_from_the_storage_lock() {
     let dir = std::env::temp_dir().join(format!("gum_tlock_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let lock = dir.join("layout.json");
-    let solc = repo_root().join("tools").join("solc.exe");
-    if !solc.exists() {
-        eprintln!("skipping: no solc");
-        return;
-    }
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
     let (ok, out) = run_gumc_with_args(
         "contract C:\n    u256 kept\n    transient u256 scratch\n\n    export fn go():\n        C.kept = 1\n        C.scratch = 2\n",
         &["--lock", &lock.to_string_lossy()],

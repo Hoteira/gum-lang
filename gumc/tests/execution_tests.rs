@@ -7,8 +7,9 @@
 // storage, return data, and success/revert on both. This is what converts
 // "looks right" into "provably behaves like solc".
 //
-// Requires tools/solc.exe (same as the assembly tests); skips gracefully if
-// absent, since solc is optional tooling rather than a build dependency.
+// Needs solc (see solc_path below for how it is found); skips gracefully if
+// absent, since solc is optional tooling rather than a build dependency. CI
+// sets GUM_REQUIRE_SOLC so a skip there is a failure instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,9 +29,31 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
+// Finds solc: $SOLC first, then tools/solc(.exe), then whatever is on PATH.
+// The bare name is the fallback rather than the default so a local tools/ copy still wins, which is what keeps a developer's runs on the version this repo was verified against.
+//
+// Returning None makes the caller skip, since solc is optional tooling and not a build dependency. That is right on a laptop and wrong in CI, where a silent skip would turn 68 differential tests into a green tick that asserted nothing. GUM_REQUIRE_SOLC=1 turns the skip into a failure; the workflow sets it.
 fn solc_path() -> Option<PathBuf> {
-    let p = repo_root().join("tools").join("solc.exe");
-    if p.exists() { Some(p) } else { None }
+    if let Ok(p) = std::env::var("SOLC") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for name in ["solc.exe", "solc"] {
+        let p = repo_root().join("tools").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if Command::new("solc").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return Some(PathBuf::from("solc"));
+    }
+    assert!(
+        std::env::var("GUM_REQUIRE_SOLC").is_err(),
+        "GUM_REQUIRE_SOLC is set but no solc was found: checked $SOLC, tools/solc(.exe), and PATH"
+    );
+    None
 }
 
 fn tmp_path(ext: &str) -> PathBuf {
@@ -389,7 +412,7 @@ fn diff_run(calls: &[(&str, Vec<U256>)], rich: bool) {
     let solc = match solc_path() {
         Some(p) => p,
         None => {
-            eprintln!("skipping execution diff: tools/solc.exe not found");
+            eprintln!("skipping execution diff: no solc found");
             return;
         }
     };
