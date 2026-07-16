@@ -609,10 +609,30 @@ contract C:
                 return amount
 ```
 
-An enum value is a pointer to `[tag, payload]` in memory; the tag is the
-variant's 0-based declaration index. `match` switches on the tag and, for a
-payload variant, binds the payload in the arm's scope. Match must be
+The tag is the variant's 0-based declaration index. `match` switches on it and,
+for a payload variant, binds the payload in the arm's scope. Match must be
 exhaustive.
+
+How an enum is represented depends on whether *any* of its variants carries a
+payload, and the difference is load-bearing:
+
+| | payload-free enum | payload-carrying enum |
+|---|---|---|
+| representation | the tag, a plain `u8` | a pointer to `[tag, payload]` in memory |
+| `size_of` | 1 | 64 |
+| storage | one packed byte, exactly as Solidity lays an enum out | none: a compile error |
+| ABI | `uint8`, and `[S]` is a `uint8[]` | none: a compile error |
+| in a mapping, array, struct | yes, like any `u8` | none: a compile error |
+| as a local | yes | yes |
+
+A payload-free enum is a `u8` in every respect. It packs 32-to-a-slot, stores as
+one byte, logs as `uint8`, and crosses the ABI as `uint8`, so it is
+slot-for-slot and wire-for-wire what Solidity does.
+
+A payload-carrying enum exists only in memory: construct it, `match` it, bind
+the payload. It has no ABI encoding (a `uint8` carries a tag and nothing else)
+and no Solidity storage equivalent, so anywhere a size would be needed it is
+rejected rather than laid out as 64 opaque bytes.
 
 ---
 

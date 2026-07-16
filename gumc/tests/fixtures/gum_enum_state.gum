@@ -1,0 +1,35 @@
+use gum.defaults.Account
+
+enum Status:
+    Active
+    Paused
+    Closed
+
+enum Logs:
+    Changed
+
+contract C:
+    Status state
+    u256 after_enum
+    HashMap(Account, Status) per_user
+
+    export fn set_state(Status s):
+        C.state = s
+
+    export fn get_state() -> Status:
+        return C.state
+
+    export fn set_after(u256 v):
+        C.after_enum = v
+
+    export fn get_after() -> u256:
+        return C.after_enum
+
+    export fn set_user(Account k, Status s):
+        C.per_user[k] = s
+
+    export fn get_user(Account k) -> Status:
+        return C.per_user[k]
+
+    export fn emit_it(Status s):
+        log(Logs.Changed, s)

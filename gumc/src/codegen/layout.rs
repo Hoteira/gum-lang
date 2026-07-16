@@ -269,11 +269,8 @@ impl<'a> LayoutEngine<'a> {
 
             let mut layout = match lock.and_then(|m| m.classes.get(&class_name)) {
                 Some(committed) => self.pack_storage_fields_locked(&class_name, &persistent, committed, &mut append)?,
-                None => {
-                    let (l, next) = self.pack_storage_fields(&persistent, append, false);
-                    append = next;
-                    l
-                }
+                // The returned next-free slot is discarded: append is per-class, and the transient pass below starts its own keyspace at 0.
+                None => self.pack_storage_fields(&persistent, append, false).0,
             };
             let (tlayout, _) = self.pack_storage_fields(&transient, 0, true);
             layout.extend(tlayout);
@@ -391,7 +388,9 @@ impl<'a> LayoutEngine<'a> {
                 } else if self.type_checker.loaded_classes.contains_key(name) {
                     32 // Class known but not yet laid out (shouldn't normally happen)
                 } else if self.type_checker.loaded_enums.contains_key(name) {
-                    64 // 32 bytes for tag + 32 bytes for max payload
+                    // A payload-free enum is a tag and nothing else, so it is one byte, exactly as Solidity lays an enum out. Saying 64 here was the root of a family of bugs: it burned two storage slots instead of one byte, displaced every field after it, and made the mapping/log paths write the memory pointer instead of the value.
+                    // A payload-carrying enum keeps the [tag][payload] pair, which only exists in memory; it is rejected anywhere that needs a size, so this number is never used to lay one out.
+                    if self.type_checker.enum_has_payload(name) { 64 } else { 1 }
                 } else {
                     32
                 }
@@ -405,7 +404,6 @@ impl<'a> LayoutEngine<'a> {
             Type::Generic { .. } => {
                 32
             }
-            _ => 32
         }
     }
 

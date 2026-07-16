@@ -27,3 +27,15 @@ contract C:
         if x == 0:
             return Status.Active
         return Status.Closed
+
+    export fn count_closed([Status] xs) -> u256:
+        mut u256 n = 0
+        for x in xs:
+            match x:
+                Active:
+                    n = n + 0
+                Paused:
+                    n = n + 0
+                Closed:
+                    n = n + 1
+        return n

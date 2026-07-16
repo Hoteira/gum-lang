@@ -22,6 +22,14 @@ contract C {
         return s;
     }
 
+    function count_closed(Status[] calldata xs) external pure returns (uint256) {
+        uint256 n = 0;
+        for (uint256 i = 0; i < xs.length; i++) {
+            if (xs[i] == Status.Closed) n += 1;
+        }
+        return n;
+    }
+
     function pick(uint256 x) external pure returns (Status) {
         if (x == 0) return Status.Active;
         return Status.Closed;

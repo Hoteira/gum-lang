@@ -227,7 +227,7 @@ fn deploy_with_gas(db: &mut Db, creation: Vec<u8>) -> (Address, u64) {
         .build()
         .expect("bad deploy tx");
     match evm.transact_commit(tx).expect("deploy tx failed") {
-        ExecutionResult::Success { output: Output::Create(_, Some(addr)), gas, .. } => (addr, gas.used()),
+        ExecutionResult::Success { output: Output::Create(_, Some(addr)), gas, .. } => (addr, gas.tx_gas_used()),
         other => panic!("deployment did not create a contract: {:?}", other),
     }
 }
@@ -274,10 +274,10 @@ fn call_with_value(db: &mut Db, caller: Address, to: Address, data: Vec<u8>, val
                 let topics = l.data.topics().iter().map(|t| t.0).collect();
                 (topics, l.data.data.to_vec())
             }).collect();
-            CallResult { success: true, output: output.into_data().to_vec(), logs, gas: gas.used() }
+            CallResult { success: true, output: output.into_data().to_vec(), logs, gas: gas.tx_gas_used() }
         }
-        ExecutionResult::Revert { output, gas, .. } => CallResult { success: false, output: output.to_vec(), logs: vec![], gas: gas.used() },
-        ExecutionResult::Halt { gas, .. } => CallResult { success: false, output: vec![], logs: vec![], gas: gas.used() },
+        ExecutionResult::Revert { output, gas, .. } => CallResult { success: false, output: output.to_vec(), logs: vec![], gas: gas.tx_gas_used() },
+        ExecutionResult::Halt { gas, .. } => CallResult { success: false, output: vec![], logs: vec![], gas: gas.tx_gas_used() },
     }
 }
 
@@ -376,6 +376,8 @@ const GUM_STRUCT_DEPLOY: &str = include_str!("fixtures/gum_struct_deploy.gum");
 const GUM_IFACE_CALL: &str = include_str!("fixtures/gum_iface_call.gum");
 const GUM_MSG_BLOCK: &str = include_str!("fixtures/gum_msg_block.gum");
 const GUM_ENUM_ABI: &str = include_str!("fixtures/gum_enum_abi.gum");
+const GUM_ENUM_STATE: &str = include_str!("fixtures/gum_enum_state.gum");
+const SOL_ENUM_STATE: &str = include_str!("fixtures/sol_enum_state.sol");
 const GUM_VIEW: &str = include_str!("fixtures/gum_view.gum");
 const SOL_PROBER: &str = include_str!("fixtures/sol_prober.sol");
 const SOL_ENUM_ABI: &str = include_str!("fixtures/sol_enum_abi.sol");
@@ -3957,7 +3959,6 @@ fn p256_verify_accepts_a_real_signature_and_rejects_tampering() {
         }
     };
     use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     let mut gdb: Db = CacheDB::new(EmptyDB::default());
     let addr = deploy(&mut gdb, gum_creation_bytecode(GUM_P256, &solc, false));
@@ -4723,6 +4724,20 @@ fn enums_cross_the_abi_like_solidity() {
         assert_eq!(gr.output, sr.output, "pick({}) differs from solidity", x);
         assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "pick returns a tag");
     }
+    // An array of enums. A payload-free enum is a u8, so [S] is a uint8[]: one byte per element, 32 to a word, exactly like a [u8].
+    let mut d = selector("count_closed(uint8[])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&word_u256(U256::from(5u64)));
+    for tag in [0u64, 2, 2, 1, 2] {
+        d.extend_from_slice(&word_u256(U256::from(tag)));
+    }
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert!(gr.success, "gum count_closed reverted");
+    assert!(sr.success, "sol count_closed reverted");
+    assert_eq!(gr.output, sr.output, "count_closed differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(3u64), "three Closed in the array");
+
 }
 
 // A function the ABI calls `view` has to survive STATICCALL, which is what solc emits when one contract calls another's view function. Anything that writes state reverts in there.
@@ -4779,3 +4794,64 @@ fn view_functions_survive_a_staticcall() {
     assert_eq!(U256::from_be_slice(&r.output), U256::from(42u64), "double still computes");
 }
 
+
+// An enum in storage, in a mapping, and in a log. All three used to write the enum's *memory pointer* rather than its value, because size_of(enum) claimed 64 bytes for a [tag][payload] pair.
+// A payload-free enum is a u8, exactly as Solidity lays one out, so this diffs the raw slots rather than only the getters: a getter that reads back what it wrongly wrote would agree with itself.
+#[test]
+fn enum_state_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(GUM_ENUM_STATE, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(SOL_ENUM_STATE, &solc));
+
+    // Storage: set, read back, and check the enum really is one packed byte.
+    for tag in [0u64, 1, 2] {
+        let d = encode("set_state(uint8)", &[U256::from(tag)]);
+        assert!(call(&mut gdb, g, d.clone()).success, "gum set_state reverted");
+        assert!(call(&mut sdb, s, d).success, "sol set_state reverted");
+        let gr = call(&mut gdb, g, encode("get_state()", &[]));
+        let sr = call(&mut sdb, s, encode("get_state()", &[]));
+        assert_eq!(gr.output, sr.output, "get_state({}) differs from solidity", tag);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(tag), "the tag survives a storage round trip");
+    }
+
+    // The enum must occupy one byte, not a whole slot and certainly not two.
+    // gum packs size-first, so its slot numbers need not match solidity's; what must hold is that the value is a byte and the neighbour is untouched.
+    assert!(call(&mut gdb, g, encode("set_after(uint256)", &[U256::from(12345u64)])).success);
+    let gr = call(&mut gdb, g, encode("get_after()", &[]));
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(12345u64), "the field after an enum is not clobbered");
+    let gr = call(&mut gdb, g, encode("get_state()", &[]));
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(2u64), "and the enum still reads back after its neighbour was written");
+
+    // Mapping value: this used to sstore the memory pointer.
+    let who: Address = "0x00000000000000000000000000000000cafebabe".parse().unwrap();
+    for tag in [0u64, 2, 1] {
+        let d = encode_words("set_user(address,uint8)", &[word_addr(who), word_u256(U256::from(tag))]);
+        assert!(call(&mut gdb, g, d.clone()).success, "gum set_user reverted");
+        assert!(call(&mut sdb, s, d).success, "sol set_user reverted");
+        let gr = call(&mut gdb, g, encode_words("get_user(address)", &[word_addr(who)]));
+        let sr = call(&mut sdb, s, encode_words("get_user(address)", &[word_addr(who)]));
+        assert_eq!(gr.output, sr.output, "get_user({}) differs from solidity", tag);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(tag), "the tag survives a mapping round trip");
+    }
+
+    // Log: the data word used to be the pointer, and topic0 was hashed from "Changed(uint256)" while the parameter path called the same enum uint8.
+    for tag in [0u64, 1, 2] {
+        let d = encode("emit_it(uint8)", &[U256::from(tag)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert!(gr.success, "gum emit_it reverted");
+        assert_eq!(gr.logs.len(), 1, "one log");
+        assert_eq!(sr.logs.len(), 1, "one log");
+        assert_eq!(gr.logs[0].0, sr.logs[0].0, "topic0 differs: the event signature disagrees with solidity");
+        assert_eq!(gr.logs[0].1, sr.logs[0].1, "log data differs from solidity");
+        assert_eq!(U256::from_be_slice(&gr.logs[0].1), U256::from(tag), "the log carries the tag, not a pointer");
+    }
+}

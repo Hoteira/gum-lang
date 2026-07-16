@@ -3,7 +3,6 @@ use crate::parser;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct SymbolInfo {
@@ -343,6 +342,31 @@ impl TypeChecker {
         None
     }
 
+    // Whether an enum has any variant carrying a payload.
+    //
+    // This is the whole distinction that matters for an enum's size. A
+    // payload-free enum is just a tag, so it is a u8 exactly like Solidity's,
+    // and every place that stores or encodes one can treat it as a scalar. A
+    // payload-carrying one needs the [tag][payload] pair in memory, which has
+    // no ABI form and no Solidity storage equivalent, so it is memory-only and
+    // rejected anywhere a size would be needed.
+    pub fn enum_has_payload(&self, name: &str) -> bool {
+        self.loaded_enums
+            .get(name)
+            .map(|e| e.variants.iter().any(|v| v.payload.is_some()))
+            .unwrap_or(false)
+    }
+
+    // Whether t is a payload-free enum, i.e. one that behaves as a plain u8 tag.
+    pub fn is_scalar_enum(&self, t: &Type) -> bool {
+        matches!(t, Type::Primitive(n) if self.loaded_enums.contains_key(n) && !self.enum_has_payload(n))
+    }
+
+    // Whether t is a payload-carrying enum: usable as a local, illegal anywhere that needs a size.
+    pub fn is_payload_enum(&self, t: &Type) -> bool {
+        matches!(t, Type::Primitive(n) if self.enum_has_payload(n))
+    }
+
     // Reports as many independent semantic errors as it safely can in one
     // pass, rather than making you fix-recompile-fix to see the next one.
     // Scoped at the top-level-declaration granularity: two unrelated
@@ -571,7 +595,31 @@ impl TypeChecker {
             .map(|(n, c)| (n.clone(), c.clone()))
             .collect();
             
+        // A payload-carrying enum is a [tag][payload] pair that only exists in memory: it has no ABI form, and no storage layout Solidity has an equivalent for.
+        // Anywhere a size is needed it must be rejected, or the layout engine lays it out as 64 opaque bytes and every read of it returns a stale memory address.
         for (class_name, class_decl) in &classes {
+            for field in &class_decl.fields {
+                let payload_enum_in = |t: &Type| -> Option<String> {
+                    match t {
+                        Type::Primitive(n) if self.enum_has_payload(n) => Some(n.clone()),
+                        Type::Array(inner) | Type::FixedArray(inner, _) => match inner.as_ref() {
+                            Type::Primitive(n) if self.enum_has_payload(n) => Some(n.clone()),
+                            _ => None,
+                        },
+                        Type::Generic { args, .. } => args.iter().find_map(|a| match a {
+                            Type::Primitive(n) if self.enum_has_payload(n) => Some(n.clone()),
+                            _ => None,
+                        }),
+                        _ => None,
+                    }
+                };
+                if let Some(en) = payload_enum_in(&field.type_def) {
+                    errors.push(format!(
+                        "Semantic Error: enum '{}' has a variant carrying a payload, so it has no storage layout and cannot be the type of field '{}' in '{}'. Such an enum lives in memory only: use it as a local, and store its parts separately.",
+                        en, field.name, class_name
+                    ));
+                }
+            }
             if class_decl.is_global {
                 for field in &class_decl.fields {
                     if let Type::Generic { name, args } = &field.type_def {
@@ -594,7 +642,11 @@ impl TypeChecker {
         }
 
         {
+            // A payload-free enum belongs here: it is a u8 in every respect now, it maps to uint8 in the ABI, and it packs 32-to-a-slot in storage exactly like one. A payload-carrying enum does not, and is caught by the check below.
             let elem_ok = |t: &Type| {
+                if self.is_scalar_enum(t) {
+                    return true;
+                }
                 matches!(t, Type::Primitive(n) if matches!(n.as_str(),
                     "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
                     "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
@@ -890,6 +942,9 @@ impl TypeChecker {
                     }
                     return Ok(true);
                 }
+                // A revert ends the frame, so the path never reaches the missing return: it owes one no more than a return does.
+                // The const-assignment checker already gives this credit through `diverges`; this checker did not, so a function whose last statement was a revert was rejected for not returning.
+                Statement::Revert { .. } => return Ok(true),
                 Statement::IfElse { if_body, else_body, .. } => {
                     let if_returns = self.check_returns(if_body, expected)?;
                     if let Some(eb) = else_body {
@@ -1068,12 +1123,27 @@ impl TypeChecker {
         Ok(())
     }
 
+    // A fixed-point value is a WAD-scaled integer: 1.0 is 10^18, not 1. So mixing one with a plain integer is almost always a bug, `price * 2` means "times 0.000000000000000002", and the result carries the fixed-point type as if it were fine.
+    // The right operand's type was evaluated here and dropped, so nothing rejected the mix. Nothing else checks binary operand compatibility either, so this is the only place it can be caught.
     fn check_fixed_point_math(&self, expr: &Expr) -> Result<(), String> {
-        if let Expr::BinaryOp { left, operator: _, right } = expr {
+        if let Expr::BinaryOp { left, operator, right } = expr {
             let left_type = self.eval_type(left)?;
             let right_type = self.eval_type(right)?;
-            if let Type::Primitive(t1) = &left_type {
-                if t1 == "f32" || t1 == "f64" {
+            let fixed = |t: &Type| matches!(t, Type::Primitive(p) if p == "f32" || p == "f64");
+            let lf = fixed(&left_type);
+            let rf = fixed(&right_type);
+            if lf != rf {
+                // A literal is typed u256 until it is coerced, so `x * 2` on a fixed-point x would trip this. Comparisons are fine either way, only arithmetic carries the scale.
+                let arith = matches!(operator.as_str(), "+" | "-" | "*" | "/" | "%" | "**");
+                if arith && !matches!(if lf { right } else { left }.as_ref(), Expr::Number(_)) {
+                    return Err(format!(
+                        "Fixed-point math must not mix scales: {:?} {} {:?}. A fixed-point value is WAD-scaled (1.0 is 10^18), so combining it with a plain integer silently reads that integer as a fraction. Convert one side first.",
+                        left_type, operator, right_type
+                    ));
+                }
+            }
+            if lf {
+                if let Type::Primitive(t1) = &left_type {
                     println!("    [Codegen Routing] Intercepted math on {}. Routing to WAD Fixed-Point Math Library to save gas.", t1);
                 }
             }
@@ -1336,7 +1406,6 @@ impl TypeChecker {
                     _ => return Err(format!("{} Bitwise flip value must be an integer or bool, got {:?}", error_prefix, val_type)),
                 }
             }
-            _ => {}
         }
         Ok(())
     }

@@ -1976,11 +1976,48 @@ fn a_fixed_array_of_structs_across_the_abi_is_rejected() {
 }
 
 #[test]
+fn a_revert_counts_as_diverging_for_the_return_check() {
+    // A revert ends the frame, so the path never reaches a missing return. check_returns knew about return, if/else and match but not revert, so this shape was rejected.
+    assert_compiles("error Bad(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return x\n        revert Bad(x)\n");
+    // One branch returning and the other reverting is a complete function.
+    assert_compiles("error B(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return 1\n        else:\n            revert B(x)\n");
+    // And the check must not have got weaker: a real missing return is still an error.
+    assert_compile_fails("contract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return x\n");
+    assert_compile_fails("error B(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            revert B(x)\n");
+}
+
+#[test]
+fn a_payload_free_enum_is_one_byte_like_solidity() {
+    // size_of said 64 for every enum, which burned two storage slots per field, displaced every later field, and made the mapping and log paths write the memory pointer instead of the value.
+    let src = "enum S:\n    A\n    B\n\ncontract C:\n    S state\n\n    export fn set(S s):\n        C.state = s\n";
+    // One packed byte in one slot, exactly as Solidity lays an enum out.
+    assert_output_contains(src, "sstore(0, or(and(sload(0), not(shl(0, 0xff))), shl(0, and(s, 0xff))))");
+}
+
+#[test]
+fn a_payload_enum_has_no_storage_layout() {
+    // A payload-carrying enum is a [tag][payload] pair that exists only in memory. Anywhere a size is needed it must be rejected, or it is laid out as 64 opaque bytes and every read returns a stale address.
+    let head = "enum R:\n    Ok(u256)\n    Err\n\n";
+    for body in [
+        "contract C:\n    R r\n\n    export fn f() -> u256:\n        return 1\n",
+        "use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, R) m\n\n    export fn f() -> u256:\n        return 1\n",
+        "contract C:\n    [R] xs\n\n    export fn f() -> u256:\n        return 1\n",
+        "class S:\n    R r\n\ncontract C:\n    export fn f() -> u256:\n        return 1\n",
+    ] {
+        let (ok, out) = run_gumc(&format!("{}{}", head, body));
+        assert!(!ok, "a payload enum must not be given a layout:\n{}", out);
+        assert!(out.contains("has no storage layout"), "expected a layout error, got:\n{}", out);
+    }
+    // But it stays usable as a local: construct, match, extract.
+    assert_compiles("enum R:\n    Ok(u256)\n    Err\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        var r = R.Ok(x)\n        match r:\n            Ok(v):\n                return v\n            Err:\n                return 0\n        return 0\n");
+}
+
+#[test]
 fn an_enum_param_decodes_from_one_word() {
-    // An enum is a uint8 on the wire but [tag][payload] in memory, so it is rebuilt from one word rather than copied out of two.
-    // Copying 64 bytes read the next argument as the payload, and left the argument after it reading past the end of calldata as zero.
+    // A payload-free enum is a plain u8 tag: one word in, masked, and used as a value throughout. No pointer, no allocation.
+    // It used to copy size_of(enum) = 64 bytes, which ate the next argument as a phantom payload and left every later one reading past calldata as zero.
     let src = "enum S:\n    A\n    B\n\ncontract C:\n    export fn f(S s, u256 x) -> u256:\n        return x\n";
-    assert_output_contains(src, "let param_s := make_enum(and(calldataload(4), 0xff), 0)");
+    assert_output_contains(src, "let param_s := and(calldataload(4), 0xff)");
     assert_output_contains(src, "let param_x := calldataload(36)");
 }
 
@@ -2109,13 +2146,7 @@ fn transient_fields_are_absent_from_the_storage_lock() {
     let dir = std::env::temp_dir().join(format!("gum_tlock_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let lock = dir.join("layout.json");
-    let solc = match find_solc() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping: no solc");
-            return;
-        }
-    };
+    // No solc needed: this only inspects the lock manifest, it never assembles bytecode.
     let (ok, out) = run_gumc_with_args(
         "contract C:\n    u256 kept\n    transient u256 scratch\n\n    export fn go():\n        C.kept = 1\n        C.scratch = 2\n",
         &["--lock", &lock.to_string_lossy()],

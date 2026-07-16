@@ -575,9 +575,8 @@ impl EvmYulBackend {
                     }
                     // Same as the dispatcher: one wire word holding the tag, rebuilt into the [tag][payload] pair the body expects.
                     if is_enum_type(layout_engine.type_checker, &p.type_def) {
-                        translator.require_make_enum();
                         yul.push_str(&format!(
-                            "    let {} := make_enum(and(mload(add(args_mem, {})), 0xff), 0)\n",
+                            "    let {} := and(mload(add(args_mem, {})), 0xff)\n",
                             arg_name, offset
                         ));
                         offset += 32;
@@ -799,9 +798,8 @@ impl EvmYulBackend {
                         // An enum is one uint8 word on the wire holding the tag, but a pointer to [tag][payload] in memory, so it is rebuilt rather than copied.
                         // Copying size_of(enum) = 64 bytes instead read the *next* argument as the payload and then read every later one past the end of calldata as zero.
                         if is_enum_type(layout_engine.type_checker, &p.type_def) {
-                            translator.require_make_enum();
                             yul.push_str(&format!(
-                                "          let {} := make_enum(and(calldataload({}), 0xff), 0)\n",
+                                "          let {} := and(calldataload({}), 0xff)\n",
                                 arg_name, offset
                             ));
                             offset += 32;
