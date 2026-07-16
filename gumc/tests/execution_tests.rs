@@ -383,6 +383,10 @@ const SOL_PROBER: &str = include_str!("fixtures/sol_prober.sol");
 const SOL_ENUM_ABI: &str = include_str!("fixtures/sol_enum_abi.sol");
 const SOL_MSG_BLOCK: &str = include_str!("fixtures/sol_msg_block.sol");
 const GUM_STARR_ABI: &str = include_str!("fixtures/gum_starr_abi.gum");
+const GUM_NEST_ABI: &str = include_str!("fixtures/gum_nest_abi.gum");
+const GUM_LOG_NONSCALAR: &str = include_str!("fixtures/gum_log_nonscalar.gum");
+const SOL_LOG_NONSCALAR: &str = include_str!("fixtures/sol_log_nonscalar.sol");
+const SOL_NEST_ABI: &str = include_str!("fixtures/sol_nest_abi.sol");
 const SOL_STARR_ABI: &str = include_str!("fixtures/sol_starr_abi.sol");
 const SOL_IFACE_SINK: &str = include_str!("fixtures/sol_iface_sink.sol");
 const SOL_STRUCT_DEPLOY: &str = include_str!("fixtures/sol_struct_deploy.sol");
@@ -4595,6 +4599,20 @@ fn a_struct_array_crosses_the_abi_like_solidity() {
         assert_eq!(U256::from_be_slice(&gr.output), want, "{}[{}] by value", f, i);
     }
 
+    // Assigning a whole element copies its bytes. mstore instead wrote the source element's address into field a and left b and c alone, so reading b back still looked right.
+    {
+        let mut d = selector(&format!("copy_elem({},uint256,uint256)", tup)).to_vec();
+        d.extend_from_slice(&word_u256(U256::from(96u64)));
+        d.extend_from_slice(&word_u256(U256::from(0u64)));
+        d.extend_from_slice(&word_u256(U256::from(1u64)));
+        d.extend_from_slice(&arr);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert!(gr.success, "gum copy_elem reverted");
+        assert_eq!(gr.output, sr.output, "copy_elem differs from solidity");
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(200u64), "element 1's b after copying it over element 0");
+    }
+
     let mut d = selector(&format!("at_c({},uint256)", tup)).to_vec();
     d.extend_from_slice(&word_u256(U256::from(64u64)));
     d.extend_from_slice(&word_u256(U256::from(1u64)));
@@ -4853,5 +4871,654 @@ fn enum_state_matches_solidity() {
         assert_eq!(gr.logs[0].0, sr.logs[0].0, "topic0 differs: the event signature disagrees with solidity");
         assert_eq!(gr.logs[0].1, sr.logs[0].1, "log data differs from solidity");
         assert_eq!(U256::from_be_slice(&gr.logs[0].1), U256::from(tag), "the log carries the tag, not a pointer");
+    }
+}
+
+// The wire form of a uint256[][] body: a count, then one offset per row, then the rows.
+// The offsets are relative to the start of the offset table rather than to the array, which is the detail a nested decoder gets wrong first.
+fn enc_rows(rows: &[Vec<u64>]) -> Vec<u8> {
+    let mut head: Vec<u8> = word_u256(U256::from(rows.len() as u64)).to_vec();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut cur = 32 * rows.len();
+    for r in rows {
+        head.extend_from_slice(&word_u256(U256::from(cur as u64)));
+        let mut b = word_u256(U256::from(r.len() as u64)).to_vec();
+        for v in r {
+            b.extend_from_slice(&word_u256(U256::from(*v)));
+        }
+        cur += b.len();
+        tail.extend_from_slice(&b);
+    }
+    head.extend_from_slice(&tail);
+    head
+}
+
+// A nested array is the first shape where an element carries an offset instead of its bytes, so the wire grows an indirection the memory form does not have.
+// uint256[][] is the flagship: ragged rows make a wrong stride, a wrong offset base, and a wrong count each produce a different wrong answer.
+#[test]
+fn a_nested_array_crosses_the_abi_like_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(GUM_NEST_ABI, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(SOL_NEST_ABI, &solc));
+
+    let rows: Vec<Vec<u64>> = vec![vec![1, 2], vec![10, 20, 30], vec![100]];
+    let arr = enc_rows(&rows);
+
+    for f in ["rows", "total", "echo"] {
+        let mut d = selector(&format!("{}(uint256[][])", f)).to_vec();
+        d.extend_from_slice(&word_u256(U256::from(32u64)));
+        d.extend_from_slice(&arr);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert!(sr.success, "solidity {} reverted", f);
+        assert!(gr.success, "gum {} reverted", f);
+        assert_eq!(gr.output, sr.output, "{} differs from solidity", f);
+    }
+
+    // By value as well as by diff, so a bug both sides share would still fail.
+    let mut d = selector("total(uint256[][])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&arr);
+    let gr = call(&mut gdb, g, d);
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(163u64), "1+2+10+20+30+100");
+
+    for (i, want) in [(0u64, 2u64), (1, 3), (2, 1)] {
+        let mut d = selector("row_len(uint256[][],uint256)").to_vec();
+        d.extend_from_slice(&word_u256(U256::from(64u64)));
+        d.extend_from_slice(&word_u256(U256::from(i)));
+        d.extend_from_slice(&arr);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.output, sr.output, "row_len({}) differs from solidity", i);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "row_len({}) by value", i);
+    }
+
+    for (i, j, want) in [(0u64, 1u64, 2u64), (1, 2, 30), (2, 0, 100)] {
+        let mut d = selector("at(uint256[][],uint256,uint256)").to_vec();
+        d.extend_from_slice(&word_u256(U256::from(96u64)));
+        d.extend_from_slice(&word_u256(U256::from(i)));
+        d.extend_from_slice(&word_u256(U256::from(j)));
+        d.extend_from_slice(&arr);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.output, sr.output, "at({},{}) differs from solidity", i, j);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "at({},{}) by value", i, j);
+    }
+}
+
+// Three levels deep, a fixed array of dynamic ones, a dynamic array of fixed ones, and both struct-array shapes.
+// Each is a different answer to "does the element carry an offset" and "is the count in the type or in the data", which is what the codec recursion has to decide per level.
+#[test]
+fn nested_array_shapes_match_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(GUM_NEST_ABI, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(SOL_NEST_ABI, &solc));
+
+    macro_rules! both {
+        ($d:expr, $what:expr, $want:expr) => {{
+            let d: Vec<u8> = $d;
+            let gr = call(&mut gdb, g, d.clone());
+            let sr = call(&mut sdb, s, d);
+            assert!(sr.success, "solidity {} reverted", $what);
+            assert!(gr.success, "gum {} reverted", $what);
+            assert_eq!(gr.output, sr.output, "{} differs from solidity", $what);
+            assert_eq!(U256::from_be_slice(&gr.output), U256::from($want as u64), "{} by value", $what);
+        }};
+    }
+
+    // uint256[][][]: an offset table whose entries point at offset tables.
+    let cubes: Vec<Vec<Vec<u64>>> = vec![vec![vec![1, 2], vec![3]], vec![vec![4, 5, 6]]];
+    let mut cube_blob: Vec<u8> = word_u256(U256::from(cubes.len() as u64)).to_vec();
+    let mut cube_tail: Vec<u8> = Vec::new();
+    let mut cur = 32 * cubes.len();
+    for c in &cubes {
+        cube_blob.extend_from_slice(&word_u256(U256::from(cur as u64)));
+        let b = enc_rows(c);
+        cur += b.len();
+        cube_tail.extend_from_slice(&b);
+    }
+    cube_blob.extend_from_slice(&cube_tail);
+    for (i, j, k, want) in [(0u64, 0u64, 1u64, 2u64), (0, 1, 0, 3), (1, 0, 2, 6)] {
+        let mut d = selector("deep_at(uint256[][][],uint256,uint256,uint256)").to_vec();
+        d.extend_from_slice(&word_u256(U256::from(128u64)));
+        d.extend_from_slice(&word_u256(U256::from(i)));
+        d.extend_from_slice(&word_u256(U256::from(j)));
+        d.extend_from_slice(&word_u256(U256::from(k)));
+        d.extend_from_slice(&cube_blob);
+        both!(d, format!("deep_at({},{},{})", i, j, k), want);
+    }
+
+    // uint256[][2]: dynamic overall, but the count is in the type, so there is no count word.
+    let pair: Vec<Vec<u64>> = vec![vec![7, 8], vec![9]];
+    let mut pair_blob: Vec<u8> = Vec::new();
+    let mut pair_tail: Vec<u8> = Vec::new();
+    let mut pcur = 32 * pair.len();
+    for r in &pair {
+        pair_blob.extend_from_slice(&word_u256(U256::from(pcur as u64)));
+        let mut b = word_u256(U256::from(r.len() as u64)).to_vec();
+        for v in r {
+            b.extend_from_slice(&word_u256(U256::from(*v)));
+        }
+        pcur += b.len();
+        pair_tail.extend_from_slice(&b);
+    }
+    pair_blob.extend_from_slice(&pair_tail);
+    let mut d = selector("pair_sum(uint256[][2])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&pair_blob);
+    both!(d, "pair_sum", 24);
+
+    // uint256[3][]: the element is static, so it is inline with no offset of its own.
+    let grid: Vec<[u64; 3]> = vec![[1, 2, 3], [4, 5, 6]];
+    let mut grid_blob: Vec<u8> = word_u256(U256::from(grid.len() as u64)).to_vec();
+    for r in &grid {
+        for v in r {
+            grid_blob.extend_from_slice(&word_u256(U256::from(*v)));
+        }
+    }
+    for (i, j, want) in [(0u64, 2u64, 3u64), (1, 0, 4)] {
+        let mut d = selector("fixed_rows(uint256[3][],uint256,uint256)").to_vec();
+        d.extend_from_slice(&word_u256(U256::from(96u64)));
+        d.extend_from_slice(&word_u256(U256::from(i)));
+        d.extend_from_slice(&word_u256(U256::from(j)));
+        d.extend_from_slice(&grid_blob);
+        both!(d, format!("fixed_rows({},{})", i, j), want);
+    }
+
+    // P[2]: fully static, so it rides inline in the head and the head is four words, not two.
+    let mut sp: Vec<u8> = Vec::new();
+    for (a, bb) in [(1u64, 111u64), (2, 222)] {
+        sp.extend_from_slice(&word_u256(U256::from(a)));
+        sp.extend_from_slice(&word_u256(U256::from(bb)));
+    }
+    for (i, want) in [(0u64, 111u64), (1, 222)] {
+        let mut d = selector("struct_pair_b((uint128,uint256)[2],uint256)").to_vec();
+        d.extend_from_slice(&sp);
+        d.extend_from_slice(&word_u256(U256::from(i)));
+        both!(d, format!("struct_pair_b({})", i), want);
+    }
+
+    // P[][]: rows of structs, so the offset indirection and the packed-vs-wire field move are both in play at once.
+    let sgrid: Vec<Vec<(u64, u64)>> = vec![vec![(1, 10), (2, 20)], vec![(3, 30)]];
+    let mut sg: Vec<u8> = word_u256(U256::from(sgrid.len() as u64)).to_vec();
+    let mut sg_tail: Vec<u8> = Vec::new();
+    let mut scur = 32 * sgrid.len();
+    for row in &sgrid {
+        sg.extend_from_slice(&word_u256(U256::from(scur as u64)));
+        let mut b = word_u256(U256::from(row.len() as u64)).to_vec();
+        for (a, bb) in row {
+            b.extend_from_slice(&word_u256(U256::from(*a)));
+            b.extend_from_slice(&word_u256(U256::from(*bb)));
+        }
+        scur += b.len();
+        sg_tail.extend_from_slice(&b);
+    }
+    sg.extend_from_slice(&sg_tail);
+    for (i, j, want) in [(0u64, 0u64, 10u64), (0, 1, 20), (1, 0, 30)] {
+        let mut d = selector("struct_grid_b((uint128,uint256)[][],uint256,uint256)").to_vec();
+        d.extend_from_slice(&word_u256(U256::from(96u64)));
+        d.extend_from_slice(&word_u256(U256::from(i)));
+        d.extend_from_slice(&word_u256(U256::from(j)));
+        d.extend_from_slice(&sg);
+        both!(d, format!("struct_grid_b({},{})", i, j), want);
+    }
+}
+
+// Event data is an ABI argument list, and the log path used to write one word per field: for an array, a string or a struct that word was the memory pointer.
+// The ABI JSON said uint256[] the whole time, so a decoder read the pointer as a plausible small number rather than failing. Diffing the raw log bytes against Solidity is the only thing that catches that.
+#[test]
+fn logging_a_non_scalar_encodes_it_like_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(GUM_LOG_NONSCALAR, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(SOL_LOG_NONSCALAR, &solc));
+
+    let diff = |gdb: &mut Db, sdb: &mut Db, d: Vec<u8>, what: &str| {
+        let gr = call(gdb, g, d.clone());
+        let sr = call(sdb, s, d);
+        assert!(sr.success, "solidity {} reverted", what);
+        assert!(gr.success, "gum {} reverted", what);
+        assert_eq!(gr.logs.len(), sr.logs.len(), "{}: log count", what);
+        for (i, (gl, sl)) in gr.logs.iter().zip(sr.logs.iter()).enumerate() {
+            assert_eq!(gl.0, sl.0, "{}: log {} topics", what, i);
+            assert_eq!(gl.1, sl.1, "{}: log {} data", what, i);
+        }
+        // A pointer-sized word would tie on length with a one-element array, so check the data is really there.
+        assert!(!gr.logs.is_empty(), "{}: no log emitted", what);
+    };
+
+    // uint256[]
+    let mut xs: Vec<u8> = word_u256(U256::from(3u64)).to_vec();
+    for v in [11u64, 22, 33] {
+        xs.extend_from_slice(&word_u256(U256::from(v)));
+    }
+    let mut d = selector("arr(uint256[])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&xs);
+    diff(&mut gdb, &mut sdb, d, "arr");
+
+    // string
+    let text = b"gum";
+    let mut sblob: Vec<u8> = word_u256(U256::from(text.len() as u64)).to_vec();
+    let mut padded = text.to_vec();
+    padded.resize(32, 0);
+    sblob.extend_from_slice(&padded);
+    let mut d = selector("str(string)").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&sblob);
+    diff(&mut gdb, &mut sdb, d, "str");
+
+    // A struct is static, so it rides inline with no offset: getting this one wrong logs the pointer and the field after it.
+    let mut d = selector("tup((uint128,uint256))").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(7u64)));
+    d.extend_from_slice(&word_u256(U256::from(700u64)));
+    diff(&mut gdb, &mut sdb, d, "tup");
+
+    // uint256[][], the nested case: the data has an offset table inside an offset.
+    let rows: Vec<Vec<u64>> = vec![vec![1, 2], vec![3]];
+    let mut d = selector("grid(uint256[][])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&enc_rows(&rows));
+    diff(&mut gdb, &mut sdb, d, "grid");
+
+    // Indexed scalar in a topic, two dynamic fields in the data, so the head/tail split has to be right too.
+    let who: Address = "0x00000000000000000000000000000000cafebabe".parse().unwrap();
+    let mut d = selector("mixed(address,uint256,uint256[],string)").to_vec();
+    d.extend_from_slice(&word_addr(who));
+    d.extend_from_slice(&word_u256(U256::from(9u64)));
+    d.extend_from_slice(&word_u256(U256::from(128u64)));
+    d.extend_from_slice(&word_u256(U256::from(128u64 + 32 + 3 * 32)));
+    d.extend_from_slice(&xs);
+    d.extend_from_slice(&sblob);
+    diff(&mut gdb, &mut sdb, d, "mixed");
+}
+
+// A custom error's revert data is an ABI argument list too, and its encoder was hand-rolled: it handled scalars and strings and wrote the memory pointer for an array or a struct.
+// The selector is hashed from the real type, so ethers and viem decode the pointer as a plausible value rather than throwing.
+#[test]
+fn a_custom_error_with_a_non_scalar_field_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "\
+class P:
+    u128 a
+    u256 b
+
+error BadArr([u256] xs, u256 n)
+error BadTup(P p)
+error BadGrid([[u256]] g)
+
+contract C:
+    export fn arr([u256] xs) -> u256:
+        revert BadArr(xs, 5)
+
+    export fn tup(P p) -> u256:
+        revert BadTup(p)
+
+    export fn grid([[u256]] g) -> u256:
+        revert BadGrid(g)
+";
+    let sol_src = "\
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract C {
+    struct P { uint128 a; uint256 b; }
+
+    error BadArr(uint256[] xs, uint256 n);
+    error BadTup(P p);
+    error BadGrid(uint256[][] g);
+
+    function arr(uint256[] calldata xs) external pure returns (uint256) {
+        revert BadArr(xs, 5);
+    }
+
+    function tup(P calldata p) external pure returns (uint256) {
+        revert BadTup(p);
+    }
+
+    function grid(uint256[][] calldata g) external pure returns (uint256) {
+        revert BadGrid(g);
+    }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    let diff = |gdb: &mut Db, sdb: &mut Db, d: Vec<u8>, what: &str| {
+        let gr = call(gdb, g, d.clone());
+        let sr = call(sdb, s, d);
+        assert!(!gr.success, "gum {} should have reverted", what);
+        assert!(!sr.success, "solidity {} should have reverted", what);
+        assert_eq!(gr.output, sr.output, "{}: revert data", what);
+        // A pointer word is 32 bytes, so a bare selector-plus-one-word would be the bug's shape.
+        assert!(gr.output.len() > 4, "{}: revert data is only a selector", what);
+    };
+
+    let mut xs: Vec<u8> = word_u256(U256::from(2u64)).to_vec();
+    for v in [8u64, 9] {
+        xs.extend_from_slice(&word_u256(U256::from(v)));
+    }
+    let mut d = selector("arr(uint256[])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&xs);
+    diff(&mut gdb, &mut sdb, d, "arr");
+
+    let mut d = selector("tup((uint128,uint256))").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(4u64)));
+    d.extend_from_slice(&word_u256(U256::from(400u64)));
+    diff(&mut gdb, &mut sdb, d, "tup");
+
+    let rows: Vec<Vec<u64>> = vec![vec![1], vec![2, 3]];
+    let mut d = selector("grid(uint256[][])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&enc_rows(&rows));
+    diff(&mut gdb, &mut sdb, d, "grid");
+}
+
+// An aggregate local with no initializer used to bind 0, so every read of it went to scratch memory at address 0 rather than to a value of its own.
+// Address 0 is where gum_hash_slot stages its keccak input, so a mapping read anywhere earlier in the function leaves a key sitting there and the "zero value" comes back as that key.
+#[test]
+fn an_uninitialized_aggregate_local_is_its_own_zero_value() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let src = "\
+use gum.defaults.Account
+use gum.defaults.String
+
+class P:
+    u128 a
+    u256 b
+
+contract C:
+    HashMap(Account, u256) m
+
+    export fn seed(Account k, u256 v):
+        C.m[k] = v
+
+    export fn arr_zero() -> u256:
+        mut [u256; 2] xs
+        return xs[0]
+
+    export fn struct_zero() -> u256:
+        mut P p
+        return p.b
+
+    export fn dyn_len() -> u256:
+        mut [u256] xs
+        return xs.length
+
+    export fn str_len() -> u256:
+        mut String s
+        return s.length
+
+    export fn struct_zero_after_map(Account k) -> u256:
+        var seen = C.m[k]
+        mut P p
+        return p.b + seen - seen
+
+    export fn arr_writable() -> u256:
+        mut [u256; 2] xs
+        xs[1] = 9
+        return xs[0] + xs[1]
+
+    export fn delete_struct(Account k) -> u256:
+        mut P p
+        p.a = 3
+        p.b = 77
+        delete p
+        var dirty = C.m[k]
+        return p.b + p.a + dirty - dirty
+
+    export fn delete_dyn([u256] src) -> u256:
+        mut [u256] xs = src
+        delete xs
+        return xs.length
+
+    export fn delete_leaves_neighbour_alone() -> u256:
+        mut P p
+        mut [u256; 2] after
+        after[0] = 8
+        p.a = 1
+        delete p
+        return after[0]
+";
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, true));
+
+    for f in ["arr_zero()", "struct_zero()", "dyn_len()", "str_len()"] {
+        let r = call(&mut db, c, selector(f).to_vec());
+        assert!(r.success, "{} reverted", f);
+        assert_eq!(U256::from_be_slice(&r.output), U256::ZERO, "{} is not zero", f);
+    }
+
+    // The one that makes the old bug visible rather than accidentally-zero: seed a mapping so scratch memory holds a live key, then read a fresh struct.
+    let key: Address = "0x00000000000000000000000000000000cafebabe".parse().unwrap();
+    let r = call(
+        &mut db,
+        c,
+        encode_words("seed(address,uint256)", &[word_addr(key), word_u256(U256::from(4242u64))]),
+    );
+    assert!(r.success, "seed reverted");
+    let r = call(&mut db, c, encode_words("struct_zero_after_map(address)", &[word_addr(key)]));
+    assert!(r.success, "struct_zero_after_map reverted");
+    assert_eq!(
+        U256::from_be_slice(&r.output),
+        U256::ZERO,
+        "a fresh struct read scratch memory left over from the mapping lookup"
+    );
+
+    // And the block is real memory, not a coincidence: writing one element must not disturb the other.
+    let r = call(&mut db, c, selector("arr_writable()").to_vec());
+    assert!(r.success, "arr_writable reverted");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(9u64), "0 + 9");
+
+    // delete on a memory-backed local clears its block. Assigning 0 nulled the pointer instead, and a plain read-back would still say zero, since scratch memory is usually zero anyway.
+    // Reading the mapping after the delete puts a live key in scratch, so a nulled pointer reads that key back rather than the cleared field.
+    let r = call(&mut db, c, encode_words("delete_struct(address)", &[word_addr(key)]));
+    assert!(r.success, "delete_struct reverted");
+    assert_eq!(U256::from_be_slice(&r.output), U256::ZERO, "delete left the struct set");
+
+    let mut d = selector("delete_dyn(uint256[])").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&word_u256(U256::from(2u64)));
+    d.extend_from_slice(&word_u256(U256::from(1u64)));
+    d.extend_from_slice(&word_u256(U256::from(2u64)));
+    let r = call(&mut db, c, d);
+    assert!(r.success, "delete_dyn reverted");
+    assert_eq!(U256::from_be_slice(&r.output), U256::ZERO, "delete left the array non-empty");
+
+    // A struct is 48 bytes, so its last word is half outside the block: clearing a whole word there would eat the next allocation.
+    let r = call(&mut db, c, selector("delete_leaves_neighbour_alone()").to_vec());
+    assert!(r.success, "delete_leaves_neighbour_alone reverted");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(8u64), "delete overran into the next allocation");
+}
+
+// A struct as a direct contract field: C.p.b = v compiled to a write into a fresh memory copy of the struct, which was then discarded, so the storage write was a silent no-op.
+// The same struct as a mapping value was always correct, which is why no test caught this: every fixture used the mapping form.
+#[test]
+fn a_struct_contract_field_persists_like_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "class P:
+    u128 a
+    u256 b
+
+contract C:
+    P p
+    u256 tail
+
+    export fn set(u128 a, u256 b):
+        C.p.a = a
+        C.p.b = b
+
+    export fn get_a() -> u128:
+        return C.p.a
+
+    export fn get_b() -> u256:
+        return C.p.b
+
+    export fn set_tail(u256 v):
+        C.tail = v
+
+    export fn get_tail() -> u256:
+        return C.tail
+";
+    let sol_src = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract C {
+    struct P { uint128 a; uint256 b; }
+    P p;
+    uint256 tail;
+
+    function set(uint128 a, uint256 b) external { p.a = a; p.b = b; }
+    function get_a() external view returns (uint128) { return p.a; }
+    function get_b() external view returns (uint256) { return p.b; }
+    function set_tail(uint256 v) external { tail = v; }
+    function get_tail() external view returns (uint256) { return tail; }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    let d = encode_words("set(uint128,uint256)", &[word_u256(U256::from(7u64)), word_u256(U256::from(12345u64))]);
+    assert!(call(&mut gdb, g, d.clone()).success, "gum set reverted");
+    assert!(call(&mut sdb, s, d).success, "solidity set reverted");
+
+    // The field written last, and the one packed beside it: a lost write shows up as zero.
+    for (f, want) in [("get_b()", 12345u64), ("get_a()", 7)] {
+        let gr = call(&mut gdb, g, selector(f).to_vec());
+        let sr = call(&mut sdb, s, selector(f).to_vec());
+        assert!(gr.success, "gum {} reverted", f);
+        assert_eq!(gr.output, sr.output, "{} differs from solidity", f);
+        assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "{} did not persist", f);
+    }
+
+    // The field after the struct must not have been displaced by it.
+    let d = encode_words("set_tail(uint256)", &[word_u256(U256::from(99u64))]);
+    assert!(call(&mut gdb, g, d.clone()).success, "gum set_tail reverted");
+    assert!(call(&mut sdb, s, d).success, "solidity set_tail reverted");
+    let gr = call(&mut gdb, g, selector("get_tail()").to_vec());
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(99u64), "the field after the struct");
+    // And writing it must not have clobbered the struct.
+    let gr = call(&mut gdb, g, selector("get_b()").to_vec());
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(12345u64), "tail overlapped the struct");
+}
+
+// Vec(P) and [P] are the same storage layout spelled two ways, but only the [P] form reached the struct path: Vec(P) fell through to the packed-scalar reader, so v.get(i).b read a storage word and used it as a memory pointer.
+// The .get(i) spelling was the other half of it, since only a mapping's .get resolved to a struct base.
+#[test]
+fn a_storage_vec_of_structs_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "class P:
+    u128 a
+    u256 b
+
+contract C:
+    Vec(P) v
+    [P] xs
+
+    export fn push_v(u128 a, u256 b):
+        C.v.push()
+        C.v.get(C.v.len() - 1).a = a
+        C.v.get(C.v.len() - 1).b = b
+
+    export fn v_len() -> u256:
+        return C.v.len()
+
+    export fn v_b(u256 i) -> u256:
+        return C.v.get(i).b
+
+    export fn v_a(u256 i) -> u128:
+        return C.v.get(i).a
+";
+    let sol_src = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract C {
+    struct P { uint128 a; uint256 b; }
+    P[] v;
+    P[] xs;
+
+    function push_v(uint128 a, uint256 b) external { v.push(P(a, b)); }
+    function v_len() external view returns (uint256) { return v.length; }
+    function v_b(uint256 i) external view returns (uint256) { return v[i].b; }
+    function v_a(uint256 i) external view returns (uint128) { return v[i].a; }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    for (a, b) in [(1u64, 100u64), (2, 200)] {
+        let d = encode_words("push_v(uint128,uint256)", &[word_u256(U256::from(a)), word_u256(U256::from(b))]);
+        assert!(call(&mut gdb, g, d.clone()).success, "gum push_v reverted");
+        assert!(call(&mut sdb, s, d).success, "solidity push_v reverted");
+    }
+
+    let gr = call(&mut gdb, g, selector("v_len()").to_vec());
+    let sr = call(&mut sdb, s, selector("v_len()").to_vec());
+    assert_eq!(gr.output, sr.output, "v_len differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(2u64), "two pushes");
+
+    for (i, wa, wb) in [(0u64, 1u64, 100u64), (1, 2, 200)] {
+        for (f, want) in [("v_b(uint256)", wb), ("v_a(uint256)", wa)] {
+            let d = encode_words(f, &[word_u256(U256::from(i))]);
+            let gr = call(&mut gdb, g, d.clone());
+            let sr = call(&mut sdb, s, d);
+            assert!(gr.success, "gum {} reverted", f);
+            assert_eq!(gr.output, sr.output, "{}[{}] differs from solidity", f, i);
+            assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "{}[{}] by value", f, i);
+        }
     }
 }

@@ -532,6 +532,234 @@ fn gum_abi_arr_size_helper_src() -> String {
     .to_string()
 }
 
+// A dynamic element carries an offset rather than its bytes, so the wire grows a level: [count][off_0..off_n-1][tail_0][tail_1]...
+// The offsets are relative to the start of the offset table, not to the array or to calldata, which is the one detail that makes a nested decode look unlike a flat one.
+// Memory mirrors that with a pointer per element, so the outer stride is 32 regardless of what the element costs.
+fn abi_dynarr_cd_helper_src(fname: &str, inner_cd: &str) -> String {
+    format!(
+        "function {fname}(off) -> ptr {{\n\
+         \x20   if lt(calldatasize(), add(off, 32)) {{ revert(0, 0) }}\n\
+         \x20   let n := calldataload(off)\n\
+         \x20   let base := add(off, 32)\n\
+         \x20   if gt(n, div(sub(calldatasize(), base), 32)) {{ revert(0, 0) }}\n\
+         \x20   ptr := allocate_memory(add(32, mul(n, 32)))\n\
+         \x20   mstore(ptr, mul(n, 32))\n\
+         \x20   for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{\n\
+         \x20       let eo := calldataload(add(base, mul(i, 32)))\n\
+         \x20       if gt(eo, calldatasize()) {{ revert(0, 0) }}\n\
+         \x20       mstore(add(add(ptr, 32), mul(i, 32)), {inner_cd}(add(base, eo)))\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_cd = inner_cd
+    )
+}
+
+// Same shape from an ABI blob already in memory, which is how constructor args arrive.
+// limit is the blob's real end and is threaded into the element codec unchanged, since an element's offset is attacker-chosen and its own bounds check is the only thing standing behind it.
+fn abi_dynarr_mem_helper_src(fname: &str, inner_mem: &str) -> String {
+    format!(
+        "function {fname}(base, off, limit) -> ptr {{\n\
+         \x20   if lt(limit, add(off, 32)) {{ revert(0, 0) }}\n\
+         \x20   let n := mload(add(base, off))\n\
+         \x20   let tbl := add(off, 32)\n\
+         \x20   if gt(n, div(sub(limit, tbl), 32)) {{ revert(0, 0) }}\n\
+         \x20   ptr := allocate_memory(add(32, mul(n, 32)))\n\
+         \x20   mstore(ptr, mul(n, 32))\n\
+         \x20   for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{\n\
+         \x20       let eo := mload(add(base, add(tbl, mul(i, 32))))\n\
+         \x20       if gt(eo, limit) {{ revert(0, 0) }}\n\
+         \x20       mstore(add(add(ptr, 32), mul(i, 32)), {inner_mem}(base, add(tbl, eo), limit))\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_mem = inner_mem
+    )
+}
+
+// Memory -> ABI. The offset table is laid out first at a known width, then each tail is appended and its offset backfilled, so the cursor runs ahead of the loop rather than being computable up front.
+// Element sizes vary, so cur has to come from what the element codec actually wrote rather than from a stride.
+fn abi_dynarr_put_helper_src(fname: &str, inner_put: &str) -> String {
+    format!(
+        "function {fname}(dst, ptr) -> written {{\n\
+         \x20   let n := div(mload(ptr), 32)\n\
+         \x20   mstore(dst, n)\n\
+         \x20   let tbl := add(dst, 32)\n\
+         \x20   let cur := mul(n, 32)\n\
+         \x20   for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{\n\
+         \x20       mstore(add(tbl, mul(i, 32)), cur)\n\
+         \x20       let e := mload(add(add(ptr, 32), mul(i, 32)))\n\
+         \x20       cur := add(cur, {inner_put}(add(tbl, cur), e))\n\
+         \x20   }}\n\
+         \x20   written := add(32, cur)\n\
+         }}\n",
+        fname = fname,
+        inner_put = inner_put
+    )
+}
+
+// The ABI size of a nested array: the count, the offset table, then each element's own size, which only the element codec can answer.
+fn abi_dynarr_size_helper_src(fname: &str, inner_size: &str) -> String {
+    format!(
+        "function {fname}(ptr) -> sz {{\n\
+         \x20   let n := div(mload(ptr), 32)\n\
+         \x20   sz := add(32, mul(n, 32))\n\
+         \x20   for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{\n\
+         \x20       sz := add(sz, {inner_size}(mload(add(add(ptr, 32), mul(i, 32)))))\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_size = inner_size
+    )
+}
+
+// A fixed array of dynamic elements is itself dynamic, so it sits behind an offset like a dynamic array, but with no count word: the length is in the type.
+// Its offset table is therefore the first thing at off, and the offsets are relative to off itself.
+fn abi_dynfarr_cd_helper_src(fname: &str, inner_cd: &str, n: usize) -> String {
+    format!(
+        "function {fname}(off) -> ptr {{\n\
+         \x20   if lt(calldatasize(), add(off, {bytes})) {{ revert(0, 0) }}\n\
+         \x20   ptr := allocate_memory({bytes})\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       let eo := calldataload(add(off, mul(i, 32)))\n\
+         \x20       if gt(eo, calldatasize()) {{ revert(0, 0) }}\n\
+         \x20       mstore(add(ptr, mul(i, 32)), {inner_cd}(add(off, eo)))\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_cd = inner_cd,
+        n = n,
+        bytes = n * 32
+    )
+}
+
+fn abi_dynfarr_mem_helper_src(fname: &str, inner_mem: &str, n: usize) -> String {
+    format!(
+        "function {fname}(base, off, limit) -> ptr {{\n\
+         \x20   if lt(limit, add(off, {bytes})) {{ revert(0, 0) }}\n\
+         \x20   ptr := allocate_memory({bytes})\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       let eo := mload(add(base, add(off, mul(i, 32))))\n\
+         \x20       if gt(eo, limit) {{ revert(0, 0) }}\n\
+         \x20       mstore(add(ptr, mul(i, 32)), {inner_mem}(base, add(off, eo), limit))\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_mem = inner_mem,
+        n = n,
+        bytes = n * 32
+    )
+}
+
+fn abi_dynfarr_put_helper_src(fname: &str, inner_put: &str, n: usize) -> String {
+    format!(
+        "function {fname}(dst, ptr) -> written {{\n\
+         \x20   let cur := {bytes}\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       mstore(add(dst, mul(i, 32)), cur)\n\
+         \x20       cur := add(cur, {inner_put}(add(dst, cur), mload(add(ptr, mul(i, 32)))))\n\
+         \x20   }}\n\
+         \x20   written := cur\n\
+         }}\n",
+        fname = fname,
+        inner_put = inner_put,
+        n = n,
+        bytes = n * 32
+    )
+}
+
+fn abi_dynfarr_size_helper_src(fname: &str, inner_size: &str, n: usize) -> String {
+    format!(
+        "function {fname}(ptr) -> sz {{\n\
+         \x20   sz := {bytes}\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       sz := add(sz, {inner_size}(mload(add(ptr, mul(i, 32)))))\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_size = inner_size,
+        n = n,
+        bytes = n * 32
+    )
+}
+
+// The put half of a dynamic array of static elements, for an element codec that reports what it wrote.
+// abi_starr_put_helper_src covers the same shape for a bare struct, whose codec returns nothing; the widths here are compile-time constants either way, so the returned count is discarded.
+fn abi_statarr_put_helper_src(fname: &str, inner_put: &str, wire: usize, packed: usize) -> String {
+    format!(
+        "function {fname}(dst, ptr) -> written {{\n\
+         \x20   let n := div(mload(ptr), {packed})\n\
+         \x20   mstore(dst, n)\n\
+         \x20   for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{\n\
+         \x20       pop({inner_put}(add(add(dst, 32), mul(i, {wire})), add(add(ptr, 32), mul(i, {packed}))))\n\
+         \x20   }}\n\
+         \x20   written := add(32, mul(n, {wire}))\n\
+         }}\n",
+        fname = fname,
+        inner_put = inner_put,
+        wire = wire,
+        packed = packed
+    )
+}
+
+// A fixed array of static elements: the elements are inline on the wire and inline in memory, at different strides, so this is the struct-array walk with the count coming from the type instead of the data.
+fn abi_statfarr_cd_helper_src(fname: &str, inner_cd: &str, n: usize, wire: usize, packed: usize) -> String {
+    format!(
+        "function {fname}(off) -> ptr {{\n\
+         \x20   if lt(calldatasize(), add(off, {total})) {{ revert(0, 0) }}\n\
+         \x20   ptr := allocate_memory({mtotal})\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       let e := {inner_cd}(add(off, mul(i, {wire})))\n\
+         \x20       gum_memory_copy(e, add(ptr, mul(i, {packed})), {packed})\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_cd = inner_cd,
+        n = n,
+        wire = wire,
+        packed = packed,
+        total = n * wire,
+        mtotal = n * packed
+    )
+}
+
+fn abi_statfarr_mem_helper_src(fname: &str, inner_mem: &str, n: usize, wire: usize, packed: usize) -> String {
+    format!(
+        "function {fname}(base, off, limit) -> ptr {{\n\
+         \x20   if lt(limit, add(off, {total})) {{ revert(0, 0) }}\n\
+         \x20   ptr := allocate_memory({mtotal})\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       let e := {inner_mem}(base, add(off, mul(i, {wire})), limit)\n\
+         \x20       gum_memory_copy(e, add(ptr, mul(i, {packed})), {packed})\n\
+         \x20   }}\n\
+         }}\n",
+        fname = fname,
+        inner_mem = inner_mem,
+        n = n,
+        wire = wire,
+        packed = packed,
+        total = n * wire,
+        mtotal = n * packed
+    )
+}
+
+fn abi_statfarr_put_helper_src(fname: &str, inner_put: &str, n: usize, wire: usize, packed: usize) -> String {
+    format!(
+        "function {fname}(dst, ptr) -> written {{\n\
+         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+         \x20       {inner_put}(add(dst, mul(i, {wire})), add(ptr, mul(i, {packed})))\n\
+         \x20   }}\n\
+         \x20   written := {total}\n\
+         }}\n",
+        fname = fname,
+        inner_put = inner_put,
+        n = n,
+        wire = wire,
+        packed = packed,
+        total = n * wire
+    )
+}
+
 // One field of a struct as it crosses the ABI: where it sits in the packed memory form, and how wide it is there.
 // is_addr is carried separately because an Account field is a whole 32-byte word in memory, so the packing never narrows it to its real 160 bits the way a u128 field's width does.
 #[derive(Clone, Copy)]
@@ -539,6 +767,20 @@ pub struct AbiStructField {
     mem_offset: usize,
     width: usize,
     is_addr: bool,
+}
+
+// A stable, unique suffix naming one type's codecs, so two functions taking the same type share a decoder and two different types never collide on one.
+// The recursion has to mirror the type exactly: [[u256]] and [[u256]; 2] differ only in a count, and a name that dropped it would hand the second the first's codec.
+fn abi_mangle(t: &Type) -> String {
+    match t {
+        Type::Primitive(n) => n.clone(),
+        Type::Array(i) => format!("arr_{}", abi_mangle(i)),
+        Type::FixedArray(i, n) => format!("farr{}_{}", n, abi_mangle(i)),
+        Type::Generic { name, args } => {
+            let inner: Vec<String> = args.iter().map(abi_mangle).collect();
+            format!("{}_{}", name, inner.join("_"))
+        }
+    }
 }
 
 // Whether a type is a scalar the ABI can put in exactly one word.
@@ -1736,6 +1978,211 @@ impl<'a> Translator<'a> {
         self.ensure_helper("gum_abi_farr_put", gum_abi_farr_put_helper_src);
     }
 
+    // Whether the ABI keeps this type behind an offset word instead of inline in the head.
+    // A fixed array inherits it from its element: [u256; 3] is three inline words, but [[u256]; 3] is three offsets and therefore dynamic itself.
+    pub fn abi_is_dynamic(&self, t: &Type) -> bool {
+        match t {
+            Type::Array(_) => true,
+            Type::FixedArray(inner, _) => self.abi_is_dynamic(inner),
+            Type::Primitive(n) => n == "String" || n == "Bytes",
+            _ => false,
+        }
+    }
+
+    // The struct name of t if t is a struct with a static wire form, else None.
+    fn abi_static_struct(&self, t: &Type) -> Option<String> {
+        match t {
+            Type::Primitive(n) if is_struct_type(self.type_checker(), t) => {
+                self.abi_struct_layout(n).map(|_| n.clone())
+            }
+            _ => None,
+        }
+    }
+
+    // The four ensure_abi_* below give every ABI type the same four codec signatures: cd(off), mem(base, off, limit), put(dst, ptr) -> written, size(ptr).
+    // That uniformity is the whole trick behind nesting: an outer array calls its element's codec by name without knowing whether the element is a scalar array, a struct array, or another nesting level.
+    // None means the type has no ABI form and the caller must reject it rather than emit a codec that silently drops data.
+    pub fn ensure_abi_cd(&self, t: &Type) -> Option<String> {
+        if let Some(sn) = self.abi_struct_elem(t) {
+            return self.ensure_abi_struct_arr_cd(&sn);
+        }
+        let fname = format!("gum_abi_{}_cd", abi_mangle(t));
+        if self.helper_thunks.borrow().contains_key(&fname) {
+            return Some(fname);
+        }
+        let src = match t {
+            Type::Array(inner) => {
+                if self.abi_is_dynamic(inner) {
+                    let ic = self.ensure_abi_cd(inner)?;
+                    abi_dynarr_cd_helper_src(&fname, &ic)
+                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_arr_cd();
+                    let esz = self.layout_engine.size_of(inner);
+                    format!(
+                        "function {}(off) -> ptr {{\n    ptr := gum_abi_arr_cd(off, {})\n}}\n",
+                        fname, esz
+                    )
+                } else {
+                    // A static element that is not a scalar, so it is inline on the wire but at its own width rather than one word: [u256; 3] rows, say.
+                    let ic = self.ensure_abi_cd(inner)?;
+                    let wire = self.abi_head_bytes(inner);
+                    let packed = self.layout_engine.size_of(inner);
+                    abi_starr_cd_helper_src(&fname, &ic, wire, packed)
+                }
+            }
+            Type::FixedArray(inner, n) => {
+                if self.abi_is_dynamic(inner) {
+                    let ic = self.ensure_abi_cd(inner)?;
+                    abi_dynfarr_cd_helper_src(&fname, &ic, *n)
+                } else if let Some(sn) = self.abi_static_struct(inner) {
+                    let (st, wire) = self.ensure_abi_struct_cd(&sn)?;
+                    let packed = self.abi_struct_packed(&sn);
+                    abi_statfarr_cd_helper_src(&fname, &st, *n, wire, packed)
+                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_farr_cd();
+                    let esz = self.layout_engine.size_of(inner);
+                    format!(
+                        "function {}(off) -> ptr {{\n    ptr := gum_abi_farr_cd(off, {}, {})\n}}\n",
+                        fname, n, esz
+                    )
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        self.ensure_helper(&fname, || src);
+        Some(fname)
+    }
+
+    pub fn ensure_abi_mem(&self, t: &Type) -> Option<String> {
+        if let Some(sn) = self.abi_struct_elem(t) {
+            return self.ensure_abi_struct_arr_mem(&sn);
+        }
+        let fname = format!("gum_abi_{}_mem", abi_mangle(t));
+        if self.helper_thunks.borrow().contains_key(&fname) {
+            return Some(fname);
+        }
+        let src = match t {
+            Type::Array(inner) => {
+                if self.abi_is_dynamic(inner) {
+                    let ic = self.ensure_abi_mem(inner)?;
+                    abi_dynarr_mem_helper_src(&fname, &ic)
+                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_arr_mem();
+                    let esz = self.layout_engine.size_of(inner);
+                    format!(
+                        "function {}(base, off, limit) -> ptr {{\n    ptr := gum_abi_arr_mem(base, off, limit, {})\n}}\n",
+                        fname, esz
+                    )
+                } else {
+                    let ic = self.ensure_abi_mem(inner)?;
+                    let wire = self.abi_head_bytes(inner);
+                    let packed = self.layout_engine.size_of(inner);
+                    abi_starr_mem_helper_src(&fname, &ic, wire, packed)
+                }
+            }
+            Type::FixedArray(inner, n) => {
+                if self.abi_is_dynamic(inner) {
+                    let ic = self.ensure_abi_mem(inner)?;
+                    abi_dynfarr_mem_helper_src(&fname, &ic, *n)
+                } else if let Some(sn) = self.abi_static_struct(inner) {
+                    let (st, wire) = self.ensure_abi_struct_mem(&sn)?;
+                    let packed = self.abi_struct_packed(&sn);
+                    abi_statfarr_mem_helper_src(&fname, &st, *n, wire, packed)
+                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_farr_mem();
+                    let esz = self.layout_engine.size_of(inner);
+                    format!(
+                        "function {}(base, off, limit) -> ptr {{\n    ptr := gum_abi_farr_mem(base, off, limit, {}, {})\n}}\n",
+                        fname, n, esz
+                    )
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        self.ensure_helper(&fname, || src);
+        Some(fname)
+    }
+
+    // Returns the put and size helper names together, since a caller that encodes a value always has to measure it first to lay out the head.
+    pub fn ensure_abi_put(&self, t: &Type) -> Option<(String, String)> {
+        if let Some(sn) = self.abi_struct_elem(t) {
+            return self.ensure_abi_struct_arr_put(&sn);
+        }
+        let fname = format!("gum_abi_{}_put", abi_mangle(t));
+        let sname = format!("gum_abi_{}_size", abi_mangle(t));
+        if self.helper_thunks.borrow().contains_key(&fname) {
+            return Some((fname, sname));
+        }
+        let (psrc, ssrc) = match t {
+            Type::Array(inner) => {
+                if self.abi_is_dynamic(inner) {
+                    let (ip, is) = self.ensure_abi_put(inner)?;
+                    (
+                        abi_dynarr_put_helper_src(&fname, &ip),
+                        abi_dynarr_size_helper_src(&sname, &is),
+                    )
+                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_arr_put();
+                    let esz = self.layout_engine.size_of(inner);
+                    (
+                        format!(
+                            "function {}(dst, ptr) -> written {{\n    written := gum_abi_arr_put(dst, ptr, {})\n}}\n",
+                            fname, esz
+                        ),
+                        format!(
+                            "function {}(ptr) -> sz {{\n    sz := gum_abi_arr_size(ptr, {})\n}}\n",
+                            sname, esz
+                        ),
+                    )
+                } else {
+                    let (ip, _) = self.ensure_abi_put(inner)?;
+                    let wire = self.abi_head_bytes(inner);
+                    let packed = self.layout_engine.size_of(inner);
+                    (
+                        abi_statarr_put_helper_src(&fname, &ip, wire, packed),
+                        abi_starr_size_helper_src(&sname, wire, packed),
+                    )
+                }
+            }
+            Type::FixedArray(inner, n) => {
+                if self.abi_is_dynamic(inner) {
+                    let (ip, is) = self.ensure_abi_put(inner)?;
+                    (
+                        abi_dynfarr_put_helper_src(&fname, &ip, *n),
+                        abi_dynfarr_size_helper_src(&sname, &is, *n),
+                    )
+                } else if let Some(sn) = self.abi_static_struct(inner) {
+                    let (st, wire) = self.ensure_abi_struct_put(&sn)?;
+                    let packed = self.abi_struct_packed(&sn);
+                    (
+                        abi_statfarr_put_helper_src(&fname, &st, *n, wire, packed),
+                        format!("function {}(ptr) -> sz {{\n    ptr := ptr\n    sz := {}\n}}\n", sname, n * wire),
+                    )
+                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_farr_put();
+                    let esz = self.layout_engine.size_of(inner);
+                    (
+                        format!(
+                            "function {}(dst, ptr) -> written {{\n    gum_abi_farr_put(dst, ptr, {}, {})\n    written := {}\n}}\n",
+                            fname, n, esz, n * 32
+                        ),
+                        format!("function {}(ptr) -> sz {{\n    ptr := ptr\n    sz := {}\n}}\n", sname, n * 32),
+                    )
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        self.ensure_helper(&fname, || psrc);
+        self.ensure_helper(&sname, || ssrc);
+        Some((fname, sname))
+    }
+
     // How many bytes this type occupies in an ABI **head**: one word for a
     // scalar or a dynamic type's offset, N words inline for a fixed array.
     // Shared so the calldata-length guard, the head layout, and the decoders
@@ -1743,8 +2190,12 @@ impl<'a> Translator<'a> {
     // How many bytes a parameter occupies in the ABI head, which is what the dispatcher's calldatasize guard is built from.
     // A static struct is inline, so it is as wide as its field count; everything dynamic is a single offset word and is length-checked by its own decoder.
     pub fn abi_head_bytes(&self, t: &Type) -> usize {
+        if self.abi_is_dynamic(t) {
+            return 32;
+        }
         match t {
-            Type::FixedArray(_, n) => 32 * n,
+            // A fixed array of statics is its element repeated, and the element may itself be a struct or another fixed array, so this recurses rather than assuming one word each.
+            Type::FixedArray(inner, n) => n * self.abi_head_bytes(inner),
             Type::Primitive(name) if is_struct_type(self.type_checker(), t) => {
                 self.abi_struct_wire_size(name).unwrap_or(32)
             }
@@ -1892,7 +2343,6 @@ impl<'a> Translator<'a> {
                     type_def
                 };
                 ctx.declare(name, type_def);
-                let size = self.layout_engine.size_of(type_def);
                 let val_expr = match value {
                     Some(Expr::ArrayLiteral(elements)) => {
                         let hint = if let Type::FixedArray(inner, _) = type_def {
@@ -1903,16 +2353,12 @@ impl<'a> Translator<'a> {
                         mask_for_type(&self.translate_array_literal(elements, hint, ctx), type_def)
                     }
                     Some(v) => mask_for_type(&self.translate_expr(v, ctx), type_def),
-                    None => "0".to_string(),
+                    None => match self.fresh_local_bytes(type_def) {
+                        Some(bytes) => format!("allocate_memory({})", bytes),
+                        None => "0".to_string(),
+                    },
                 };
-                if size > 32 {
-                    format!(
-                        "let {} := {}\n// Complex allocation size: {}\n",
-                        name, val_expr, size
-                    )
-                } else {
-                    format!("let {} := {}\n", name, val_expr)
-                }
+                format!("let {} := {}\n", name, val_expr)
             }
             Statement::Assignment { target, value } => {
                 let val_expr = self.translate_expr(value, ctx);
@@ -1955,7 +2401,17 @@ impl<'a> Translator<'a> {
                         let (addr_expr, stride) = self.mem_array_addr(base, &i, ctx);
                         let av = format!("__ma_{}", self.next_literal_id());
                         let mut out = format!("let {} := {}\n", av, addr_expr);
-                        if stride >= 32 {
+                        let elem_ty = match self.static_type(base, ctx) {
+                            Type::Array(inner) | Type::FixedArray(inner, _) => Some(*inner),
+                            _ => None,
+                        };
+                        // An inline element is the bytes themselves, so assigning one copies them; mstore would write the source pointer into the element's first word and drop the rest.
+                        if elem_ty.as_ref().map(|t| self.elem_is_inline(t)).unwrap_or(false) {
+                            out.push_str(&format!(
+                                "gum_memory_copy({}, {}, {})\n",
+                                val_expr, av, stride
+                            ));
+                        } else if stride >= 32 {
                             out.push_str(&format!("mstore({}, {})\n", av, val_expr));
                         } else {
                             let merged =
@@ -1982,10 +2438,9 @@ impl<'a> Translator<'a> {
             Statement::Return { value: Some(value) } => {
                 let mut val_expr = self.translate_expr(value, ctx);
                 let mut is_dynamic = false;
-                let mut array_elem: Option<usize> = None;
-                let mut fixed_array: Option<(usize, usize)> = None;
                 let mut struct_ret: Option<(String, usize)> = None;
-                let mut struct_arr_ret: Option<(String, String)> = None;
+                // The put and size helpers for an array return of any shape, plus whether the ABI puts it behind an offset word.
+                let mut arr_ret: Option<(String, String, bool, usize)> = None;
                 if let Some(ret_ty) = &ctx.return_type {
                     val_expr = mask_for_type(&val_expr, ret_ty);
                     if let Type::Primitive(name) = ret_ty {
@@ -1996,18 +2451,15 @@ impl<'a> Translator<'a> {
                             struct_ret = self.ensure_abi_struct_put(name);
                         }
                     }
-                    if let Type::Array(inner) = ret_ty {
-                        if ctx.is_entry {
-                            if let Some(sn) = self.abi_struct_elem(ret_ty) {
-                                struct_arr_ret = self.ensure_abi_struct_arr_put(&sn);
-                            }
+                    if ctx.is_entry && matches!(ret_ty, Type::Array(_) | Type::FixedArray(..)) {
+                        if let Some((put, size_fn)) = self.ensure_abi_put(ret_ty) {
+                            arr_ret = Some((
+                                put,
+                                size_fn,
+                                self.abi_is_dynamic(ret_ty),
+                                self.abi_head_bytes(ret_ty),
+                            ));
                         }
-                        if struct_arr_ret.is_none() {
-                            array_elem = Some(self.layout_engine.size_of(inner));
-                        }
-                    }
-                    if let Type::FixedArray(inner, n) = ret_ty {
-                        fixed_array = Some((*n, self.layout_engine.size_of(inner)));
                     }
                 }
                 if ctx.is_entry {
@@ -2017,19 +2469,33 @@ impl<'a> Translator<'a> {
                         Some(lock) => format!("tstore({}, 0)\n", lock),
                         None => String::new(),
                     };
-                    if let Some((put, size_fn)) = struct_arr_ret {
-                        format!(
-                            "let _p := {val}\n\
-                             let _out := allocate_memory(add(32, {size_fn}(_p)))\n\
-                             mstore(_out, 32)\n\
-                             let _w := {put}(add(_out, 32), _p)\n\
-                             {lock_clear}\
-                             return(_out, add(32, _w))\n",
-                            val = val_expr,
-                            size_fn = size_fn,
-                            put = put,
-                            lock_clear = lock_clear
-                        )
+                    if let Some((put, size_fn, dynamic, head)) = arr_ret {
+                        if dynamic {
+                            format!(
+                                "let _p := {val}\n\
+                                 let _out := allocate_memory(add(32, {size_fn}(_p)))\n\
+                                 mstore(_out, 32)\n\
+                                 let _w := {put}(add(_out, 32), _p)\n\
+                                 {lock_clear}\
+                                 return(_out, add(32, _w))\n",
+                                val = val_expr,
+                                size_fn = size_fn,
+                                put = put,
+                                lock_clear = lock_clear
+                            )
+                        } else {
+                            format!(
+                                "let _p := {val}\n\
+                                 let _out := allocate_memory({head})\n\
+                                 pop({put}(_out, _p))\n\
+                                 {lock_clear}\
+                                 return(_out, {head})\n",
+                                val = val_expr,
+                                head = head,
+                                put = put,
+                                lock_clear = lock_clear
+                            )
+                        }
                     } else if let Some((helper, wire)) = struct_ret {
                         format!(
                             "let _p := {val}\n\
@@ -2040,33 +2506,6 @@ impl<'a> Translator<'a> {
                             val = val_expr,
                             wire = wire,
                             helper = helper,
-                            lock_clear = lock_clear
-                        )
-                    } else if let Some((n, esz)) = fixed_array {
-                        self.ensure_abi_farr_put();
-                        format!(
-                            "let _p := {val}\n\
-                             let _out := allocate_memory({sz})\n\
-                             gum_abi_farr_put(_out, _p, {n}, {esz})\n\
-                             {lock_clear}\
-                             return(_out, {sz})\n",
-                            val = val_expr,
-                            sz = 32 * n,
-                            n = n,
-                            esz = esz,
-                            lock_clear = lock_clear
-                        )
-                    } else if let Some(esz) = array_elem {
-                        self.ensure_abi_arr_put();
-                        format!(
-                            "let _p := {val}\n\
-                             let _out := allocate_memory(add(32, gum_abi_arr_size(_p, {esz})))\n\
-                             mstore(_out, 32)\n\
-                             let _w := gum_abi_arr_put(add(_out, 32), _p, {esz})\n\
-                             {lock_clear}\
-                             return(_out, add(32, _w))\n",
-                            val = val_expr,
-                            esz = esz,
                             lock_clear = lock_clear
                         )
                     } else if is_dynamic {
@@ -2108,14 +2547,13 @@ impl<'a> Translator<'a> {
                 let error_decl = self.type_checker().loaded_errors.get(error_name).unwrap();
                 let abi_gen = AbiGenerator::new(self.type_checker());
                 let selector = abi_gen.calculate_error_selector(error_decl);
-                let is_dyn: Vec<bool> = error_decl.parameters.iter().map(|p| {
-                    matches!(&p.type_def, Type::Primitive(n) if n == "String" || n == "Bytes")
-                }).collect();
+                let types: Vec<Type> =
+                    error_decl.parameters.iter().map(|p| p.type_def.clone()).collect();
                 self.emit_revert_data(
                     &format!("Revert {}", error_name),
                     &selector,
                     args,
-                    &is_dyn,
+                    &types,
                     ctx,
                 )
             }
@@ -2253,23 +2691,25 @@ impl<'a> Translator<'a> {
             })
             .collect();
 
-        let sig_types: Vec<String> = fields
+        let field_types: Vec<Type> = fields.iter().map(|(_, e)| self.static_type(e, ctx)).collect();
+        let sig_types: Vec<String> = field_types
             .iter()
-            .map(|(_, e)| self.abi_gen.signature_type(&self.static_type(e, ctx)))
+            .map(|t| self.abi_gen.signature_type(t))
             .collect();
         let signature = format!("{}({})", event_name, sig_types.join(","));
         let topic0 = keccak256_hex(&signature);
 
+        // The JSON names a struct "tuple" and carries its fields in components, while topic0 is hashed from the expanded "(uint128,uint256)" form. They are the same type spelled two ways, and using the signature spelling in the JSON emitted a "type": "(uint256)" no decoder accepts.
         let inputs: Vec<AbiInput> = fields
             .iter()
-            .zip(&sig_types)
-            .map(|((indexed, e), ty)| AbiInput {
+            .zip(&field_types)
+            .map(|((indexed, e), t)| AbiInput {
                 name: match e {
                     Expr::Identifier(n) => n.clone(),
                     _ => String::new(),
                 },
-                type_name: ty.clone(),
-                components: Vec::new(),
+                type_name: self.abi_gen.map_type(t),
+                components: self.abi_gen.generate_components(t),
                 indexed: Some(*indexed),
             })
             .collect();
@@ -2277,36 +2717,47 @@ impl<'a> Translator<'a> {
             self.errors.borrow_mut().push(e);
         }
 
+        // Solidity puts a hash of the value in the topic for anything that is not one word, since a topic is exactly 32 bytes. Rejecting is better than emitting the pointer, which is what this did.
         let mut topics = vec![topic0];
-        for (indexed, e) in &fields {
+        for ((indexed, e), t) in fields.iter().zip(&field_types) {
             if *indexed {
+                if !is_abi_scalar(t) && !self.type_checker().is_scalar_enum(t) {
+                    self.errors.borrow_mut().push(format!(
+                        "Semantic Error: an indexed field of event '{}' must be one word, and '{}' is not. A topic is 32 bytes, so a longer value would have to be hashed to fit. Log it unindexed.",
+                        event_name,
+                        self.abi_gen.signature_type(t)
+                    ));
+                }
                 topics.push(self.translate_expr(e, ctx));
             }
         }
-        let data_exprs: Vec<String> = fields
-            .iter()
-            .filter(|(indexed, _)| !indexed)
-            .map(|(_, e)| self.translate_expr(e, ctx))
-            .collect();
         let log_op = format!("log{}", topics.len()); // topics.len() is 1..=4
 
-        if data_exprs.is_empty() {
+        let data: Vec<(String, Type)> = fields
+            .iter()
+            .zip(&field_types)
+            .filter(|((indexed, _), _)| !indexed)
+            .map(|((_, e), t)| (self.translate_expr(e, ctx), t.clone()))
+            .collect();
+
+        if data.is_empty() {
             return format!("{}(0, 0, {})\n", log_op, topics.join(", "));
         }
 
-        let ptr = format!("log_ptr_{}", self.next_literal_id());
-        let size = 32 * data_exprs.len();
-        let mut out = format!("let {} := allocate_memory({})\n", ptr, size);
-        for (i, d) in data_exprs.iter().enumerate() {
-            out.push_str(&format!("mstore(add({}, {}), {})\n", ptr, 32 * i, d));
+        // The event data is an ABI argument list like any other, so it goes through the encoder the CREATE and interface-call paths use rather than one word per field.
+        // One word per field was right only for scalars: for a string, an array or a struct it wrote the memory pointer, and the ABI JSON told decoders to read it as the real type.
+        let types: Vec<Type> = data.iter().map(|(_, t)| t.clone()).collect();
+        let (size_src, write_src) = self.abi_arg_blob_src(&types);
+        // A block, so the a0..aN the encoder emits are scoped to this log and a second log in the same function does not redeclare them.
+        let mut out = String::from("{\n");
+        for (i, (e, _)) in data.iter().enumerate() {
+            out.push_str(&format!("let a{} := {}\n", i, e));
         }
-        out.push_str(&format!(
-            "{}({}, {}, {})\n",
-            log_op,
-            ptr,
-            size,
-            topics.join(", ")
-        ));
+        out.push_str(&size_src);
+        out.push_str("let blob := allocate_memory(alen)\n");
+        out.push_str(&write_src);
+        out.push_str(&format!("{}(blob, alen, {})\n", log_op, topics.join(", ")));
+        out.push_str("}\n");
         out
     }
 
@@ -2671,9 +3122,7 @@ impl<'a> Translator<'a> {
                 }
                 let i = self.translate_expr(index, ctx);
                 let (addr, stride) = self.mem_array_addr(base, &i, ctx);
-                // A struct element is addressed, not loaded: elements sit inline and packed, so the element address already is the struct pointer that field access wants.
-                // mload here would hand back the struct's first word as if it were the whole value, which is what made a memory struct array unreadable.
-                if is_struct_type(self.type_checker(), &self.static_type(expr, ctx)) {
+                if self.elem_is_inline(&self.static_type(expr, ctx)) {
                     return addr;
                 }
                 read_packed(&format!("mload({})", addr), 0, stride)
@@ -2716,14 +3165,6 @@ impl<'a> Translator<'a> {
     // Returns (size_src, write_src): the first computes `alen`, the second fills the blob at `blob`, so a caller can allocate between them and choose its own prefix, a 4-byte selector or the child's creation code.
     // Every codec is registered here rather than inside the caller's builder closure, since ensure_helper holds the thunk map borrowed while it runs and a nested registration would panic.
     fn abi_arg_blob_src(&self, types: &[Type]) -> (String, String) {
-        let elem_size = |t: &Type| match t {
-            Type::Array(inner) => Some(self.layout_engine.size_of(inner)),
-            _ => None,
-        };
-        let fixed_of = |t: &Type| match t {
-            Type::FixedArray(inner, n) => Some((*n, self.layout_engine.size_of(inner))),
-            _ => None,
-        };
         let head_bytes: usize = types.iter().map(|t| self.abi_head_bytes(t)).sum();
         let head_at: Vec<usize> = types
             .iter()
@@ -2733,16 +3174,10 @@ impl<'a> Translator<'a> {
                 Some(at)
             })
             .collect();
-        let any_dynamic = types.iter().any(|t| is_str_type(t) || elem_size(t).is_some());
+        let any_dynamic = types.iter().any(|t| is_str_type(t) || self.abi_is_dynamic(t));
 
         if types.iter().any(is_str_type) {
             self.ensure_helper("gum_str_len", gum_str_len_helper_src);
-        }
-        if types.iter().any(|t| elem_size(t).is_some()) {
-            self.ensure_abi_arr_put();
-        }
-        if types.iter().any(|t| fixed_of(t).is_some()) {
-            self.ensure_abi_farr_put();
         }
         let struct_put: Vec<Option<String>> = types
             .iter()
@@ -2753,25 +3188,28 @@ impl<'a> Translator<'a> {
                 _ => None,
             })
             .collect();
-        let starr_put: Vec<Option<(String, String)>> = types
+        // One codec per array argument whatever its shape, so an outbound nested array encodes by the same path a flat one does.
+        let arr_put: Vec<Option<(String, String, bool)>> = types
             .iter()
             .map(|t| {
-                self.abi_struct_elem(t)
-                    .and_then(|sn| self.ensure_abi_struct_arr_put(&sn))
+                if matches!(t, Type::Array(_) | Type::FixedArray(..)) {
+                    self.ensure_abi_put(t)
+                        .map(|(p, s)| (p, s, self.abi_is_dynamic(t)))
+                } else {
+                    None
+                }
             })
             .collect();
 
+        // Only a dynamic value adds to alen; a static array is already counted, since abi_head_bytes gives its whole inline width rather than one offset word.
         let mut size_src = format!("    let alen := {}\n", head_bytes);
         for (i, t) in types.iter().enumerate() {
             if is_str_type(t) {
                 size_src.push_str(&format!("    let a{i}_len := gum_str_len(a{i})\n", i = i));
                 size_src.push_str(&format!("    let a{i}_pad := and(add(a{i}_len, 31), not(31))\n", i = i));
                 size_src.push_str(&format!("    alen := add(alen, add(32, a{}_pad))\n", i));
-            } else if let Some((_, size_fn)) = &starr_put[i] {
+            } else if let Some((_, size_fn, true)) = &arr_put[i] {
                 size_src.push_str(&format!("    let a{i}_abi := {s}(a{i})\n", i = i, s = size_fn));
-                size_src.push_str(&format!("    alen := add(alen, a{}_abi)\n", i));
-            } else if let Some(esz) = elem_size(t) {
-                size_src.push_str(&format!("    let a{i}_abi := gum_abi_arr_size(a{i}, {e})\n", i = i, e = esz));
                 size_src.push_str(&format!("    alen := add(alen, a{}_abi)\n", i));
             }
         }
@@ -2790,23 +3228,16 @@ impl<'a> Translator<'a> {
                     i = i
                 ));
                 write_src.push_str(&format!("    tail := add(tail, add(32, a{}_pad))\n", i));
-            } else if let Some((put, _)) = &starr_put[i] {
-                write_src.push_str(&format!("    mstore(add(blob, {}), tail)\n", at));
-                write_src.push_str(&format!(
-                    "    tail := add(tail, {}(add(blob, tail), a{}))\n",
-                    put, i
-                ));
-            } else if let Some(esz) = elem_size(t) {
-                write_src.push_str(&format!("    mstore(add(blob, {}), tail)\n", at));
-                write_src.push_str(&format!(
-                    "    tail := add(tail, gum_abi_arr_put(add(blob, tail), a{}, {}))\n",
-                    i, esz
-                ));
-            } else if let Some((n, esz)) = fixed_of(t) {
-                write_src.push_str(&format!(
-                    "    gum_abi_farr_put(add(blob, {}), a{}, {}, {})\n",
-                    at, i, n, esz
-                ));
+            } else if let Some((put, _, dynamic)) = &arr_put[i] {
+                if *dynamic {
+                    write_src.push_str(&format!("    mstore(add(blob, {}), tail)\n", at));
+                    write_src.push_str(&format!(
+                        "    tail := add(tail, {}(add(blob, tail), a{}))\n",
+                        put, i
+                    ));
+                } else {
+                    write_src.push_str(&format!("    pop({}(add(blob, {}), a{}))\n", put, at, i));
+                }
             } else if let Some(helper) = &struct_put[i] {
                 write_src.push_str(&format!("    {}(add(blob, {}), a{})\n", helper, at, i));
             } else {
@@ -3377,6 +3808,15 @@ impl<'a> Translator<'a> {
     }
 
     fn struct_base_transient(&self, base: &Expr, ctx: &Ctx) -> bool {
+        // A struct held directly as a field carries its own transient flag, so it has to be asked here too or a transient struct would read and write persistent slots.
+        if let Expr::PropertyAccess { base: owner, property } = base {
+            let sf = self
+                .field_owner(owner, ctx)
+                .and_then(|c| self.layout_engine.storage_field(&c, property));
+            if let Some(sf) = sf {
+                return sf.is_transient;
+            }
+        }
         let map: &Expr = match base {
             Expr::IndexAccess { base: m, .. } => m,
             Expr::MethodCall {
@@ -3398,6 +3838,7 @@ impl<'a> Translator<'a> {
         ctx: &Ctx,
     ) -> Option<(String, String, String, usize, bool)> {
         let sf = self.resolve_storage_field(arr, ctx)?;
+        // No Vec case here on purpose: a contract's Vec(T) field is rewritten to [T] when the class is loaded, so codegen only ever sees the array form.
         let (inner, len_expr, data_base) = match self.static_type(arr, ctx) {
             Type::Array(inner) => {
                 self.ensure_helper("arr_data_base", arr_data_base_helper_src);
@@ -3418,8 +3859,38 @@ impl<'a> Translator<'a> {
         Some((data_base, len_expr, struct_name, es, sf.is_transient))
     }
 
+    // The class owning a bare field reference, resolving self against the enclosing class.
+    fn field_owner(&self, base: &Expr, ctx: &Ctx) -> Option<String> {
+        match base {
+            Expr::Identifier(n) if n == "self" => ctx.self_ctx.map(|s| s.class_name.clone()),
+            Expr::Identifier(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+
     fn struct_storage_base(&self, base: &Expr, ctx: &Ctx) -> Option<(String, String)> {
-        if let Expr::IndexAccess { base: arr, index } = base {
+        // A struct held directly as a contract field, C.p, so C.p.b resolves to p's base slot plus b's offset within the struct.
+        // Without this the field fell through to load_storage_field, which materializes a memory copy of the struct: reads reloaded it every time and worked by accident, and a write landed in the copy and was discarded.
+        if let Expr::PropertyAccess { base: owner, property } = base {
+            let sf = self
+                .field_owner(owner, ctx)
+                .and_then(|c| self.layout_engine.storage_field(&c, property));
+            let ty = self.static_type(base, ctx);
+            if let (Some(sf), Type::Primitive(struct_name)) = (sf, &ty) {
+                if is_struct_type(self.type_checker(), &ty) {
+                    return Some((sf.slot.to_string(), struct_name.clone()));
+                }
+            }
+        }
+        // xs[i] and v.get(i) are the same access spelled two ways, so both reach the struct-array path; only the mapping form used to accept .get.
+        let indexed: Option<(&Expr, &Expr)> = match base {
+            Expr::IndexAccess { base: arr, index } => Some((arr, index)),
+            Expr::MethodCall { base: arr, method, args } if method == "get" && !args.is_empty() => {
+                Some((arr, &args[0]))
+            }
+            _ => None,
+        };
+        if let Some((arr, index)) = indexed {
             if let Some((data_base, len, struct_name, es, tr)) = self.storage_struct_array(arr, ctx)
             {
                 self.ensure_helper("sarr_base", || sarr_base_helper_src(self.rich_reverts));
@@ -3474,17 +3945,21 @@ impl<'a> Translator<'a> {
         Some((slot, sf.offset_in_slot, sf.size))
     }
 
+    // The revert data of a custom error is an ABI argument list like any other, so it shares the CREATE and interface-call encoder rather than laying out its own head and tail.
+    // Hand-rolled, it handled scalars and strings and wrote the memory pointer for an array or a struct, while the selector was hashed from the real type, so a decoder read the pointer as a plausible value.
+    // types comes from the error declaration, not the argument expressions, because only the declaration says what the wire form is.
     fn emit_revert_data(
         &self,
         label: &str,
         selector: &str,
         args: &[Expr],
-        is_dyn: &[bool],
+        types: &[Type],
         ctx: &Ctx,
     ) -> String {
         let mut out = format!("// {}\n", label);
 
-        if args.len() == 1 && is_dyn.first().copied().unwrap_or(false) {
+        // One string keeps its own helper: it is the assert(msg) shape and by far the most common revert, so it is worth the bytes it saves.
+        if args.len() == 1 && types.first().map(is_str_type).unwrap_or(false) {
             self.ensure_helper("gum_str_len", gum_str_len_helper_src);
             self.ensure_helper("gum_revert_str", gum_revert_str_helper_src);
             let arg = self.translate_expr(&args[0], ctx);
@@ -3504,50 +3979,19 @@ impl<'a> Translator<'a> {
             return out;
         }
 
+        let (size_src, write_src) = self.abi_arg_blob_src(types);
         out.push_str("{\n");
         for (i, arg) in args.iter().enumerate() {
             let arg_expr = self.translate_expr(arg, ctx);
-            out.push_str(&format!("let _ra_{} := {}\n", i, arg_expr));
+            out.push_str(&format!("let a{} := {}\n", i, arg_expr));
         }
-
-        let head_bytes = args.len() * 32;
-        out.push_str("let _p := mload(0x40)\n");
+        out.push_str(&size_src);
+        // The selector sits immediately before the blob, so one allocation covers both and revert can hand back a contiguous range.
+        out.push_str("let _p := allocate_memory(add(4, alen))\n");
         out.push_str(&format!("mstore(_p, shl(224, {}))\n", selector));
-        out.push_str("let _head := add(_p, 4)\n");
-        out.push_str(&format!("let _tail := add(_head, {})\n", head_bytes));
-
-        for i in 0..args.len() {
-            let head_i = i * 32;
-            if is_dyn.get(i).copied().unwrap_or(false) {
-                out.push_str(&format!(
-                    "mstore(add(_head, {}), sub(_tail, _head))\n",
-                    head_i
-                ));
-                out.push_str(&format!(
-                    "let _len_{} := and(shr(192, mload(_ra_{})), 0xffffffffffffffff)\n",
-                    i, i
-                ));
-                out.push_str(&format!(
-                    "let _pad_{} := and(add(_len_{}, 31), not(31))\n",
-                    i, i
-                ));
-                out.push_str(&format!("mstore(_tail, _len_{})\n", i));
-                out.push_str(&format!(
-                    "if _pad_{} {{ mstore(add(_tail, _pad_{}), 0) }}\n",
-                    i, i
-                ));
-                out.push_str(&format!(
-                    "gum_memory_copy(add(_ra_{}, 32), add(_tail, 32), _len_{})\n",
-                    i, i
-                ));
-                out.push_str(&format!("_tail := add(add(_tail, 32), _pad_{})\n", i));
-            } else {
-                out.push_str(&format!("mstore(add(_head, {}), _ra_{})\n", head_i, i));
-            }
-        }
-
-        out.push_str("mstore(0x40, _tail)\n");
-        out.push_str("revert(_p, sub(_tail, _p))\n");
+        out.push_str("let blob := add(_p, 4)\n");
+        out.push_str(&write_src);
+        out.push_str("revert(_p, add(4, alen))\n");
         out.push_str("}\n");
         out
     }
@@ -3557,25 +4001,22 @@ impl<'a> Translator<'a> {
             if let Some(err) = self.type_checker().loaded_errors.get(name) {
                 let abi_gen = AbiGenerator::new(self.type_checker());
                 let selector = abi_gen.calculate_error_selector(err);
-                let is_dyn: Vec<bool> = err
-                    .parameters
-                    .iter()
-                    .map(|p| is_str_type(&p.type_def))
-                    .collect();
+                let types: Vec<Type> = err.parameters.iter().map(|p| p.type_def.clone()).collect();
                 return self.emit_revert_data(
                     &format!("assert failed: {}", name),
                     &selector,
                     args,
-                    &is_dyn,
+                    &types,
                     ctx,
                 );
             }
         }
+        // A bare assert message is Error(string), the selector every tool already knows.
         self.emit_revert_data(
             "assert failed",
             "0x08c379a0",
             std::slice::from_ref(msg),
-            &[true],
+            &[Type::Primitive("String".to_string())],
             ctx,
         )
     }
@@ -3892,6 +4333,30 @@ impl<'a> Translator<'a> {
         }
     }
 
+    // How many bytes a fresh local of this type needs, or None for a scalar, which is just a value.
+    // Anything memory-backed has to own a block from the start: a declaration with no initializer used to bind 0, so p.x on a `mut P p` read scratch memory at address 0 and returned whatever happened to be there.
+    // Fresh memory is already zero, since allocate_memory only ever bumps the free pointer, so the block needs no explicit clearing; a dynamic array's or a string's header word is a zero length for free.
+    fn fresh_local_bytes(&self, t: &Type) -> Option<usize> {
+        match t {
+            Type::FixedArray(..) | Type::Array(_) => Some(self.layout_engine.size_of(t)),
+            Type::Primitive(n) if n == "String" || n == "Bytes" => Some(32),
+            Type::Primitive(_)
+                if is_struct_type(self.type_checker(), t)
+                    || self.type_checker().is_payload_enum(t) =>
+            {
+                Some(self.layout_engine.size_of(t))
+            }
+            _ => None,
+        }
+    }
+
+    // Whether a value of this type sits inline where it is stored rather than being a pointer to somewhere else.
+    // An inline element is addressed, never loaded: its address already is the value, and mload would hand back only its first word.
+    // A struct and a fixed array are inline; a dynamic array is a stored pointer, so it is loaded like a scalar.
+    fn elem_is_inline(&self, t: &Type) -> bool {
+        matches!(t, Type::FixedArray(..)) || is_struct_type(self.type_checker(), t)
+    }
+
     fn array_elem_info(&self, base: &Expr, ctx: &Ctx) -> (bool, usize) {
         match self.static_type(base, ctx) {
             Type::Array(inner) => (true, self.layout_engine.size_of(&inner)),
@@ -4106,6 +4571,28 @@ impl<'a> Translator<'a> {
                     }
                     return out;
                 }
+            }
+        }
+
+        // A memory-backed local is a pointer to a block, so deleting it clears the block. Assigning 0 nulled the pointer instead, and every later read of it went to scratch memory at address 0.
+        // A dynamic array's and a string's block is just the header, so zeroing it is exactly a length of 0.
+        if let Expr::Identifier(_) = target {
+            let t = self.static_type(target, ctx);
+            if let Some(bytes) = self.fresh_local_bytes(&t) {
+                let p = self.translate_expr(target, ctx);
+                let pv = format!("__delp_{}", self.next_literal_id());
+                let mut out = format!("let {} := {}\n", pv, p);
+                for i in 0..(bytes / 32) {
+                    out.push_str(&format!("mstore(add({}, {}), 0)\n", pv, i * 32));
+                }
+                // The block need not end on a word boundary, and the bytes after it belong to the next allocation, so the tail word is a masked read-modify-write rather than a store.
+                let rem = bytes % 32;
+                if rem > 0 {
+                    let addr = format!("add({}, {})", pv, (bytes / 32) * 32);
+                    let merged = write_packed(&format!("mload({})", addr), 0, rem, "0");
+                    out.push_str(&format!("mstore({}, {})\n", addr, merged));
+                }
+                return out;
             }
         }
 
@@ -4401,9 +4888,18 @@ impl<'a> Translator<'a> {
                 "gum_abi_str_mem(rd, mload(rd), returndatasize())".to_string(),
             );
         }
-        if let Some(sn) = self.abi_struct_elem(t) {
-            if let Some(h) = self.ensure_abi_struct_arr_mem(&sn) {
-                return decode("32".to_string(), format!("{}(rd, mload(rd), returndatasize())", h));
+        // An array of any shape decodes through its own codec, reading returndata as the memory blob it already is.
+        // A dynamic result starts with an offset word, hence mload(rd); a static one begins at 0.
+        if matches!(t, Type::Array(_) | Type::FixedArray(..)) {
+            if let Some(h) = self.ensure_abi_mem(t) {
+                return if self.abi_is_dynamic(t) {
+                    decode("32".to_string(), format!("{}(rd, mload(rd), returndatasize())", h))
+                } else {
+                    decode(
+                        self.abi_head_bytes(t).to_string(),
+                        format!("{}(rd, 0, returndatasize())", h),
+                    )
+                };
             }
         }
         match t {
@@ -4412,22 +4908,6 @@ impl<'a> Translator<'a> {
                     return decode(wire.to_string(), format!("{}(rd, 0, returndatasize())", h));
                 }
                 scalar
-            }
-            Type::Array(inner) => {
-                let esz = self.layout_engine.size_of(inner);
-                self.ensure_abi_arr_mem();
-                decode(
-                    "32".to_string(),
-                    format!("gum_abi_arr_mem(rd, mload(rd), returndatasize(), {})", esz),
-                )
-            }
-            Type::FixedArray(inner, cnt) => {
-                let esz = self.layout_engine.size_of(inner);
-                self.ensure_abi_farr_mem();
-                decode(
-                    (32 * cnt).to_string(),
-                    format!("gum_abi_farr_mem(rd, 0, returndatasize(), {}, {})", cnt, esz),
-                )
             }
             _ => scalar,
         }

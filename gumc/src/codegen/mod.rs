@@ -594,35 +594,24 @@ impl EvmYulBackend {
                             }
                         }
                     }
-                    if let Some(sn) = translator.abi_struct_elem(&p.type_def) {
-                        if let Some(helper) = translator.ensure_abi_struct_arr_mem(&sn) {
-                            yul.push_str(&format!(
-                                "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
-                                arg_name, helper, offset
-                            ));
-                            offset += 32;
+                    // The dispatcher's array path, reading the blob the creation code appended instead of calldata.
+                    if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
+                        if let Some(helper) = translator.ensure_abi_mem(&p.type_def) {
+                            if translator.abi_is_dynamic(&p.type_def) {
+                                yul.push_str(&format!(
+                                    "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
+                                    arg_name, helper, offset
+                                ));
+                                offset += 32;
+                            } else {
+                                yul.push_str(&format!(
+                                    "    let {} := {}(args_mem, {}, _args_len)\n",
+                                    arg_name, helper, offset
+                                ));
+                                offset += translator.abi_head_bytes(&p.type_def);
+                            }
                             continue;
                         }
-                    }
-                    if let Type::Array(inner) = &p.type_def {
-                        let esz = layout_engine.size_of(inner);
-                        translator.ensure_abi_arr_mem();
-                        yul.push_str(&format!(
-                            "    let {} := gum_abi_arr_mem(args_mem, mload(add(args_mem, {})), _args_len, {})\n",
-                            arg_name, offset, esz
-                        ));
-                        offset += 32;
-                        continue;
-                    }
-                    if let Type::FixedArray(inner, n) = &p.type_def {
-                        let esz = layout_engine.size_of(inner);
-                        translator.ensure_abi_farr_mem();
-                        yul.push_str(&format!(
-                            "    let {} := gum_abi_farr_mem(args_mem, {}, _args_len, {}, {})\n",
-                            arg_name, offset, n, esz
-                        ));
-                        offset += 32 * n;
-                        continue;
                     }
                     let size = layout_engine.size_of(&p.type_def);
                     if size <= 32 {
@@ -817,37 +806,22 @@ impl EvmYulBackend {
                             }
                         }
 
-                        if let Some(sn) = translator.abi_struct_elem(&p.type_def) {
-                            if let Some(helper) = translator.ensure_abi_struct_arr_cd(&sn) {
-                                yul.push_str(&format!(
-                                    "          let {} := {}(add(4, calldataload({})))\n",
-                                    arg_name, helper, offset
-                                ));
-                                offset += 32;
+                        // Every array shape resolves through one codec lookup, which recurses into its element, so a nested array decodes by the same path a flat one does.
+                        // A dynamic value sits behind an offset word and is decoded at add(4, that offset); a static one is inline and is decoded where the cursor already points.
+                        if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
+                            if let Some(helper) = translator.ensure_abi_cd(&p.type_def) {
+                                if translator.abi_is_dynamic(&p.type_def) {
+                                    yul.push_str(&format!(
+                                        "          let {} := {}(add(4, calldataload({})))\n",
+                                        arg_name, helper, offset
+                                    ));
+                                    offset += 32;
+                                } else {
+                                    yul.push_str(&format!("          let {} := {}({})\n", arg_name, helper, offset));
+                                    offset += translator.abi_head_bytes(&p.type_def);
+                                }
                                 continue;
                             }
-                        }
-
-                        if let Type::Array(inner) = &p.type_def {
-                            let esz = layout_engine.size_of(inner);
-                            translator.ensure_abi_arr_cd();
-                            yul.push_str(&format!(
-                                "          let {} := gum_abi_arr_cd(add(4, calldataload({})), {})\n",
-                                arg_name, offset, esz
-                            ));
-                            offset += 32;
-                            continue;
-                        }
-
-                        if let Type::FixedArray(inner, n) = &p.type_def {
-                            let esz = layout_engine.size_of(inner);
-                            translator.ensure_abi_farr_cd();
-                            yul.push_str(&format!(
-                                "          let {} := gum_abi_farr_cd({}, {}, {})\n",
-                                arg_name, offset, n, esz
-                            ));
-                            offset += 32 * n;
-                            continue;
                         }
 
                         let size = layout_engine.size_of(&p.type_def);

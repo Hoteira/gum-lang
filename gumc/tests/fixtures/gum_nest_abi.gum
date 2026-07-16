@@ -1,0 +1,42 @@
+class P:
+    u128 a
+    u256 b
+
+contract N:
+    export fn rows([[u256]] xs) -> u256:
+        return xs.length
+
+    export fn row_len([[u256]] xs, u256 i) -> u256:
+        return xs[i].length
+
+    export fn total([[u256]] xs) -> u256:
+        mut u256 t = 0
+        for row in xs:
+            for v in row:
+                t = t + v
+        return t
+
+    export fn at([[u256]] xs, u256 i, u256 j) -> u256:
+        return xs[i][j]
+
+    export fn echo([[u256]] xs) -> [[u256]]:
+        return xs
+
+    export fn deep_at([[[u256]]] xs, u256 i, u256 j, u256 k) -> u256:
+        return xs[i][j][k]
+
+    export fn pair_sum([[u256]; 2] xs) -> u256:
+        mut u256 t = 0
+        for row in xs:
+            for v in row:
+                t = t + v
+        return t
+
+    export fn fixed_rows([[u256; 3]] xs, u256 i, u256 j) -> u256:
+        return xs[i][j]
+
+    export fn struct_pair_b([P; 2] xs, u256 i) -> u256:
+        return xs[i].b
+
+    export fn struct_grid_b([[P]] xs, u256 i, u256 j) -> u256:
+        return xs[i][j].b

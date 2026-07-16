@@ -421,21 +421,21 @@ fn indexed_event_uses_canonical_erc20_transfer_topic() {
     // real ERC20 Transfer hash every wallet/indexer keys on, proving the
     // signature is built from arg types (Account->address, u256->uint256),
     // and that indexed() args route to LOG topics (log3), not data.
-    // The log_ptr_N suffix is a codegen counter shared with every other
-    // literal thunk, so it shifts whenever unrelated codegen changes, match
-    // on the parts that carry meaning (opcode arity, data size, topic hash)
-    // rather than pinning the counter.
-    assert_output_contains_numbered(
-        &read_repo_file("examples/token.gum"),
-        "log3(log_ptr_",
-        ", 32, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    let src = read_repo_file("examples/token.gum");
+    assert_output_contains(
+        &src,
+        "log3(blob, alen, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, sender, to)",
     );
+    // Two indexed fields leave one word of data, so the encoder's head is 32 and there is no tail.
+    assert_output_contains(&src, "let alen := 32");
 }
 
 #[test]
 fn non_indexed_event_stays_in_data() {
     // Mint(to indexed, value): one indexed topic -> log2, value in 32B data.
-    assert_output_contains_numbered(&read_repo_file("examples/token.gum"), "log2(log_ptr_", ", 32,");
+    let src = read_repo_file("examples/token.gum");
+    assert_output_contains(&src, "log2(blob, alen,");
+    assert_output_contains(&src, "let alen := 32");
 }
 
 #[test]
@@ -1846,9 +1846,9 @@ fn deploying_a_contract_with_an_array_constructor_arg_encodes_it() {
     // The array is re-expanded to one ABI word per element after the creation
     // code, and the child decodes it back out of the codecopy'd blob.
     let src = "contract Child:\n    u256 n\n\n    fn new([u256] xs):\n        self.n = xs.length\n\ncontract Factory:\n    u256 c\n\n    export fn make([u256] xs) -> Account:\n        return new Child(xs)\n";
-    assert_output_contains(src, "gum_abi_arr_size(a0, 32)");
-    assert_output_contains(src, "gum_abi_arr_put(add(blob, tail), a0, 32)");
-    assert_output_contains(src, "gum_abi_arr_mem(args_mem,");
+    assert_output_contains(src, "let a0_abi := gum_abi_arr_u256_size(a0)");
+    assert_output_contains(src, "tail := add(tail, gum_abi_arr_u256_put(add(blob, tail), a0))");
+    assert_output_contains(src, "gum_abi_arr_u256_mem(args_mem,");
     assert_assembles(src);
 }
 
@@ -1857,11 +1857,12 @@ fn deploying_a_contract_with_a_fixed_array_constructor_arg_encodes_it_inline() {
     // [T; N] is a static type on the wire: N words inline in the head, with
     // no offset and no tail.
     let src = "contract Child:\n    u256 n\n\n    fn new([u8; 3] xs, u256 v):\n        self.n = v\n\ncontract Factory:\n    u256 c\n\n    export fn make([u8; 3] xs, u256 v) -> Account:\n        return new Child(xs, v)\n";
-    assert_output_contains(src, "gum_abi_farr_put(add(blob, 0), a0, 3, 1)");
+    assert_output_contains(src, "pop(gum_abi_farr3_u8_put(add(blob, 0), a0))");
+    assert_output_contains(src, "gum_abi_farr_put(dst, ptr, 3, 1)");
     // The array takes three head words, so the next argument starts at 96 ,
     // not 32.
     assert_output_contains(src, "mstore(add(blob, 96), a1)");
-    assert_output_contains(src, "gum_abi_farr_mem(args_mem, 0, _args_len, 3, 1)");
+    assert_output_contains(src, "let param_xs := gum_abi_farr3_u8_mem(args_mem, 0, _args_len)");
     assert_assembles(src);
 }
 
@@ -1889,7 +1890,8 @@ fn an_array_argument_decodes_from_its_abi_offset_not_as_a_scalar() {
     // scalar handed the body a calldata offset and called it an array pointer ,
     // while the published ABI said uint256[], so callers encoded it properly.
     let src = "contract C:\n    export fn sum([u256] xs) -> u256:\n        mut u256 s = 0\n        for x in xs:\n            s = s + x\n        return s\n";
-    assert_output_contains(src, "gum_abi_arr_cd(add(4, calldataload(4)), 32)");
+    assert_output_contains(src, "gum_abi_arr_u256_cd(add(4, calldataload(4)))");
+    assert_output_contains(src, "ptr := gum_abi_arr_cd(off, 32)");
     assert_output_contains(src, "\"type\": \"uint256[]\"");
     assert_assembles(src);
 }
@@ -1899,8 +1901,10 @@ fn a_narrow_array_converts_between_wire_and_memory_widths() {
     // The ABI gives a uint8 a whole 32-byte word; memory packs it to one byte.
     // A flat copy would be wrong in both directions.
     let src = "contract C:\n    export fn echo([u8] xs) -> [u8]:\n        return xs\n";
-    assert_output_contains(src, "gum_abi_arr_cd(add(4, calldataload(4)), 1)");
-    assert_output_contains(src, "gum_abi_arr_put(add(_out, 32), _p, 1)");
+    assert_output_contains(src, "let param_xs := gum_abi_arr_u8_cd(add(4, calldataload(4)))");
+    assert_output_contains(src, "ptr := gum_abi_arr_cd(off, 1)");
+    assert_output_contains(src, "let _w := gum_abi_arr_u8_put(add(_out, 32), _p)");
+    assert_output_contains(src, "written := gum_abi_arr_put(dst, ptr, 1)");
     assert_assembles(src);
 }
 
@@ -1934,10 +1938,37 @@ fn memory_array_length_is_an_element_count_not_a_byte_count() {
 }
 
 #[test]
-fn an_array_of_arrays_across_the_abi_is_rejected() {
-    // Decoding each element as a 32-byte scalar would read the inner arrays'
-    // offsets as if they were values, silently.
-    assert_compile_fails("contract C:\n    export fn f([[u256]] xs) -> u256:\n        return 1\n");
+fn an_array_of_arrays_crosses_the_abi() {
+    // The element is dynamic, so it carries an offset rather than its bytes and the outer array needs its own codec rather than a stride.
+    let src = "contract C:\n    export fn f([[u256]] xs) -> u256:\n        return xs[0][1]\n";
+    assert_output_contains(src, "\"type\": \"uint256[][]\"");
+    assert_output_contains(src, "let param_xs := gum_abi_arr_arr_u256_cd(add(4, calldataload(4)))");
+    // The inner decode is reached through the offset table, not by striding over inline data.
+    assert_output_contains(src, "mstore(add(add(ptr, 32), mul(i, 32)), gum_abi_arr_u256_cd(add(base, eo)))");
+    assert_assembles(src);
+}
+
+#[test]
+fn a_dynamic_value_inside_a_storage_aggregate_is_rejected() {
+    // Each of these compiled, and each read a storage word and then used it as a memory address. [String] was worst: it laid a String out as an 8-byte packed scalar.
+    assert_compile_fails("contract C:\n    [[u256]] g\n\n    export fn f(u256 i, u256 j) -> u256:\n        return C.g[i][j]\n");
+    assert_compile_fails("contract C:\n    [[u256]; 2] g\n\n    export fn f() -> u256:\n        return 1\n");
+    assert_compile_fails("use gum.defaults.String\n\ncontract C:\n    [String] g\n\n    export fn f() -> u256:\n        return 1\n");
+    assert_compile_fails("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, [u256]) m\n\n    export fn f() -> u256:\n        return 1\n");
+    assert_compile_fails("use gum.defaults.Account\nuse gum.defaults.String\n\ncontract C:\n    HashMap(Account, String) m\n\n    export fn f() -> u256:\n        return 1\n");
+    // Storage is only a contract's own fields, so the same type as a parameter is untouched.
+    assert_compiles("contract C:\n    export fn f([[u256]] xs) -> u256:\n        return xs[0][0]\n");
+    // And what has a real layout still has one.
+    assert_compiles("use gum.defaults.String\n\ncontract C:\n    String s\n\n    export fn f() -> u256:\n        return C.s.length\n");
+    assert_compiles("class P:\n    u256 x\n\ncontract C:\n    [P] xs\n\n    export fn f(u256 i) -> u256:\n        return C.xs[i].x\n");
+    assert_compiles("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, HashMap(Account, u256)) m\n\n    export fn f(Account a, Account b) -> u256:\n        return C.m[a][b]\n");
+    assert_compiles("contract C:\n    [u256] xs\n\n    export fn f(u256 i) -> u256:\n        return C.xs[i]\n");
+}
+
+#[test]
+fn a_dynamic_element_the_codecs_cannot_carry_is_still_rejected() {
+    // String is dynamic and has no element codec, so string[] must be refused rather than encoded as its memory pointer.
+    assert_compile_fails("use gum.defaults.String\n\ncontract C:\n    export fn f([String] xs) -> u256:\n        return 1\n");
 }
 
 #[test]
@@ -1954,7 +1985,7 @@ fn an_interface_returning_a_non_scalar_decodes_it() {
     let src = "use gum.defaults.String\n\ninterface I:\n    fn name() -> String\n\ncontract C:\n    export fn f(Account t) -> u256:\n        var s = I(t).name()\n        return s.length\n";
     assert_output_contains(src, "gum_abi_str_mem(rd, mload(rd), returndatasize())");
     let arr = "interface I:\n    fn xs() -> [u256]\n\ncontract C:\n    export fn f(Account t) -> u256:\n        var a = I(t).xs()\n        return a.length\n";
-    assert_output_contains(arr, "gum_abi_arr_mem(rd, mload(rd), returndatasize(), 32)");
+    assert_output_contains(arr, "gum_abi_arr_u256_mem(rd, mload(rd), returndatasize())");
 }
 
 #[test]
@@ -1970,9 +2001,14 @@ fn an_array_of_non_static_structs_across_the_abi_is_rejected() {
 }
 
 #[test]
-fn a_fixed_array_of_structs_across_the_abi_is_rejected() {
-    // Only the dynamic form is implemented, [P; N] has no codec.
-    assert_compile_fails("class P:\n    u256 x\n\ncontract C:\n    export fn f([P; 2] xs) -> u256:\n        return 1\n");
+fn a_fixed_array_of_structs_rides_inline_in_the_head() {
+    // Every element is static, so the whole thing is static: no offset word, no count word, and the head is as wide as the elements together.
+    let src = "class P:\n    u256 x\n\ncontract C:\n    export fn f([P; 2] xs, u256 v) -> u256:\n        return xs[1].x + v\n";
+    assert_output_contains(src, "\"type\": \"tuple[2]\"");
+    assert_output_contains(src, "let param_xs := gum_abi_farr2_P_cd(4)");
+    // Two one-field tuples inline take 64 bytes, so v is read at 68 rather than at 36.
+    assert_output_contains(src, "let param_v := calldataload(68)");
+    assert_assembles(src);
 }
 
 #[test]

@@ -25,3 +25,7 @@ contract S:
     export fn bump([P] xs, u256 i, u128 v) -> u128:
         xs[i].a = v
         return xs[i].a
+
+    export fn copy_elem([P] xs, u256 d, u256 srci) -> u256:
+        xs[d] = xs[srci]
+        return xs[d].b

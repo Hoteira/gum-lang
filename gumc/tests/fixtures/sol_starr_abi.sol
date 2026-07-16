@@ -37,4 +37,9 @@ contract S {
         m[i].a = v;
         return m[i].a;
     }
+
+    function copy_elem(P[] memory xs, uint256 d, uint256 srci) external pure returns (uint256) {
+        xs[d] = xs[srci];
+        return xs[d].b;
+    }
 }

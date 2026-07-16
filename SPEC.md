@@ -487,10 +487,31 @@ The difference is invisible for `[u256]`, whose stride already *is* a word, and
 load-bearing for everything narrower: a `[u8]` carries one byte of payload per 32
 on the wire, and one byte per byte in memory.
 
-The element must be a **scalar** (`uN`, `iN`, `bool`, `Account`) or a static
-struct (§7b). An array *of arrays* is a compile error rather than a wrong
-answer: it would decode each element as a 32-byte scalar, which for `[[T]]`
-means reading the inner arrays' offsets as if they were values.
+The element must be a **scalar** (`uN`, `iN`, `bool`, `Account`), a payload-free
+enum, a static struct (§7b), or another array of any of those, to any depth.
+`String` and `Bytes` elements are a compile error rather than a wrong answer:
+they are dynamic and have no element codec, so `[String]` is refused instead of
+being encoded as its memory pointer.
+
+#### Nesting
+
+An array whose element is itself **dynamic** grows an indirection the memory
+form does not have: the element carries an *offset* rather than its bytes.
+
+| | ABI (the wire) | gum memory |
+|---|---|---|
+| `[[T]]` | offset → count → **one offset per row** → the rows | count word, then **one pointer per row** |
+| `[[T]; N]` | offset → **N offsets** (no count) → the rows | N pointers, no header |
+| `[[T; N]]` | offset → count → the rows **inline** | count word, then rows inline at `N * size_of(T)` |
+
+The per-row offsets are relative to the **start of the offset table**, not to the
+array and not to calldata. Each level is one codec calling its element's codec,
+so `[[[T]]]` needs no new machinery.
+
+The element's shape decides whether indexing loads or addresses. `xs[i]` on a
+`[[T]]` **loads** the row pointer; on a `[[T; N]]` it yields the row's
+**address**, because a fixed array is inline where it sits. Same rule as a
+struct element (§7b).
 
 Indexing is bounds-checked in memory as well as in storage (`Panic(0x32)` under
 `--rich-reverts`), and `.length` is an element count in both.
@@ -528,8 +549,12 @@ element is converted through the same per-struct codec above.
 Indexing a memory `[P]` yields the element's **address**, not a copy, elements
 are inline, so the address already is the struct pointer that field access wants.
 `xs[i].a` reads and `xs[i].a = v` writes in place, and `for x in xs` binds `x` to
-each element's address the same way. A `[P; N]` is *not* supported and is a
-compile error.
+each element's address the same way. Assigning a whole element (`xs[i] = p`)
+copies its bytes rather than storing the pointer.
+
+`[P; N]` works too, and being all-static it rides **inline in the head** with no
+offset and no count: `[P; 2]` of a one-field tuple makes the next argument start
+at byte 64, not 32.
 
 Where it works: arguments, returns, constructor arguments, `new Child(...)`
 arguments, and `interface` calls, the last three share one encoder, so they
@@ -568,6 +593,11 @@ error.
 The message must be a `String` or a declared custom-error call; anything else
 is a compile error. `--rich-reverts` is independent of this, it governs
 whether *arithmetic* and *bounds* failures carry `Panic(uint256)` data.
+
+A custom error's fields are a normal ABI argument list, encoded by the same code
+the `interface` and `new Child(...)` paths use, so an array, a nested array or a
+`tuple` field is laid out head/tail exactly as Solidity lays it out and `ethers`
+and `viem` decode it from the ABI JSON.
 
 ### Returns and exhaustiveness
 
@@ -653,6 +683,13 @@ log(TokenLogs.Transfer, indexed(from), indexed(to), amount)
   example the standard ERC20 `Transfer(address,address,uint256)` topic
   `0xddf252ad…` is produced automatically.
 - Emits `LOG1`–`LOG4` by indexed count (topic0 + up to 3 indexed).
+- An indexed field must be **one word**. A topic is exactly 32 bytes, so a
+  `String` or an array would have to be hashed to fit; that is a compile error
+  rather than a guess.
+- The data area is a normal ABI argument list, encoded by the same code the
+  `interface` and `new Child(...)` paths use, so a `String`, an array, a nested
+  array or a `tuple` in an event is laid out head/tail exactly as Solidity lays
+  it out.
 
 ---
 

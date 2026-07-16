@@ -216,7 +216,7 @@ against, so they are verified against the EVM's own behaviour instead.
 |---|---|
 | Integers | `u8`-`u256`, `i8`-`i256`, checked `+ - * / % **`, signed ops, `.saturate()` |
 | Other scalars | `bool`, `Account` (EVM address, masked to 160 bits at boundaries) |
-| Mappings | `HashMap(K, V)`, scalar-valued, nested (`HashMap(K, HashMap(K, V))`), struct-valued |
+| Mappings | `HashMap(K, V)`, scalar-valued, nested (`HashMap(K, HashMap(K, V))`), struct-valued. A dynamic value (an array, a `String`) is a compile error: it would need a slot region of its own per key, which is not implemented |
 | Structs | user `class`, in memory and in storage, as a mapping value or as an array element. `arr[i].field` and `m[k].field` compile to the same slot arithmetic; a struct array element occupies whole slots and never packs with its neighbours, exactly as Solidity lays it out |
 | Inheritance | an `[Parent]` attribute above a class inherits its fields (ancestors first, as Solidity orders them) and methods, transitively; a child method overrides, and `super.method()` calls the parent's. An `interface` parent means *implements*, checked signature by signature |
 | Storage strings | `String`/`Bytes` `contract` fields use Solidity's exact storage layout (short packed inline, long at `keccak256(slot)`), slot for slot |
@@ -224,7 +224,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | Storage vectors | a `Vec(T)` `contract` field is a storage vector: the same layout as `[T]`, and it takes either spelling (`v[i]`/`v.get(i)`, `.length`/`.len()`) |
 | `delete` | resets a scalar, packed field, mapping entry, array element, whole array, storage string, or struct, releasing the slots Solidity releases |
 | Control flow | `if/else`, `while`, `for ... in <array>` (memory or storage), `match` over enums |
-| Events | `log(Event, indexed(x), ...)` becomes a real `LOG1`-`LOG4` with canonical topic hashes, plus matching `"type": "event"` entries in the ABI JSON, so wallets, ethers/viem and Etherscan decode the logs. The schema is recorded at the `log()` site from the same values `topic0` is hashed from, so the ABI cannot describe an event the bytecode does not emit |
+| Events | `log(Event, indexed(x), ...)` becomes a real `LOG1`-`LOG4` with canonical topic hashes, plus matching `"type": "event"` entries in the ABI JSON, so wallets, ethers/viem and Etherscan decode the logs. The schema is recorded at the `log()` site from the same values `topic0` is hashed from, so the ABI cannot describe an event the bytecode does not emit. The data area shares the ABI encoder the `interface` and `new Child(...)` paths use, so a string, an array or a tuple field is encoded head/tail rather than as a pointer. An indexed field must be one word, since a topic is 32 bytes |
 | External calls | `interface` types (compiled to `CALL`), low-level `call target(payload)`, `to.pay(amount)` (returns success) and `to.transfer(amount)` (reverts on failure) to send ETH. A failing call bubbles the callee's own revert reason, byte for byte as Solidity does |
 | Deploying contracts | `new SomeContract(args)` becomes `CREATE`, with the child's creation code embedded in the deployer; or `Account.create`/`create2`/`create2_address` from raw bytecode, for proxies and EIP-1167 clones |
 | Bare ETH | `export payable fn receive():` for a plain send, `export fn fallback():` for an unmatched selector |
@@ -234,7 +234,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | Safety | checked arithmetic, reentrancy guards on by default (transient storage; `unsafe fn` opts out), nonpayable guard, calldata-length validation, address masking, returndata checks, array-bounds `Panic(0x32)` in memory and storage |
 | Upgrades | storage-layout lockfile (`--lock`) pins committed fields and errors on unsafe changes |
 | Reproducible builds | the same source always compiles to byte-identical bytecode, which is what lets a deployed contract be verified against its source. Emission order is stable everywhere (slots, helpers, class methods), never a randomized hash-map walk. Asserted by a test that compiles a reference contract in separate processes and diffs the output |
-| ABI | standard 4-byte selectors; `address`/`uintN`/`bool`, `string`/`bytes`, `T[]`, an `enum` as `uint8`, a `class` of scalar fields as a `tuple`, and `T[]` of those tuples. Each works in every direction: arguments, returns, constructor arguments, `new Child(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied. `stateMutability` is inferred: a function that writes nothing is `view`, one that touches no chain state at all is `pure`, so wallets and explorers render getters as reads rather than as write buttons. The inference is a whitelist, so anything it cannot prove read-only stays `nonpayable` |
+| ABI | standard 4-byte selectors; `address`/`uintN`/`bool`, `string`/`bytes`, `T[]`, `T[N]`, an `enum` as `uint8`, a `class` of scalar fields as a `tuple`, and arrays of any of those nested to any depth (`T[][]`, `T[][2]`, `T[3][]`, `tuple[2]`, `tuple[][]`). Each works in every direction: arguments, returns, constructor arguments, `new Child(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied. `stateMutability` is inferred: a function that writes nothing is `view`, one that touches no chain state at all is `pure`, so wallets and explorers render getters as reads rather than as write buttons. The inference is a whitelist, so anything it cannot prove read-only stays `nonpayable` |
 
 Reference contracts live in [`examples/`](examples/): [`token`](examples/token.gum),
 [`amm`](examples/amm.gum), [`erc20`](examples/erc20.gum),
@@ -287,11 +287,16 @@ covers every function without a `once`.
 The first of these is rejected at compile time rather than miscompiled. The
 second is a diagnostics gap.
 
-- **Nesting across the ABI past one level.** A struct or an array is fine, and
-  so is one inside the other (`[P]`), but not two: `[[T]]`, `[P; N]`, and a
-  struct that itself holds a struct, a `String`/`Bytes`, or an array are all
-  rejected. Everything at one level (`[T]`, `[T; N]`, `P`, `[P]`) works as
+- **Dynamic values inside a struct or an array.** Across the ABI, arrays nest to
+  any depth (`[[T]]`, `[[T]; N]`, `[[T; N]]`, `[P; N]`, `[[P]]`), but a
+  `String`/`Bytes` element (`[String]`) and a struct that itself holds a struct,
+  a `String`/`Bytes`, or an array are rejected. Everything accepted works as
   arguments, returns, constructor arguments, and `interface` calls.
+- **Dynamic values inside storage.** A storage array element, a `Vec` element,
+  and a mapping value must be a scalar, a payload-free enum, or a struct. A
+  nested array (`[[T]]`) or a `String` in any of those positions would need a
+  slot region of its own per element and is a compile error. This is narrower
+  than the ABI: `[[T]]` is fine as an argument, just not as a field.
 - **Parser error recovery is per top-level declaration.** Every malformed
   declaration is reported, but only the first error within one is, and an
   indentation error stops the compile on its own, since indentation is what

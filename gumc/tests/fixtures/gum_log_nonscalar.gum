@@ -1,0 +1,29 @@
+use gum.defaults.Account
+use gum.defaults.String
+
+class P:
+    u128 a
+    u256 b
+
+enum Logs:
+    Arr
+    Str
+    Tup
+    Grid
+    Mixed
+
+contract L:
+    export fn arr([u256] xs):
+        log(Logs.Arr, xs)
+
+    export fn str(String s):
+        log(Logs.Str, s)
+
+    export fn tup(P p):
+        log(Logs.Tup, p)
+
+    export fn grid([[u256]] g):
+        log(Logs.Grid, g)
+
+    export fn mixed(Account who, u256 n, [u256] xs, String s):
+        log(Logs.Mixed, indexed(who), n, xs, s)

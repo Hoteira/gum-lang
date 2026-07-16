@@ -367,6 +367,60 @@ impl TypeChecker {
         matches!(t, Type::Primitive(n) if self.enum_has_payload(n))
     }
 
+    // The struct field types of t, or None when t is not a user struct.
+    // Account, String and Bytes are Primitive-named classes the compiler treats as values, so they encode on their own rather than as tuples.
+    pub fn abi_struct_fields(&self, t: &Type) -> Option<Vec<Type>> {
+        if let Type::Primitive(n) = t {
+            if n == "Account" || n == "String" || n == "Bytes" {
+                return None;
+            }
+            if let Some(c) = self.loaded_classes.get(n) {
+                return Some(c.fields.iter().map(|f| f.type_def.clone()).collect());
+            }
+        }
+        None
+    }
+
+    // Whether the codecs can carry t as an array element or a struct field: a scalar, a payload-free enum, a struct of those, or an array of any of them to any depth.
+    // String and Bytes are deliberately absent. They are dynamic and would need an element codec that does not exist yet, so string[] stays rejected rather than silently mis-encoded.
+    pub fn abi_elem_ok(&self, t: &Type) -> bool {
+        if self.is_scalar_enum(t) {
+            return true;
+        }
+        match t {
+            Type::Array(inner) | Type::FixedArray(inner, _) => self.abi_elem_ok(inner),
+            Type::Primitive(n) => {
+                if matches!(
+                    n.as_str(),
+                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256"
+                        | "i8" | "i16" | "i32" | "i64" | "i128" | "i256"
+                        | "bool" | "Account"
+                ) {
+                    return true;
+                }
+                // A struct only rides the wire if every field is a single word, which is what the per-field move the codecs generate assumes. Nesting a struct inside a struct has no codec, so it is not admitted here.
+                match self.abi_struct_fields(t) {
+                    Some(fs) => !fs.is_empty() && fs.iter().all(|f| self.is_scalar_enum(f) || matches!(f, Type::Primitive(n) if matches!(n.as_str(),
+                        "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
+                        "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
+                        "bool" | "Account"))),
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    // Whether a type can be an element of a storage array or a Vec, or the value of a mapping: something the slot arithmetic knows a fixed width for.
+    // Arrays, Vec, String and Bytes are absent deliberately. Each is dynamic and would need its own keccak-derived region per element, which the layout engine does not build.
+    // Accepting one was not a missing feature but a wrong answer: C.g[i][j] on a [[u256]] field compiled to a storage read whose result was then used as a memory address.
+    pub fn storage_elem_ok(&self, t: &Type) -> bool {
+        match t {
+            Type::Array(_) | Type::FixedArray(..) | Type::Generic { .. } => false,
+            Type::Primitive(n) => n != "String" && n != "Bytes" && !self.is_payload_enum(t),
+        }
+    }
+
     // Reports as many independent semantic errors as it safely can in one
     // pass, rather than making you fix-recompile-fix to see the next one.
     // Scoped at the top-level-declaration granularity: two unrelated
@@ -620,51 +674,47 @@ impl TypeChecker {
                     ));
                 }
             }
+            // Only a contract's fields live in storage, so only they are held to a storage layout; the same type as a local or a parameter is fine and is left alone.
             if class_decl.is_global {
                 for field in &class_decl.fields {
-                    if let Type::Generic { name, args } = &field.type_def {
-                        if name == "Vec" {
+                    let bad = |what: &str, t: &Type| {
+                        format!(
+                            "Semantic Error: {} of type '{}' has no storage layout. Field '{}' in class '{}' must hold a scalar, an enum without a payload, or a struct. A dynamic value would need a slot region of its own per element, which is not implemented.",
+                            what, type_name(t), field.name, class_name
+                        )
+                    };
+                    match &field.type_def {
+                        Type::Array(inner) | Type::FixedArray(inner, _) => {
+                            if !self.storage_elem_ok(inner) {
+                                errors.push(bad("an array element", inner));
+                            }
+                        }
+                        Type::Generic { name, args } if name == "Vec" => {
                             if args.len() != 1 {
                                 errors.push(format!(
                                     "Semantic Error: Vec needs exactly one element type. Field '{}' in class '{}'.",
                                     field.name, class_name
                                 ));
-                            } else if matches!(&args[0], Type::Generic { .. } | Type::Array(_)) {
-                                errors.push(format!(
-                                    "Semantic Error: a Vec of {:?} has no storage layout. Field '{}' in class '{}' must hold a scalar element type.",
-                                    args[0], field.name, class_name
-                                ));
+                            } else if !self.storage_elem_ok(&args[0]) {
+                                errors.push(bad("a Vec element", &args[0]));
                             }
                         }
+                        // A mapping of mappings is the one nesting storage does support: the inner one owns no slot of its own, its keys just hash into the outer's.
+                        Type::Generic { name, args } if name == "HashMap" => {
+                            if let Some(v) = args.get(1) {
+                                let nested_map = matches!(v, Type::Generic { name, .. } if name == "HashMap");
+                                if !nested_map && !self.storage_elem_ok(v) {
+                                    errors.push(bad("a mapping value", v));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
 
         {
-            // A payload-free enum belongs here: it is a u8 in every respect now, it maps to uint8 in the ABI, and it packs 32-to-a-slot in storage exactly like one. A payload-carrying enum does not, and is caught by the check below.
-            let elem_ok = |t: &Type| {
-                if self.is_scalar_enum(t) {
-                    return true;
-                }
-                matches!(t, Type::Primitive(n) if matches!(n.as_str(),
-                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
-                    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
-                    "bool" | "Account"))
-            };
-            // The field types of a user struct, or None for anything that is not one.
-            // Account, String and Bytes are Primitive-named classes the compiler treats as values, so they are not structs for this purpose and encode on their own.
-            let struct_fields = |t: &Type| -> Option<Vec<Type>> {
-                if let Type::Primitive(n) = t {
-                    if n == "Account" || n == "String" || n == "Bytes" {
-                        return None;
-                    }
-                    if let Some(c) = self.loaded_classes.get(n) {
-                        return Some(c.fields.iter().map(|f| f.type_def.clone()).collect());
-                    }
-                }
-                None
-            };
             // An enum crosses as uint8, which carries the tag and nothing else, so a variant with a payload has nowhere to put it.
             let payload_enum = |t: &Type| -> bool {
                 match t {
@@ -685,34 +735,19 @@ impl TypeChecker {
                     ));
                     return;
                 }
-                if let Some(fs) = struct_fields(t) {
-                    if fs.is_empty() || !fs.iter().all(&elem_ok) {
-                        errors.push(format!(
-                            "Semantic Error: {} has no ABI encoding: a struct crossing the ABI boundary must have at least one field and hold only scalar fields, and '{}' does not. Pass its parts separately, or flatten it.",
-                            what,
-                            type_name(t)
-                        ));
-                    }
+                if self.abi_struct_fields(t).is_some() && !self.abi_elem_ok(t) {
+                    errors.push(format!(
+                        "Semantic Error: {} has no ABI encoding: a struct crossing the ABI boundary must have at least one field and hold only scalar fields, and '{}' does not. Pass its parts separately, or flatten it.",
+                        what,
+                        type_name(t)
+                    ));
                     return;
                 }
-                // A dynamic array of static structs encodes: the elements are inline, so it needs no per-element offset.
-                // A fixed array of them is still rejected, as is any array whose element is itself an array, because neither has a codec yet.
-                if let Type::Array(inner) = t {
-                    if let Some(fs) = struct_fields(inner) {
-                        if fs.is_empty() || !fs.iter().all(&elem_ok) {
-                            errors.push(format!(
-                                "Semantic Error: {} has no ABI encoding: an array of structs must hold a struct of only scalar fields, and '{}' is not one. Pass its parts separately, or flatten it.",
-                                what,
-                                type_name(inner)
-                            ));
-                        }
-                        return;
-                    }
-                }
+                // Arrays nest to any depth, so the element check is recursive rather than one level: the codecs are generated the same way, an outer array calling its element's codec whatever that turns out to be.
                 if let Type::Array(inner) | Type::FixedArray(inner, _) = t {
-                    if !elem_ok(inner) {
+                    if !self.abi_elem_ok(inner) {
                         errors.push(format!(
-                            "Semantic Error: {} has no ABI encoding: an array crossing the ABI boundary must hold a scalar element, and {} is not one. Pass its parts separately, or flatten it.",
+                            "Semantic Error: {} has no ABI encoding: an array crossing the ABI boundary must hold a scalar, a struct of scalars, or another such array, and {} is none of those. Pass its parts separately, or flatten it.",
                             what,
                             type_name(inner)
                         ));
