@@ -1,4 +1,5 @@
 pub mod layout;
+pub mod mutability;
 pub mod translator;
 pub mod abi;
 
@@ -682,6 +683,7 @@ impl EvmYulBackend {
         yul.push_str("      // --- Function Dispatcher ---\n");
 
         let has_ext = type_checker.has_external_calls.get();
+        let muts = mutability::analyze_class(type_checker, global_class);
 
         let find_fn = |pred: fn(&FnDecl) -> bool| -> Option<&FnDecl> {
             global_class.methods.iter().find(|f| pred(f))
@@ -692,7 +694,7 @@ impl EvmYulBackend {
         let any_payable = global_class.methods.iter().any(|f| is_exported(f) && is_payable(f));
 
         let invoke_bare = |yul: &mut String, f: &FnDecl, indent: &str| {
-            if has_ext && !is_unsafe(f) {
+            if has_ext && !is_unsafe(f) && !mutability::is_read_only(f, &muts) {
                 yul.push_str(&format!("{}if tload({}) {{ revert(0, 0) }}\n", indent, reentrancy_lock_slot()));
                 yul.push_str(&format!("{}tstore({}, 1)\n", indent, reentrancy_lock_slot()));
             }
@@ -736,7 +738,9 @@ impl EvmYulBackend {
                 let selector = abi_gen.calculate_selector(f);
                 yul.push_str(&format!("      case {} /* {} */ {{\n", selector, f.name));
 
-                let requires_guard = has_ext && !is_unsafe(f);
+                // A read-only function gets no guard, for two reasons that agree.
+                // It cannot be harmed by reentrancy, since it writes nothing. And the ABI calls it view, which invites callers to use eth_call: the guard's tstore would revert inside that STATICCALL, making the getter uncallable.
+                let requires_guard = has_ext && !is_unsafe(f) && !mutability::is_read_only(f, &muts);
                 if requires_guard {
                     yul.push_str(&format!("          if tload({}) {{ revert(0, 0) }}\n", reentrancy_lock_slot()));
                     yul.push_str(&format!("          tstore({}, 1)\n", reentrancy_lock_slot()));
@@ -902,7 +906,10 @@ impl EvmYulBackend {
                 continue;
             }
             {
-                let requires_guard = has_ext && !is_unsafe(f) && is_exported(f);
+                // Must agree with the dispatcher's guard decision above: this is the other half of the same lock, the clear on the return path.
+                // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its `view` invites.
+                let requires_guard =
+                    has_ext && !is_unsafe(f) && is_exported(f) && !mutability::is_read_only(f, &muts);
                 let lock_slot = if requires_guard { Some(reentrancy_lock_slot()) } else { None };
 
                 let entry_ctx = Ctx::entry(lock_slot)

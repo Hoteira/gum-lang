@@ -1,0 +1,30 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+interface ISink:
+    fn poke(u256 x) -> bool
+
+contract V:
+    u256 total
+    HashMap(Account, u256) balances
+
+    // Makes the contract external-call-bearing, so every entry point would
+    // otherwise carry a reentrancy guard.
+    export fn forward(Account t, u256 x) -> bool:
+        V.total = V.total + x
+        return ISink(t).poke(x)
+
+    export fn set_total(u256 x):
+        V.total = x
+
+    export fn get_total() -> u256:
+        return V.total
+
+    export fn balance_of(Account who) -> u256:
+        return V.balances[who]
+
+    export fn double(u256 x) -> u256:
+        return x * 2
+
+    export fn sender() -> Account:
+        return Message.sender()

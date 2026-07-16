@@ -353,6 +353,8 @@ const GUM_STRUCT_DEPLOY: &str = include_str!("fixtures/gum_struct_deploy.gum");
 const GUM_IFACE_CALL: &str = include_str!("fixtures/gum_iface_call.gum");
 const GUM_MSG_BLOCK: &str = include_str!("fixtures/gum_msg_block.gum");
 const GUM_ENUM_ABI: &str = include_str!("fixtures/gum_enum_abi.gum");
+const GUM_VIEW: &str = include_str!("fixtures/gum_view.gum");
+const SOL_PROBER: &str = include_str!("fixtures/sol_prober.sol");
 const SOL_ENUM_ABI: &str = include_str!("fixtures/sol_enum_abi.sol");
 const SOL_MSG_BLOCK: &str = include_str!("fixtures/sol_msg_block.sol");
 const GUM_STARR_ABI: &str = include_str!("fixtures/gum_starr_abi.gum");
@@ -4699,3 +4701,58 @@ fn enums_cross_the_abi_like_solidity() {
         assert_eq!(U256::from_be_slice(&gr.output), U256::from(want), "pick returns a tag");
     }
 }
+
+// A function the ABI calls `view` has to survive STATICCALL, which is what solc emits when one contract calls another's view function. Anything that writes state reverts in there.
+// That is the catch in inferring view: every entry point carries a transient-storage reentrancy guard when the contract makes external calls, and a TSTORE is a write. Advertising view while keeping the guard would make the getter uncallable from any Solidity contract.
+#[test]
+fn view_functions_survive_a_staticcall() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let v = deploy(&mut db, gum_creation_bytecode(GUM_VIEW, &solc, true));
+    let prober = deploy(&mut db, sol_creation_bytecode_for(SOL_PROBER, &solc, "Prober"));
+
+    let probe = |db: &mut Db, inner: Vec<u8>| -> bool {
+        // probe(address,bytes): the target, then a dynamic bytes tail.
+        let mut d = selector("probe(address,bytes)").to_vec();
+        d.extend_from_slice(&word_addr(v));
+        d.extend_from_slice(&word_u256(U256::from(64u64)));
+        d.extend_from_slice(&word_u256(U256::from(inner.len() as u64)));
+        let mut padded = inner.clone();
+        while padded.len() % 32 != 0 {
+            padded.push(0);
+        }
+        d.extend_from_slice(&padded);
+        let r = call(db, prober, d);
+        assert!(r.success, "the prober itself reverted");
+        U256::from_be_slice(&r.output) == U256::from(1u64)
+    };
+
+    // Read-only: these are the ones now advertised as view/pure.
+    assert!(probe(&mut db, encode("get_total()", &[])), "get_total must survive STATICCALL");
+    assert!(
+        probe(&mut db, encode_words("balance_of(address)", &[word_addr(deployer())])),
+        "balance_of must survive STATICCALL"
+    );
+    assert!(probe(&mut db, encode("double(uint256)", &[U256::from(21u64)])), "double must survive STATICCALL");
+    assert!(probe(&mut db, encode("sender()", &[])), "sender must survive STATICCALL");
+
+    // A writer must still fail under STATICCALL: the ABI calls it nonpayable, and this is what that means.
+    assert!(
+        !probe(&mut db, encode("set_total(uint256)", &[U256::from(5u64)])),
+        "set_total writes storage, so STATICCALL must reject it"
+    );
+
+    // And the read-only ones still return the right answers on a normal call.
+    assert!(call(&mut db, v, encode("set_total(uint256)", &[U256::from(77u64)])).success);
+    let r = call(&mut db, v, encode("get_total()", &[]));
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(77u64), "get_total still reads storage");
+    let r = call(&mut db, v, encode("double(uint256)", &[U256::from(21u64)]));
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(42u64), "double still computes");
+}
+

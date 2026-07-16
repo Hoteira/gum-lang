@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::codegen::mutability::{analyze_class, state_mutability};
 use crate::semantic::TypeChecker;
 use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher, Keccak};
@@ -136,6 +137,7 @@ impl<'a> AbiGenerator<'a> {
     // receive and fallback get their own entry types, never a function entry, or a caller would compute a selector that dispatches nowhere.
     pub fn generate_abi(&self, program: &Program, class: &ClassDecl) -> Vec<AbiEntry> {
         let mut entries = Vec::new();
+        let muts = analyze_class(self.type_checker, class);
 
         if let Some(constructor) = class.methods.iter().find(|m| m.name == "new") {
             let mut inputs = Vec::new();
@@ -172,11 +174,7 @@ impl<'a> AbiGenerator<'a> {
                         name: String::new(),
                         inputs: Vec::new(),
                         outputs: Some(Vec::new()),
-                        state_mutability: Some(if f.modifiers.iter().any(|m| m == "payable") {
-                            "payable".to_string()
-                        } else {
-                            "nonpayable".to_string()
-                        }),
+                        state_mutability: Some(state_mutability(f, &muts).to_string()),
                         anonymous: None,
                     });
                     continue;
@@ -209,11 +207,7 @@ impl<'a> AbiGenerator<'a> {
                     name: f.name.clone(),
                     inputs,
                     outputs: Some(outputs),
-                    state_mutability: Some(if f.modifiers.iter().any(|m| m == "payable") {
-                        "payable".to_string()
-                    } else {
-                        "nonpayable".to_string()
-                    }),
+                    state_mutability: Some(state_mutability(f, &muts).to_string()),
                     anonymous: None,
                 });
         }

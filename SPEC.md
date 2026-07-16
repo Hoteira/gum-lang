@@ -379,7 +379,28 @@ ABI entry points. At runtime the dispatcher:
 Selectors are the standard `keccak256("name(argType,...)")[:4]`, with gum types
 mapped to ABI types (`Account`→`address`, `uN`→`uintN`, etc.).
 
+### State mutability
+
+The ABI's `stateMutability` is inferred, not declared. A function that writes no
+chain state is `view`; one that reads none either is `pure`; `payable` stays a
+declaration. Callers, wallets and explorers use this to decide whether a call is
+a read or a transaction.
+
+The inference is a **whitelist**: anything it cannot positively show to be
+read-only is `nonpayable`. That asymmetry is deliberate. Calling a read-only
+function `nonpayable` only costs a needless gas prompt; calling a writing
+function `view` invites callers to reach it with `eth_call`, and the write
+silently never happens. So an `unsafe` block, a low-level `call`, and any call
+this pass has not classified all count as writes. A `once` function is never
+`view`: its replay flag is an `SSTORE`.
+
+A read-only entry point also gets **no reentrancy guard**, for two reasons that
+agree: it cannot be harmed by reentrancy, and the guard's `TSTORE` would revert
+inside the `STATICCALL` that solc emits when one contract calls another's `view`
+function.
+
 ---
+
 
 ## 7. Expressions and operators
 
@@ -681,6 +702,10 @@ Both forward all remaining gas rather than a 2300-gas stipend (the stipend
 breaks recipients whose `receive()` does real work, and silently changes meaning
 whenever gas is repriced); the reentrancy guard, not a gas limit, is what makes
 that safe. Both hand control to the recipient, so both arm the guard.
+
+A **read-only** entry point (§6) carries no guard. It writes nothing, so
+reentering it can corrupt nothing, and the guard is a `TSTORE`, which would
+revert inside the `STATICCALL` that its `view` invites callers to use.
 
 `Message` and `Block` are compiler intrinsics: their methods compile directly to
 EVM opcodes (`caller()`, `callvalue()`, `address()`, `timestamp()`, `number()`),
