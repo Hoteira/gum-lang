@@ -91,7 +91,7 @@ A program is a sequence of top-level declarations:
 |---|---|
 | unsigned int | `u8 u16 u32 u64 u128 u256` |
 | signed int | `i8 i16 i32 i64 i128 i256` |
-| fixed-point | `f32 f64` (full-width WAD-style fixed values, **not** IEEE floats) |
+| fixed-point | `f32 f64` (signed full-width WAD values where `1.0` is `10^18`, **not** IEEE floats) |
 | boolean | `bool` |
 | address | `Account` (an EVM 160-bit address) |
 | array | `[T]` (dynamic), `[T; N]` (fixed) |
@@ -436,14 +436,45 @@ Default arithmetic is **checked** (Solidity 0.8+ style):
 
 | op | behavior |
 |---|---|
-| `+` `-` `*` | revert on overflow/underflow |
-| `/` `%` | revert on divide-by-zero; signed variants for `iN` |
+| `+` `-` `*` | revert on overflow/underflow, with signed variants for `iN` and `fN` |
+| `/` `%` | revert on divide-by-zero; signed variants for `iN` and `fN` |
 | `**` | native `EXP` (not overflow-checked, like unchecked pow) |
 | comparisons | signed opcodes (`slt`/`sgt`) for signed operands |
+
+Signedness reaches `+` `-` `*` as well as `/` and comparisons: a signed add or
+subtract tests the sign of its result rather than comparing unsigned, so
+`1 - 2` is `-1` and `5 + (-3)` is `2`, and only a true wrap reverts.
 
 With `--rich-reverts`, arithmetic reverts carry `Panic(uint256)` reason data
 (`0x11` overflow, `0x12` divide-by-zero); by default they revert with no data
 (smaller bytecode). `x.saturate()` clamps to the type max instead of reverting.
+
+#### Fixed point (`f32`, `f64`)
+
+Both are **signed full-width WAD values**: the stored integer is the real value
+times `10^18`, so `1.0` is `1000000000000000000`. They are not IEEE floats, and
+`f32` and `f64` differ in name only. They cross the ABI as `int256`, which is
+what a Solidity caller sees, because solc has no fixed-point type of its own
+(`fixed`/`ufixed` are reserved and unimplemented).
+
+Only `*` and `/` touch the scale:
+
+| expression | compiles to | why |
+|---|---|---|
+| `a + b`, `a - b` | signed checked add/sub | two WAD values share a scale, so it cancels |
+| `a * b` | `(a * b) / 10^18` | the product is WAD-squared and comes back down |
+| `a / b` | `(a * 10^18) / b` | the quotient is unscaled and goes back up |
+| `a * 2` | plain signed multiply | a bare literal is a **count**, not a fixed value |
+
+That last row is the one to watch: `a * 2` doubles `a`, it does not scale it by
+`2e-18`. Mixing a fixed value with a non-literal integer is a compile error,
+since the integer would otherwise be read as a fraction.
+
+Rounding truncates toward zero, as `sdiv` does. The intermediate of `*` and `/`
+is a checked signed multiply rather than a 512-bit product, so an operand large
+enough that the unscaled intermediate leaves `int256` reverts instead of
+wrapping. That bounds operands at roughly `5.7e58` in WAD terms, the same trade
+solmate's `mulWad` makes.
 
 Literal-only expressions that provably fit are constant-folded at compile time
 (the runtime check is elided when it cannot fail).

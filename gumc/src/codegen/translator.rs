@@ -1251,8 +1251,16 @@ fn numeric_meta(name: &str) -> Option<(usize, bool)> {
         "i128" => Some((128, true)),
         "u256" => Some((256, false)),
         "i256" => Some((256, true)),
+        // A fixed-point value is a signed full-width word carrying a WAD scale, so it is signed for every purpose the scale does not touch: + and - are ordinary signed ops, and comparison and % follow the signed opcodes.
+        // Only * and / move the scale, and translate_binary_op intercepts those before this is consulted.
+        "f32" | "f64" => Some((256, true)),
         _ => None,
     }
+}
+
+// Whether a type is WAD-scaled fixed point, whose * and / must correct the scale.
+fn is_fixed_point(t: &Type) -> bool {
+    matches!(t, Type::Primitive(p) if p == "f32" || p == "f64")
 }
 
 // Truncates a value down to a narrower integer width. Unsigned types just
@@ -1557,6 +1565,89 @@ fn checked_mul_helper_src(rich: bool) -> String {
      }}\n",
         panic_revert(rich, PANIC_OVERFLOW),
         panic_revert(rich, PANIC_OVERFLOW)
+    )
+}
+
+// Signed add. checked_add guards with lt and a max, both unsigned, so on a signed type it read a negative operand as a huge number and reverted: 5 + (-3) never got a chance to be 2.
+// The overflow test is the classic sign trick, two operands of the same sign whose result differs in sign, which is exact at 256 bits where a range check alone cannot be.
+// The range check after it is what narrows the result to i8..i128; for i256 the bounds are the word's own and it always passes.
+fn checked_sadd_helper_src(rich: bool) -> String {
+    format!(
+        "function checked_sadd(a, b, minv, maxv) -> r {{\n\
+     \x20   r := add(a, b)\n\
+     \x20   if slt(and(xor(a, r), xor(b, r)), 0) {{ {} }}\n\
+     \x20   if or(slt(r, minv), sgt(r, maxv)) {{ {} }}\n\
+     }}\n",
+        panic_revert(rich, PANIC_OVERFLOW),
+        panic_revert(rich, PANIC_OVERFLOW)
+    )
+}
+
+// Signed subtract. checked_sub reverted whenever lt(a, b) unsigned, which for a signed type is exactly the ordinary case of going negative: 1 - 2 reverted instead of giving -1.
+fn checked_ssub_helper_src(rich: bool) -> String {
+    format!(
+        "function checked_ssub(a, b) -> r {{\n\
+     \x20   r := sub(a, b)\n\
+     \x20   if slt(and(xor(a, b), xor(a, r)), 0) {{ {} }}\n\
+     }}\n",
+        panic_revert(rich, PANIC_OVERFLOW)
+    )
+}
+
+// Signed subtract with a narrowing range check, for i8..i128 whose result must land back inside the declared width.
+fn checked_ssub_n_helper_src(rich: bool) -> String {
+    format!(
+        "function checked_ssub_n(a, b, minv, maxv) -> r {{\n\
+     \x20   r := checked_ssub(a, b)\n\
+     \x20   if or(slt(r, minv), sgt(r, maxv)) {{ {} }}\n\
+     }}\n",
+        panic_revert(rich, PANIC_OVERFLOW)
+    )
+}
+
+// Signed multiply. sdiv(r, a) == b is the same inverse test checked_mul uses, in its signed form.
+// The a == -1 and b == min case is special because its true result is one past max, and sdiv would hand back min again and call it agreement.
+fn checked_smul_helper_src(rich: bool) -> String {
+    format!(
+        "function checked_smul(a, b, minv, maxv) -> r {{\n\
+     \x20   r := mul(a, b)\n\
+     \x20   if iszero(iszero(a)) {{\n\
+     \x20       if and(eq(a, not(0)), eq(b, 0x8000000000000000000000000000000000000000000000000000000000000000)) {{ {} }}\n\
+     \x20       if iszero(eq(sdiv(r, a), b)) {{ {} }}\n\
+     \x20   }}\n\
+     \x20   if or(slt(r, minv), sgt(r, maxv)) {{ {} }}\n\
+     }}\n",
+        panic_revert(rich, PANIC_OVERFLOW),
+        panic_revert(rich, PANIC_OVERFLOW),
+        panic_revert(rich, PANIC_OVERFLOW)
+    )
+}
+
+// One WAD, the scale of every f32 and f64 value: 1.0 is 10^18.
+const WAD: &str = "1000000000000000000";
+
+// Multiplying two WAD values gives a WAD-squared product, so it comes back down by one WAD. Emitting a bare mul, which is what this did, left every product overscaled by 10^18.
+// The intermediate is a checked signed multiply rather than a 512-bit one, so a product whose unscaled form does not fit in an int256 reverts instead of wrapping. That bounds the operands at roughly 5.7e58 in WAD terms, which is the same trade solmate's mulWad makes.
+// sdiv truncates toward zero, so the result rounds toward zero like Solidity's own integer division.
+fn gum_wad_mul_helper_src(rich: bool) -> String {
+    let _ = rich;
+    format!(
+        "function gum_wad_mul(a, b, minv, maxv) -> r {{\n\
+     \x20   r := sdiv(checked_smul(a, b, minv, maxv), {})\n\
+     }}\n",
+        WAD
+    )
+}
+
+// Dividing two WAD values cancels the scale entirely, so the numerator goes up by one WAD first to keep it.
+fn gum_wad_div_helper_src(rich: bool) -> String {
+    format!(
+        "function gum_wad_div(a, b, minv, maxv) -> r {{\n\
+     \x20   if iszero(b) {{ {} }}\n\
+     \x20   r := sdiv(checked_smul(a, {}, minv, maxv), b)\n\
+     }}\n",
+        panic_revert(rich, PANIC_DIV_ZERO),
+        WAD
     )
 }
 
@@ -2839,11 +2930,13 @@ impl<'a> Translator<'a> {
                 return self.store_memory_field(&b, &mf, val_expr);
             }
         }
-        let b = self.translate_expr(base, ctx);
-        format!(
-            "mstore(add({}, /* offset of {} */ 0), {})\n",
-            b, property, val_expr
-        )
+        // No guess here. Every resolver above knows an offset; falling past them means the property has no known place, and assuming 0 wrote the value over whatever sits at the base instead.
+        self.errors.borrow_mut().push(format!(
+            "Codegen Error: no known storage or memory offset for '{}' on a {}, so it cannot be assigned. This is a compiler gap rather than a mistake in your code: please report it.",
+            property,
+            self.abi_gen.signature_type(&self.static_type(base, ctx))
+        ));
+        String::new()
     }
 
     fn field_is_str(&self, class_name: &str, property: &str) -> bool {
@@ -3086,8 +3179,13 @@ impl<'a> Translator<'a> {
                         return self.load_memory_field(&self.translate_expr(base, ctx), &mf);
                     }
                 }
-                let b = self.translate_expr(base, ctx);
-                format!("mload(add({}, /* offset of {} */ 0))", b, property)
+                // The read half of the same rule: offset 0 is not a default, it is the first field, so an unresolved property silently read the wrong one.
+                self.errors.borrow_mut().push(format!(
+                    "Codegen Error: no known storage or memory offset for '{}' on a {}, so it cannot be read. This is a compiler gap rather than a mistake in your code: please report it.",
+                    property,
+                    self.abi_gen.signature_type(&self.static_type(base, ctx))
+                ));
+                "0".to_string()
             }
             Expr::IndexAccess { base, index } => {
                 if is_str_type(&self.static_type(base, ctx)) {
@@ -3417,6 +3515,19 @@ impl<'a> Translator<'a> {
         }
     }
 
+    // The largest value of a signed type, as a full word: 0x7f..ff for i256, 0x00..007f for i8.
+    fn max_signed_hex(bits: usize) -> String {
+        let n = bits / 8;
+        format!("0x{}{}{}", "00".repeat(32 - n), "7f", "ff".repeat(n - 1))
+    }
+
+    // The smallest value of a signed type, as its two's complement in a full word: 0x80..00 for i256, 0xff..ff80 for i8.
+    // Sign-extended like every other negative, so slt compares it correctly against a result of the same width.
+    fn min_signed_hex(bits: usize) -> String {
+        let n = bits / 8;
+        format!("0x{}{}{}", "ff".repeat(32 - n), "80", "00".repeat(n - 1))
+    }
+
     fn const_fold(
         &self,
         left: &Expr,
@@ -3478,20 +3589,73 @@ impl<'a> Translator<'a> {
         }
 
         let rich = self.rich_reverts;
+
+        // Only * and / move a WAD scale, and only when both sides carry one: two WAD values multiplied are WAD-squared, and divided they are unscaled.
+        // A bare literal on one side is a plain count rather than a fixed-point value, which is exactly the case the scale check lets through, so x * 2 stays an ordinary scalar multiply and doubles x.
+        if matches!(operator, "*" | "/")
+            && is_fixed_point(&self.static_type(left, ctx))
+            && is_fixed_point(&self.static_type(right, ctx))
+        {
+            self.ensure_helper("checked_smul", || checked_smul_helper_src(rich));
+            let (lo, hi) = (Self::min_signed_hex(256), Self::max_signed_hex(256));
+            if operator == "*" {
+                self.ensure_helper("gum_wad_mul", || gum_wad_mul_helper_src(rich));
+                return format!("gum_wad_mul({}, {}, {}, {})", l, r, lo, hi);
+            }
+            self.ensure_helper("gum_wad_div", || gum_wad_div_helper_src(rich));
+            return format!("gum_wad_div({}, {}, {}, {})", l, r, lo, hi);
+        }
         match operator {
             "+" => match meta {
-                Some((bits, _)) => {
+                Some((bits, true)) => {
+                    self.ensure_helper("checked_sadd", || checked_sadd_helper_src(rich));
+                    format!(
+                        "checked_sadd({}, {}, {}, {})",
+                        l,
+                        r,
+                        Self::min_signed_hex(bits),
+                        Self::max_signed_hex(bits)
+                    )
+                }
+                Some((bits, false)) => {
                     self.ensure_helper("checked_add", || checked_add_helper_src(rich));
                     format!("checked_add({}, {}, {})", l, r, Self::max_value_hex(bits))
                 }
                 None => format!("add({}, {})", l, r),
             },
-            "-" => {
-                self.ensure_helper("checked_sub", || checked_sub_helper_src(rich));
-                format!("checked_sub({}, {})", l, r)
-            }
+            "-" => match meta {
+                Some((256, true)) => {
+                    self.ensure_helper("checked_ssub", || checked_ssub_helper_src(rich));
+                    format!("checked_ssub({}, {})", l, r)
+                }
+                Some((bits, true)) => {
+                    self.ensure_helper("checked_ssub", || checked_ssub_helper_src(rich));
+                    self.ensure_helper("checked_ssub_n", || checked_ssub_n_helper_src(rich));
+                    format!(
+                        "checked_ssub_n({}, {}, {}, {})",
+                        l,
+                        r,
+                        Self::min_signed_hex(bits),
+                        Self::max_signed_hex(bits)
+                    )
+                }
+                _ => {
+                    self.ensure_helper("checked_sub", || checked_sub_helper_src(rich));
+                    format!("checked_sub({}, {})", l, r)
+                }
+            },
             "*" => match meta {
-                Some((bits, _)) => {
+                Some((bits, true)) => {
+                    self.ensure_helper("checked_smul", || checked_smul_helper_src(rich));
+                    format!(
+                        "checked_smul({}, {}, {}, {})",
+                        l,
+                        r,
+                        Self::min_signed_hex(bits),
+                        Self::max_signed_hex(bits)
+                    )
+                }
+                Some((bits, false)) => {
                     self.ensure_helper("checked_mul", || checked_mul_helper_src(rich));
                     format!("checked_mul({}, {}, {})", l, r, Self::max_value_hex(bits))
                 }

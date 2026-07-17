@@ -1177,11 +1177,6 @@ impl TypeChecker {
                     ));
                 }
             }
-            if lf {
-                if let Type::Primitive(t1) = &left_type {
-                    println!("    [Codegen Routing] Intercepted math on {}. Routing to WAD Fixed-Point Math Library to save gas.", t1);
-                }
-            }
         }
         Ok(())
     }

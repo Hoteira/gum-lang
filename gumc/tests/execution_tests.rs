@@ -5522,3 +5522,172 @@ contract C {
         }
     }
 }
+
+// checked_add and checked_sub guard with unsigned lt, and the "-" arm never branched on signedness at all.
+// So for a signed type any subtraction that goes negative reverted, and adding a negative number reverted, even though the ABI declares int256 and comparisons and division were already signed-aware.
+#[test]
+fn signed_add_and_sub_match_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "contract C:
+    export fn sub(i256 a, i256 b) -> i256:
+        return a - b
+
+    export fn add(i256 a, i256 b) -> i256:
+        return a + b
+
+    export fn sub8(i8 a, i8 b) -> i8:
+        return a - b
+";
+    let sol_src = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract C {
+    function sub(int256 a, int256 b) external pure returns (int256) { return a - b; }
+    function add(int256 a, int256 b) external pure returns (int256) { return a + b; }
+    function sub8(int8 a, int8 b) external pure returns (int8) { return a - b; }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    let neg = |v: i64| -> [u8; 32] {
+        let u = (v as i128) as u128;
+        let mut w = [0xffu8; 32];
+        if v >= 0 {
+            w = [0u8; 32];
+        }
+        w[16..].copy_from_slice(&u.to_be_bytes());
+        w
+    };
+
+    // 1 - 2 = -1, the case that reverted.
+    for (f, a, b) in [
+        ("sub(int256,int256)", 1i64, 2i64),
+        ("sub(int256,int256)", 5, 3),
+        ("sub(int256,int256)", -5, 3),
+        ("add(int256,int256)", 5, -3),
+        ("add(int256,int256)", -5, -3),
+        ("add(int256,int256)", 2, 3),
+    ] {
+        let d = encode_words(f, &[neg(a), neg(b)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.success, sr.success, "{} {} {}: success differs (gum={} sol={})", f, a, b, gr.success, sr.success);
+        assert_eq!(gr.output, sr.output, "{} {} {}: differs from solidity", f, a, b);
+    }
+
+    let d = encode_words("sub8(int8,int8)", &[neg(1), neg(2)]);
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert_eq!(gr.success, sr.success, "sub8 1-2: success differs");
+    assert_eq!(gr.output, sr.output, "sub8 1-2 differs from solidity");
+}
+
+// f32 and f64 are documented and type-checked as WAD fixed point, 1.0 being 10^18, but codegen never scaled them: a * b was a bare mul, so 1.0 * 1.0 came out as 10^36 rather than 1.0.
+// The twin does the scaling by hand, which is what a Solidity author writes because solc has no fixed point of its own: fixed and ufixed are reserved and unimplemented.
+#[test]
+fn wad_fixed_point_math_matches_hand_scaled_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "contract C:
+    export fn mul(f32 a, f32 b) -> f32:
+        return a * b
+
+    export fn div(f32 a, f32 b) -> f32:
+        return a / b
+
+    export fn add(f32 a, f32 b) -> f32:
+        return a + b
+
+    export fn sub(f32 a, f32 b) -> f32:
+        return a - b
+
+    export fn scale(f32 a) -> f32:
+        return a * 2
+";
+    let sol_src = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract C {
+    int256 constant WAD = 1e18;
+    function mul(int256 a, int256 b) external pure returns (int256) { return (a * b) / WAD; }
+    function div(int256 a, int256 b) external pure returns (int256) { return (a * WAD) / b; }
+    function add(int256 a, int256 b) external pure returns (int256) { return a + b; }
+    function sub(int256 a, int256 b) external pure returns (int256) { return a - b; }
+    function scale(int256 a) external pure returns (int256) { return a * 2; }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    let w = |v: i128| -> [u8; 32] {
+        let u = v as u128;
+        let mut b = if v < 0 { [0xffu8; 32] } else { [0u8; 32] };
+        b[16..].copy_from_slice(&u.to_be_bytes());
+        b
+    };
+    const ONE: i128 = 1_000_000_000_000_000_000;
+
+    // 1.0 * 1.0 must be 1.0. A bare mul gives 10^36.
+    let d = encode_words("mul(int256,int256)", &[w(ONE), w(ONE)]);
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert!(gr.success, "gum mul reverted");
+    assert_eq!(gr.output, sr.output, "1.0 * 1.0 differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(ONE as u128), "1.0 * 1.0 is not 1.0");
+
+    // 2.5 * 4.0 = 10.0, and a negative operand, which the old unsigned guards would have reverted on.
+    for (a, b) in [(ONE * 5 / 2, ONE * 4), (-ONE, ONE * 3), (ONE / 3, ONE * 3)] {
+        let d = encode_words("mul(int256,int256)", &[w(a), w(b)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.success, sr.success, "mul {} {}: success differs", a, b);
+        assert_eq!(gr.output, sr.output, "mul {} {} differs from solidity", a, b);
+    }
+
+    // 1.0 / 4.0 = 0.25, which a bare div would have made 0.
+    let d = encode_words("div(int256,int256)", &[w(ONE), w(ONE * 4)]);
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert_eq!(gr.output, sr.output, "1.0 / 4.0 differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from((ONE / 4) as u128), "1.0 / 4.0 is not 0.25");
+
+    for (f, a, b) in [
+        ("div(int256,int256)", -ONE, ONE * 4),
+        ("add(int256,int256)", ONE, -ONE / 2),
+        ("sub(int256,int256)", ONE, ONE * 2),
+        ("sub(int256,int256)", -ONE, ONE),
+    ] {
+        let d = encode_words(f, &[w(a), w(b)]);
+        let gr = call(&mut gdb, g, d.clone());
+        let sr = call(&mut sdb, s, d);
+        assert_eq!(gr.success, sr.success, "{} {} {}: success differs", f, a, b);
+        assert_eq!(gr.output, sr.output, "{} {} {} differs from solidity", f, a, b);
+    }
+
+    // A bare literal is a plain count, not a fixed-point value, so this doubles a rather than scaling it by 2e-18.
+    let d = encode_words("scale(int256)", &[w(ONE * 3)]);
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert_eq!(gr.output, sr.output, "scale differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from((ONE * 6) as u128), "3.0 * 2 is not 6.0");
+
+    // Division by zero still panics rather than returning zero the way sdiv would.
+    let d = encode_words("div(int256,int256)", &[w(ONE), w(0)]);
+    assert!(!call(&mut gdb, g, d).success, "div by zero did not revert");
+}
