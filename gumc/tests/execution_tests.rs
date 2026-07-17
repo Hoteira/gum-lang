@@ -5691,3 +5691,130 @@ contract C {
     let d = encode_words("div(int256,int256)", &[w(ONE), w(0)]);
     assert!(!call(&mut gdb, g, d).success, "div by zero did not revert");
 }
+
+// Returning a dynamic value straight from an external call, `return I(t).name()`, substituted the call expression twice: once to read the length, once to copy the bytes.
+// The counter proves it is now one call. Before, it was two, which is double gas and, for a callee free to answer differently, a length and a body from different calls.
+#[test]
+fn returning_an_external_dynamic_result_calls_once() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "use gum.defaults.Account
+use gum.defaults.String
+
+interface I:
+    fn name() -> String
+
+contract C:
+    export fn passthrough(Account t) -> String:
+        return I(t).name()
+";
+    // A callee that records how many times it was asked, and returns a string so the caller takes the dynamic path.
+    let sol_counter = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract Counter {
+    uint256 public calls;
+    function name() external returns (string memory) {
+        calls += 1;
+        return \"gum\";
+    }
+}
+";
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(gum_src, &solc, false));
+    let counter = deploy(&mut db, sol_creation_bytecode(sol_counter, &solc));
+
+    let r = call(&mut db, c, encode_words("passthrough(address)", &[word_addr(counter)]));
+    assert!(r.success, "passthrough reverted");
+
+    // The returned string still has to be right, not just the call count.
+    let want = {
+        let mut w = Vec::new();
+        w.extend_from_slice(&word_u256(U256::from(32u64)));
+        w.extend_from_slice(&word_u256(U256::from(3u64)));
+        let mut s = b"gum".to_vec();
+        s.resize(32, 0);
+        w.extend_from_slice(&s);
+        w
+    };
+    assert_eq!(r.output, want, "returned string is wrong");
+
+    // calls is at storage slot 0. Exactly one, not two.
+    assert_eq!(storage(&mut db, counter, 0), U256::from(1u64), "name() was called more than once");
+}
+
+// The type checker knows String.concat and String.slice return a String, but codegen's static_type did not, so it typed the intermediate as unknown and a.concat(b).length fell through to the property-offset catch-all.
+// This is the same two-resolvers-disagree shape as the Vec(P) bug: the semantic pass accepts what codegen then cannot resolve.
+#[test]
+fn chained_string_method_length_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "use gum.defaults.String
+
+contract C:
+    export fn concat_len(String a, String b) -> u256:
+        return a.concat(b).length
+
+    export fn slice_len(String a) -> u256:
+        return a.slice(1, 4).length
+";
+    let sol_src = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract C {
+    function concat_len(string calldata a, string calldata b) external pure returns (uint256) {
+        return bytes(string.concat(a, b)).length;
+    }
+    function slice_len(string calldata a) external pure returns (uint256) {
+        return bytes(a[1:4]).length;
+    }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, true));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    let enc_str = |bytes: &[u8]| -> Vec<u8> {
+        let mut w = word_u256(U256::from(bytes.len() as u64)).to_vec();
+        let mut p = bytes.to_vec();
+        let pad = (32 - (p.len() % 32)) % 32;
+        p.resize(p.len() + pad, 0);
+        w.extend_from_slice(&p);
+        w
+    };
+
+    // concat_len("hello", "world") = 10.
+    let a = enc_str(b"hello");
+    let b = enc_str(b"world");
+    let mut d = selector("concat_len(string,string)").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(64u64)));
+    d.extend_from_slice(&word_u256(U256::from(64u64 + a.len() as u64)));
+    d.extend_from_slice(&a);
+    d.extend_from_slice(&b);
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert!(gr.success, "gum concat_len reverted");
+    assert_eq!(gr.output, sr.output, "concat_len differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(10u64), "hello+world length");
+
+    // slice_len of a 6-char string over [1,4) = 3.
+    let mut d = selector("slice_len(string)").to_vec();
+    d.extend_from_slice(&word_u256(U256::from(32u64)));
+    d.extend_from_slice(&enc_str(b"abcdef"));
+    let gr = call(&mut gdb, g, d.clone());
+    let sr = call(&mut sdb, s, d);
+    assert!(gr.success, "gum slice_len reverted");
+    assert_eq!(gr.output, sr.output, "slice_len differs from solidity");
+    assert_eq!(U256::from_be_slice(&gr.output), U256::from(3u64), "slice [1,4) length");
+}

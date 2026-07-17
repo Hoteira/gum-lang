@@ -2373,8 +2373,14 @@ impl<'a> Translator<'a> {
                         return args[1].clone();
                     }
                 }
-                if let Type::Primitive(class_name) = base_ty {
-                    if let Some(cd) = self.type_checker().loaded_classes.get(&class_name) {
+                if let Type::Primitive(class_name) = &base_ty {
+                    // The builtin String/Bytes methods that yield the same kind back. The type checker already knows these; codegen has to agree, or a.concat(b).length types the intermediate as unknown and the .length read falls through to the offset catch-all.
+                    if (class_name == "String" || class_name == "Bytes")
+                        && matches!(method.as_str(), "concat" | "slice")
+                    {
+                        return base_ty.clone();
+                    }
+                    if let Some(cd) = self.type_checker().loaded_classes.get(class_name) {
                         if let Some(m) = cd.methods.iter().find(|m| &m.name == method) {
                             return m
                                 .return_type
@@ -2600,13 +2606,16 @@ impl<'a> Translator<'a> {
                             lock_clear = lock_clear
                         )
                     } else if is_dynamic {
+                        // Bound to a local first, like every other branch here: the expression was substituted twice, once for the length and once for the copy, so `return I(t).name()` made the external call twice.
+                        // Two calls is not just double gas. A callee free to answer differently would have the length come from one call and the bytes from the other.
                         format!(
-                            "let _len := and(shr(192, mload({val})), 0xffffffffffffffff)\n\
+                            "let _p := {val}\n\
+                             let _len := and(shr(192, mload(_p)), 0xffffffffffffffff)\n\
                              let _padded_len := and(add(_len, 31), not(31))\n\
                              let _out := allocate_memory(add(64, _padded_len))\n\
                              mstore(_out, 32)\n\
                              mstore(add(_out, 32), _len)\n\
-                             gum_memory_copy(add({val}, 32), add(_out, 64), _len)\n\
+                             gum_memory_copy(add(_p, 32), add(_out, 64), _len)\n\
                              {lock_clear}\
                              return(_out, add(64, _padded_len))\n",
                             val = val_expr,
