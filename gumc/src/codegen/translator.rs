@@ -2345,6 +2345,12 @@ impl<'a> Translator<'a> {
                         if let Some(f) = cd.fields.iter().find(|f| &f.name == property) {
                             return f.type_def.clone();
                         }
+                        // Child.Ancestor names the ancestor slice, matching the semantic pass, so a following .method() resolves against the ancestor.
+                        if cd.parents.iter().any(|p| p == property)
+                            && self.type_checker().loaded_classes.contains_key(property)
+                        {
+                            return Type::Primitive(property.clone());
+                        }
                     }
                     if self.type_checker().loaded_enums.contains_key(&class_name) {
                         return Type::Primitive(class_name);
@@ -2941,7 +2947,7 @@ impl<'a> Translator<'a> {
         }
         // No guess here. Every resolver above knows an offset; falling past them means the property has no known place, and assuming 0 wrote the value over whatever sits at the base instead.
         self.errors.borrow_mut().push(format!(
-            "Codegen Error: no known storage or memory offset for '{}' on a {}, so it cannot be assigned. This is a compiler gap rather than a mistake in your code: please report it.",
+            "no known storage or memory offset for '{}' on a {}, so it cannot be assigned. This is a compiler gap rather than a mistake in your code: please report it.",
             property,
             self.abi_gen.signature_type(&self.static_type(base, ctx))
         ));
@@ -3190,7 +3196,7 @@ impl<'a> Translator<'a> {
                 }
                 // The read half of the same rule: offset 0 is not a default, it is the first field, so an unresolved property silently read the wrong one.
                 self.errors.borrow_mut().push(format!(
-                    "Codegen Error: no known storage or memory offset for '{}' on a {}, so it cannot be read. This is a compiler gap rather than a mistake in your code: please report it.",
+                    "no known storage or memory offset for '{}' on a {}, so it cannot be read. This is a compiler gap rather than a mistake in your code: please report it.",
                     property,
                     self.abi_gen.signature_type(&self.static_type(base, ctx))
                 ));
@@ -4218,6 +4224,32 @@ impl<'a> Translator<'a> {
         if matches!(base, Expr::Identifier(b) if b == "super") {
             return self.translate_super_call(method, args, ctx);
         }
+        // Child.Ancestor.method(): call the ancestor's retained copy, which the flattening emitted in the owner's namespace and bound to the owner's storage.
+        if let Expr::PropertyAccess { base: inner, property: ancestor } = base {
+            if let Type::Primitive(owner) = self.static_type(inner, ctx) {
+                let is_ancestor = self
+                    .type_checker()
+                    .loaded_classes
+                    .get(&owner)
+                    .map(|c| c.parents.iter().any(|p| p == ancestor))
+                    .unwrap_or(false);
+                if is_ancestor && self.type_checker().loaded_classes.contains_key(ancestor) {
+                    let name = format!("{}_{}", owner, crate::semantic::qualified_method_name(ancestor, method));
+                    let mut all: Vec<String> = Vec::new();
+                    if !self
+                        .type_checker()
+                        .loaded_classes
+                        .get(&owner)
+                        .map(|c| c.is_global)
+                        .unwrap_or(false)
+                    {
+                        all.push(self.translate_expr(inner, ctx));
+                    }
+                    all.extend(args.iter().map(|a| self.translate_expr(a, ctx)));
+                    return format!("{}({})", name, all.join(", "));
+                }
+            }
+        }
         if let Type::Primitive(name) = self.static_type(base, ctx) {
             if is_numeric_primitive(&name) {
                 match method {
@@ -4485,15 +4517,28 @@ impl<'a> Translator<'a> {
                 }
                 let arg_strs: Vec<String> =
                     args.iter().map(|a| self.translate_expr(a, ctx)).collect();
-                let static_base = matches!(base, Expr::Identifier(n) if self.type_checker().loaded_classes.contains_key(n));
-                if class_decl.is_global || static_base {
+                let is_global = class_decl.is_global;
+                let bare_class = matches!(base, Expr::Identifier(n) if self.type_checker().loaded_classes.contains_key(n));
+                if is_global {
                     return format!("{}_{}({})", class_name, method, arg_strs.join(", "));
-                } else {
-                    let self_expr = self.translate_expr(base, ctx);
-                    let mut all = vec![self_expr];
-                    all.extend(arg_strs);
-                    return format!("{}_{}({})", class_name, method, all.join(", "));
                 }
+                // Message and Block are frame namespaces whose methods compile to opcodes (caller, timestamp) and take no self, so a bare-name call is exactly right for them.
+                if bare_class && (class_name == "Message" || class_name == "Block") {
+                    return format!("{}_{}({})", class_name, method, arg_strs.join(", "));
+                }
+                // Any other bare class name is not an instance, so its method has no self to run on. This used to emit a call with the self argument dropped, which solc rejected.
+                // Reaching a parent's version is spelled Child.Parent.method(); a class's own method needs an instance.
+                if bare_class {
+                    self.errors.borrow_mut().push(format!(
+                        "'{}.{}()' has no receiver. Call a parent's version as Child.{}.{}(), or call the method on an instance.",
+                        class_name, method, class_name, method
+                    ));
+                    return String::new();
+                }
+                let self_expr = self.translate_expr(base, ctx);
+                let mut all = vec![self_expr];
+                all.extend(arg_strs);
+                return format!("{}_{}({})", class_name, method, all.join(", "));
             }
         }
 

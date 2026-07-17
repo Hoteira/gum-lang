@@ -296,9 +296,36 @@ re-declaring an inherited *field* (shadowing would silently give it a second
 slot); inheriting the same method from two parents without the child declaring
 which; and inheriting from a `contract` or from a generic class.
 
-`super.method()` calls the parent's version from an override, so a child can
-extend rather than only replace. It is a compile error where there is nothing to
-call: outside a method, or on a method the parent does not declare.
+`super.method()` calls the immediately-overridden version from inside an
+override, so a child can extend rather than only replace. It is a compile error
+where there is nothing to call: outside a method, or on a method the parent does
+not declare.
+
+`Child.Ancestor.method()` calls a **named** ancestor's version, distinct from
+`Child.method()` which runs the child's own. It works for any ancestor, not just
+the immediate parent, and disambiguates a diamond (`Child.A.m()` vs
+`Child.B.m()`). The ancestor's body runs on the child's storage, the same as
+Solidity's `Base.method()`:
+
+```python
+class Ledger:
+    fn cap() -> u256:
+        return 100
+
+[Ledger]
+contract Vault:
+    fn cap() -> u256:        # overrides Ledger.cap
+        return 250
+
+    export fn own() -> u256:
+        return Vault.cap()          # 250, the override
+
+    export fn base() -> u256:
+        return Vault.Ledger.cap()   # 100, Ledger's version
+```
+
+A bare class name is not a receiver: `Ledger.cap()` is a compile error (call it
+as `Vault.Ledger.cap()` or on an instance).
 
 ### Interfaces as parents (`implements`)
 

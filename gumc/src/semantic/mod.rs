@@ -273,6 +273,28 @@ impl TypeChecker {
         let mut seen = HashSet::new();
         ancestors.retain(|a| seen.insert(a.clone()));
 
+        // A qualified copy of each ancestor's method, kept so Child.Ancestor.method() can reach that specific version even after an override replaced it in the flat set.
+        // The copy carries the ancestor's body but is compiled in this class's context, so it operates on this class's storage, exactly like the effective and super_ copies above.
+        // Two ancestors defining the same method give two distinct copies (A__m and B__m), which is the disambiguation a diamond needs. Unused copies cost nothing: solc strips any Yul function no path calls.
+        for a in &ancestors {
+            let src = match self.loaded_classes.get(a) {
+                Some(c) => c.methods.clone(),
+                None => continue,
+            };
+            for m in &src {
+                if m.name == "new" || m.name.contains(QUAL_SEP) || m.name.starts_with(SUPER_PREFIX) {
+                    continue;
+                }
+                let qname = format!("{}{}{}", a, QUAL_SEP, m.name);
+                if methods.iter().any(|e| e.name == qname) {
+                    continue;
+                }
+                let mut copy = m.clone();
+                copy.name = qname;
+                methods.push(copy);
+            }
+        }
+
         if let Some(c) = self.loaded_classes.get_mut(name) {
             c.fields = fields;
             c.methods = methods;
@@ -1755,6 +1777,12 @@ impl TypeChecker {
                                 return Ok(field.type_def.clone());
                             }
                         }
+                        // Child.Ancestor is a reference to that ancestor's slice of the object, so Child.Ancestor.method() reaches the ancestor's version. The ancestor's type flows out and the method resolves against it.
+                        if class_decl.parents.iter().any(|p| p == property)
+                            && self.loaded_classes.contains_key(property)
+                        {
+                            return Ok(Type::Primitive(property.clone()));
+                        }
                         return Err(format!("Property '{}' not found on class '{}'", property, class_name));
                     } else if let Some(enum_decl) = self.loaded_enums.get(class_name) {
                         for variant in &enum_decl.variants {
@@ -2027,7 +2055,17 @@ fn definitely_assigns(body: &[Spanned<Statement>], class_name: &str, field: &str
 // a class declaring its own super_foo alongside an override of foo is
 // rejected by the duplicate-method check.
 pub fn super_name(method: &str) -> String {
-    format!("super_{}", method)
+    format!("{}{}", SUPER_PREFIX, method)
+}
+
+// The prefix marking super_ copies, and the separator inside an ancestor-qualified method name (Ledger__cap).
+// Both are legal identifier text but the duplicate-method check rejects a source method that collides with either, so neither is spellable by accident.
+pub const SUPER_PREFIX: &str = "super_";
+pub const QUAL_SEP: &str = "__";
+
+// The Yul function name for Contract.Ancestor.method(): the qualified copy retained during flattening, emitted in the contract's own namespace.
+pub fn qualified_method_name(ancestor: &str, method: &str) -> String {
+    format!("{}{}{}", ancestor, QUAL_SEP, method)
 }
 
 fn type_name(t: &Type) -> String {

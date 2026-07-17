@@ -5818,3 +5818,77 @@ contract C {
     assert_eq!(gr.output, sr.output, "slice_len differs from solidity");
     assert_eq!(U256::from_be_slice(&gr.output), U256::from(3u64), "slice [1,4) length");
 }
+
+// Child.Ancestor.method() calls that ancestor's version, distinct from Child.method() which is the child's override.
+// Solidity spells the same thing Base.method(), so the twin calls Ledger.tally / the override directly.
+#[test]
+fn ancestor_qualified_call_reaches_the_parent_version() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "class Ledger:
+    u256 total
+
+    fn bump() -> u256:
+        self.total = self.total + 1
+        return self.total
+
+[Ledger]
+contract C:
+    fn bump() -> u256:
+        self.total = self.total + 100
+        return self.total
+
+    export fn child_bump() -> u256:
+        return C.bump()
+
+    export fn parent_bump() -> u256:
+        return C.Ledger.bump()
+
+    export fn get_total() -> u256:
+        return C.total
+";
+    let sol_src = "// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract Ledger {
+    uint256 total;
+    function bump() public virtual returns (uint256) { total += 1; return total; }
+}
+contract C is Ledger {
+    function bump() public override returns (uint256) { total += 100; return total; }
+    function child_bump() external returns (uint256) { return C.bump(); }
+    function parent_bump() external returns (uint256) { return Ledger.bump(); }
+    function get_total() external view returns (uint256) { return total; }
+}
+";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, false));
+    let s = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    macro_rules! both {
+        ($sig:expr) => {{
+            let d = encode_words($sig, &[]);
+            let gr = call(&mut gdb, g, d.clone());
+            let sr = call(&mut sdb, s, d);
+            assert_eq!(gr.success, sr.success, "success differs for {}", $sig);
+            assert_eq!(gr.output, sr.output, "output differs for {}", $sig);
+            gr.output
+        }};
+    }
+
+    // child override adds 100, parent version adds 1, both on the same shared total.
+    let o1 = both!("parent_bump()");   // total 0 -> 1
+    assert_eq!(U256::from_be_slice(&o1), U256::from(1u64), "parent version should add 1");
+    let o2 = both!("child_bump()");    // 1 -> 101
+    assert_eq!(U256::from_be_slice(&o2), U256::from(101u64), "child override should add 100");
+    let o3 = both!("parent_bump()");   // 101 -> 102
+    assert_eq!(U256::from_be_slice(&o3), U256::from(102u64), "parent version again");
+    both!("get_total()");
+    assert_eq!(storage(&mut gdb, g, 0), U256::from(102u64), "shared total in slot 0");
+}
