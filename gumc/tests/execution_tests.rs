@@ -5892,3 +5892,70 @@ contract C is Ledger {
     both!("get_total()");
     assert_eq!(storage(&mut gdb, g, 0), U256::from(102u64), "shared total in slot 0");
 }
+
+// 512-bit mulDiv: a WAD multiply where the raw product a*b overflows int256 but the scaled result (a*b)/1e18 fits.
+// The old checked_smul-then-sdiv reverted on the intermediate; full mulDiv holds the product in two words and only fails if the true result exceeds int256.
+#[test]
+fn wad_mul_div_uses_full_precision() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let src = "contract C:
+    export fn mul(f32 a, f32 b) -> f32:
+        return a * b
+
+    export fn div(f32 a, f32 b) -> f32:
+        return a / b
+";
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    let big = |s: &str| U256::from_str_radix(s, 10).unwrap();
+    let word = |u: U256| { let mut w = [0u8; 32]; w.copy_from_slice(&u.to_be_bytes::<32>()); w };
+    // two's complement of a positive magnitude
+    let negw = |u: U256| word((U256::ZERO).wrapping_sub(u));
+
+    // mul: 2e38 * 3e38 -> 6e58. Raw product 6e76 overflows int256; result fits.
+    let a = big("200000000000000000000000000000000000000");
+    let b = big("300000000000000000000000000000000000000");
+    let want = big("60000000000000000000000000000000000000000000000000000000000");
+    let mut d = selector("mul(int256,int256)").to_vec();
+    d.extend_from_slice(&word(a)); d.extend_from_slice(&word(b));
+    let r = call(&mut db, c, d);
+    assert!(r.success, "mul reverted on a product the scaled result can hold");
+    assert_eq!(U256::from_be_slice(&r.output), want, "2e38 * 3e38 (WAD) = 6e58");
+
+    // negative: -2e38 * 3e38 -> -6e58
+    let mut d = selector("mul(int256,int256)").to_vec();
+    d.extend_from_slice(&negw(a)); d.extend_from_slice(&word(b));
+    let r = call(&mut db, c, d);
+    assert!(r.success, "signed mul reverted");
+    assert_eq!(r.output.as_slice(), negw(want), "-2e38 * 3e38 = -6e58");
+
+    // div: 6e58 / 3e38 -> 2e38. Numerator 6e58 * 1e18 = 6e76 overflows int256; result fits.
+    let n = big("60000000000000000000000000000000000000000000000000000000000");
+    let dd = big("300000000000000000000000000000000000000");
+    let dwant = big("200000000000000000000000000000000000000");
+    let mut d = selector("div(int256,int256)").to_vec();
+    d.extend_from_slice(&word(n)); d.extend_from_slice(&word(dd));
+    let r = call(&mut db, c, d);
+    assert!(r.success, "div reverted on a numerator the result can hold");
+    assert_eq!(U256::from_be_slice(&r.output), dwant, "6e58 / 3e38 (WAD) = 2e38");
+
+    // true overflow: 1e58 * 1e58 / 1e18 = 1e98 > int256 max, must revert.
+    let huge = big("10000000000000000000000000000000000000000000000000000000000");
+    let mut d = selector("mul(int256,int256)").to_vec();
+    d.extend_from_slice(&word(huge)); d.extend_from_slice(&word(huge));
+    let r = call(&mut db, c, d);
+    assert!(!r.success, "a result exceeding int256 must revert");
+
+    // divide by zero still reverts.
+    let mut d = selector("div(int256,int256)").to_vec();
+    d.extend_from_slice(&word(big("1000000000000000000"))); d.extend_from_slice(&word(U256::ZERO));
+    let r = call(&mut db, c, d);
+    assert!(!r.success, "division by zero must revert");
+}

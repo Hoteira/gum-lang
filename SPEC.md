@@ -497,11 +497,12 @@ That last row is the one to watch: `a * 2` doubles `a`, it does not scale it by
 `2e-18`. Mixing a fixed value with a non-literal integer is a compile error,
 since the integer would otherwise be read as a fraction.
 
-Rounding truncates toward zero, as `sdiv` does. The intermediate of `*` and `/`
-is a checked signed multiply rather than a 512-bit product, so an operand large
-enough that the unscaled intermediate leaves `int256` reverts instead of
-wrapping. That bounds operands at roughly `5.7e58` in WAD terms, the same trade
-solmate's `mulWad` makes.
+Rounding truncates toward zero, as `sdiv` does. `*` and `/` compute at full
+512-bit precision (the Remco Bloemen / OpenZeppelin `mulDiv`), so the raw product
+`a*b` overflowing `int256` is not a failure: only a *result* that leaves `int256`
+reverts. `2e38 * 3e38` (WAD) is `6e58`, even though `a*b` is `6e76`, past the word.
+This is the same guarantee Solidity's `Math.mulDiv` gives, but native to the
+operator rather than a library call.
 
 Literal-only expressions that provably fit are constant-folded at compile time
 (the runtime check is elided when it cannot fail).

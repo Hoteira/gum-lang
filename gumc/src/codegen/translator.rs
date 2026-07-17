@@ -1626,29 +1626,78 @@ fn checked_smul_helper_src(rich: bool) -> String {
 // One WAD, the scale of every f32 and f64 value: 1.0 is 10^18.
 const WAD: &str = "1000000000000000000";
 
-// Multiplying two WAD values gives a WAD-squared product, so it comes back down by one WAD. Emitting a bare mul, which is what this did, left every product overscaled by 10^18.
-// The intermediate is a checked signed multiply rather than a 512-bit one, so a product whose unscaled form does not fit in an int256 reverts instead of wrapping. That bounds the operands at roughly 5.7e58 in WAD terms, which is the same trade solmate's mulWad makes.
-// sdiv truncates toward zero, so the result rounds toward zero like Solidity's own integer division.
-fn gum_wad_mul_helper_src(rich: bool) -> String {
-    let _ = rich;
+// Full-precision unsigned floor((x*y)/d), the Remco Bloemen / OpenZeppelin Math.mulDiv.
+// The product x*y is held as a 512-bit number in two words, so an intermediate that overflows a single word is not lost the way a bare mul loses it; only a final result that does not fit 256 bits reverts.
+// The tail is the standard trick: strip the common power of two, then multiply by the modular inverse of d, which Newton-Raphson doubles to 256 bits in six steps.
+fn gum_muldiv_helper_src(rich: bool) -> String {
     format!(
-        "function gum_wad_mul(a, b, minv, maxv) -> r {{\n\
-     \x20   r := sdiv(checked_smul(a, b, minv, maxv), {})\n\
+        "function gum_muldiv(x, y, d) -> r {{\n\
+     \x20   let mm := mulmod(x, y, not(0))\n\
+     \x20   let p0 := mul(x, y)\n\
+     \x20   let p1 := sub(sub(mm, p0), lt(mm, p0))\n\
+     \x20   if iszero(p1) {{\n\
+     \x20       if iszero(d) {{ {divzero} }}\n\
+     \x20       r := div(p0, d)\n\
+     \x20       leave\n\
+     \x20   }}\n\
+     \x20   if iszero(gt(d, p1)) {{ {overflow} }}\n\
+     \x20   let rem := mulmod(x, y, d)\n\
+     \x20   p1 := sub(p1, gt(rem, p0))\n\
+     \x20   p0 := sub(p0, rem)\n\
+     \x20   let twos := and(sub(0, d), d)\n\
+     \x20   d := div(d, twos)\n\
+     \x20   p0 := div(p0, twos)\n\
+     \x20   twos := add(div(sub(0, twos), twos), 1)\n\
+     \x20   p0 := or(p0, mul(p1, twos))\n\
+     \x20   let inv := xor(mul(3, d), 2)\n\
+     \x20   inv := mul(inv, sub(2, mul(d, inv)))\n\
+     \x20   inv := mul(inv, sub(2, mul(d, inv)))\n\
+     \x20   inv := mul(inv, sub(2, mul(d, inv)))\n\
+     \x20   inv := mul(inv, sub(2, mul(d, inv)))\n\
+     \x20   inv := mul(inv, sub(2, mul(d, inv)))\n\
+     \x20   inv := mul(inv, sub(2, mul(d, inv)))\n\
+     \x20   r := mul(p0, inv)\n\
      }}\n",
-        WAD
+        divzero = panic_revert(rich, PANIC_DIV_ZERO),
+        overflow = panic_revert(rich, PANIC_OVERFLOW)
     )
 }
 
-// Dividing two WAD values cancels the scale entirely, so the numerator goes up by one WAD first to keep it.
-fn gum_wad_div_helper_src(rich: bool) -> String {
+// A signed WAD op reduces to an unsigned mulDiv on the magnitudes, with the sign reapplied at the end.
+// Absolute value in unsigned space: sub(0, int256_min) is 2^255, the correct magnitude, so even the extreme operand is handled.
+// The range check is the last step: a positive result may reach maxv, a negative one may reach 2^255 (which is minv's bit pattern read unsigned), so the guard is asymmetric.
+fn gum_wad_signed(fname: &str, num: &str, den: &str, rich: bool) -> String {
     format!(
-        "function gum_wad_div(a, b, minv, maxv) -> r {{\n\
-     \x20   if iszero(b) {{ {} }}\n\
-     \x20   r := sdiv(checked_smul(a, {}, minv, maxv), b)\n\
+        "function {fname}(a, b, minv, maxv) -> r {{\n\
+     \x20   let neg := xor(slt(a, 0), slt(b, 0))\n\
+     \x20   let x := a\n\
+     \x20   if slt(a, 0) {{ x := sub(0, a) }}\n\
+     \x20   let y := b\n\
+     \x20   if slt(b, 0) {{ y := sub(0, b) }}\n\
+     \x20   let mag := gum_muldiv({num}, {den})\n\
+     \x20   switch neg\n\
+     \x20   case 0 {{ if gt(mag, maxv) {{ {overflow} }} r := mag }}\n\
+     \x20   default {{ if gt(mag, minv) {{ {overflow} }} r := sub(0, mag) }}\n\
      }}\n",
-        panic_revert(rich, PANIC_DIV_ZERO),
-        WAD
+        fname = fname,
+        num = num,
+        den = den,
+        overflow = panic_revert(rich, PANIC_OVERFLOW)
     )
+}
+
+// Multiplying two WAD values gives a WAD-squared product, so it comes back down by one WAD: floor(|a|*|b| / 10^18) on the magnitudes.
+// Full-precision, so an operand large enough that a*b overflows int256 no longer reverts as long as the scaled result fits, which is the whole point of a WAD mul.
+fn gum_wad_mul_helper_src(rich: bool) -> String {
+    let den = WAD.to_string();
+    gum_wad_signed("gum_wad_mul", "x, y", &den, rich)
+}
+
+// Dividing two WAD values cancels the scale, so the numerator goes up by one WAD first: floor(|a|*10^18 / |b|).
+fn gum_wad_div_helper_src(rich: bool) -> String {
+    let num = format!("x, {}", WAD);
+    // b == 0 surfaces inside gum_muldiv as a divide-by-zero once the magnitude denominator is zero.
+    gum_wad_signed("gum_wad_div", &num, "y", rich)
 }
 
 fn checked_div_helper_src(rich: bool) -> String {
@@ -3611,7 +3660,7 @@ impl<'a> Translator<'a> {
             && is_fixed_point(&self.static_type(left, ctx))
             && is_fixed_point(&self.static_type(right, ctx))
         {
-            self.ensure_helper("checked_smul", || checked_smul_helper_src(rich));
+            self.ensure_helper("gum_muldiv", || gum_muldiv_helper_src(rich));
             let (lo, hi) = (Self::min_signed_hex(256), Self::max_signed_hex(256));
             if operator == "*" {
                 self.ensure_helper("gum_wad_mul", || gum_wad_mul_helper_src(rich));
