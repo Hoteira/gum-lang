@@ -31,11 +31,16 @@ contract AMM {
     uint256 reserveB;
     uint256 totalShares;
     mapping(address => uint256) shares;
+    // Mirrors gum's `once` one-shot guard: a dedicated flag slot, set 0->1 on the
+    // first call, so the cold SSTORE cost is the same on both sides.
+    bool initialized;
 
     event LiquidityAdded(address indexed sender, uint256 amountA, uint256 amountB, uint256 sharesMinted);
     event SwapExecuted(address indexed sender, address indexed tokenIn, uint256 amountIn, address tokenOut, uint256 amountOut);
 
     function initialize(address _tokenA, address _tokenB) external {
+        require(!initialized, "already initialized");
+        initialized = true;
         tokenA = _tokenA;
         tokenB = _tokenB;
     }

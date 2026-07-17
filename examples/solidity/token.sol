@@ -25,6 +25,9 @@ contract Token {
     address owner;
     uint256 totalSupply;
     mapping(address => uint256) balances;
+    // Mirrors gum's `once` one-shot guard: a dedicated flag slot, set 0->1 on the
+    // first call, so the cold SSTORE cost is the same on both sides.
+    bool initialized;
 
     // Match token.gum's events exactly (same names, same param types/order),
     // so topic0 hashes are identical. Transfer's topic0 is the canonical
@@ -33,6 +36,8 @@ contract Token {
     event Mint(address indexed to, uint256 value);
 
     function initialize(uint256 initialSupply) external {
+        require(!initialized, "already initialized");
+        initialized = true;
         address sender = msg.sender;
         owner = sender;
         totalSupply = initialSupply;
