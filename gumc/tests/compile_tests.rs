@@ -2200,3 +2200,61 @@ fn transient_on_a_plain_class_field_is_rejected() {
     // modifier would name a keyspace the field never touches.
     assert_compile_fails("class P:\n    transient u256 x\n\ncontract C:\n    export fn go() -> u256:\n        var p = new P()\n        return p.x\n");
 }
+
+// The Yul between a selector case's opening brace and its matching close, for asserting on one function's dispatch.
+fn case_body(yul: &str, name: &str) -> String {
+    let marker = format!("/* {} */", name);
+    let start = match yul.find(&marker) {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    let rest = &yul[start..];
+    let open = rest.find('{').unwrap_or(0);
+    let mut depth = 0i32;
+    for (i, c) in rest[open..].char_indices() {
+        if c == '{' { depth += 1; }
+        if c == '}' { depth -= 1; if depth == 0 { return rest[open..open + i + 1].to_string(); } }
+    }
+    rest.to_string()
+}
+
+#[test]
+fn only_functions_that_call_out_carry_a_reentrancy_guard() {
+    // A state-changing entry point that never hands control to another contract cannot be re-entered, so it needs no transient lock.
+    // The guard must stay on anything that does call out, including transitively through an internal helper: dropping it there is a real reentrancy hole.
+    let src = "use gum.defaults.Account
+use gum.defaults.Message
+
+contract V:
+    HashMap(Account, u256) bal
+
+    fn send_(Account to, u256 amt):
+        to.transfer(amt)
+
+    export fn touch(u256 x):
+        V.bal[Message.sender()] = x
+
+    export fn direct(u256 amt):
+        V.bal[Message.sender()] -= amt
+        Message.sender().transfer(amt)
+
+    export fn indirect(u256 amt):
+        V.bal[Message.sender()] -= amt
+        V.send_(Message.sender(), amt)
+";
+    let (ok, out) = run_gumc(src);
+    assert!(ok, "compile failed:
+{}", out);
+    // touch writes storage and calls nobody: no lock.
+    let touch = case_body(&out, "touch");
+    assert!(!touch.contains("tstore"), "touch should not be guarded:
+{}", touch);
+    // direct transfers: guarded.
+    let direct = case_body(&out, "direct");
+    assert!(direct.contains("tstore"), "direct must be guarded:
+{}", direct);
+    // indirect transfers through a helper: still guarded (transitive).
+    let indirect = case_body(&out, "indirect");
+    assert!(indirect.contains("tstore"), "indirect must be guarded through its helper:
+{}", indirect);
+}

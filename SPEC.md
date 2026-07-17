@@ -822,6 +822,14 @@ A **read-only** entry point (§6) carries no guard. It writes nothing, so
 reentering it can corrupt nothing, and the guard is a `TSTORE`, which would
 revert inside the `STATICCALL` that its `view` invites callers to use.
 
+Nor does an entry point that **never hands control to another contract**: with
+no external call, interface call, `transfer`/`pay`, or CREATE anywhere on its
+call graph, it cannot be re-entered, so the lock would be dead weight. The check
+is transitive, a function that reaches an external call only through an internal
+helper is still guarded, and conservative, an unresolved call is assumed to
+reach out. So the guard lands on exactly the functions that can actually be
+re-entered.
+
 `Message` and `Block` are compiler intrinsics: their methods compile directly to
 EVM opcodes (`caller()`, `callvalue()`, `address()`, `timestamp()`, `number()`),
 not to real storage or function calls.

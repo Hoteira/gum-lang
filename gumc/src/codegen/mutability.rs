@@ -200,3 +200,110 @@ pub fn state_mutability(f: &FnDecl, map: &MutMap) -> &'static str {
 pub fn is_read_only(f: &FnDecl, map: &MutMap) -> bool {
     matches!(state_mutability(f, map), "view" | "pure")
 }
+
+// Whether an expression can hand control to another contract, which is the only way reentrancy happens: an interface call, Account.transfer/pay, a CREATE, or a call to a function that itself does one.
+// Conservative on the unknown side: a call this pass cannot resolve is assumed to reach out, so the guard is only ever dropped from a function proven not to call anywhere.
+fn expr_calls_out(tc: &TypeChecker, class: &ClassDecl, e: &Expr, map: &HashMap<String, bool>) -> bool {
+    let sub = |x: &Expr| expr_calls_out(tc, class, x, map);
+    match e {
+        Expr::Number(_) | Expr::StringLiteral(_) | Expr::Identifier(_) => false,
+        Expr::Neg(x) | Expr::Not(x) => sub(x),
+        Expr::BinaryOp { left, right, .. } => sub(left) || sub(right),
+        Expr::ArrayLiteral(v) => v.iter().any(sub),
+        Expr::FString(segs) => segs.iter().any(|s| matches!(s, FStringSegment::Interp(x) if sub(x))),
+        Expr::PropertyAccess { base, .. } => sub(base),
+        Expr::IndexAccess { base, index } => sub(base) || sub(index),
+        // new Child(...) on a contract is a CREATE, which runs the child's code and can call back.
+        Expr::Instantiation { type_def, args } => {
+            is_contract_type(tc, type_def) || args.iter().any(sub)
+        }
+        Expr::FnCall { name, args } => {
+            let own = match name.as_str() {
+                // Builtins and markers that emit no call: log writes a topic, indexed just tags a log field, the rest are pure.
+                "log" | "indexed" | "keccak256" | "ecrecover" | "assert" => false,
+                // An unresolved name is assumed to call out; a known contract method is what the map says.
+                _ => map.get(name).copied().unwrap_or(true),
+            };
+            own || args.iter().any(sub)
+        }
+        Expr::MethodCall { base, method, args } => {
+            let a = args.iter().any(sub);
+            if let Expr::FnCall { name, .. } = &**base {
+                if tc.loaded_interfaces.contains(name) {
+                    return true;
+                }
+            }
+            if let Expr::Identifier(n) = &**base {
+                if n == "Message" || n == "Block" {
+                    return a;
+                }
+            }
+            if storage_root(tc, class, base) {
+                let own = match method.as_str() {
+                    "length" | "len" | "get" | "push" | "pop" => false,
+                    _ => map.get(method).copied().unwrap_or(true),
+                };
+                return own || a;
+            }
+            let own = match method.as_str() {
+                // Value transfers and deploys hand over control; the rest are local reads or staticcalls that cannot re-enter and write.
+                "transfer" | "pay" | "create" | "create2" => true,
+                "balance" | "delegated_to" | "is_delegated" | "verify_p256" => false,
+                "saturate" | "as_bytes" | "as_bits" | "serialize" | "concat" | "slice" => false,
+                _ => map.get(method).copied().unwrap_or(true),
+            };
+            own || a || sub(base)
+        }
+    }
+}
+
+fn stmt_calls_out(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &HashMap<String, bool>) -> bool {
+    let sub = |x: &Expr| expr_calls_out(tc, class, x, map);
+    let body = |b: &Vec<Spanned<Statement>>| b.iter().any(|s| stmt_calls_out(tc, class, &s.node, map));
+    match s {
+        Statement::VarDecl { value, .. } => value.as_ref().map(&sub).unwrap_or(false),
+        Statement::Assignment { target, value } => sub(target) || sub(value),
+        Statement::BitwiseFlip { index, value, .. } => sub(index) || sub(value),
+        Statement::Assert { condition, message } => {
+            sub(condition) || message.as_ref().map(&sub).unwrap_or(false)
+        }
+        Statement::Revert { args, .. } => args.iter().any(&sub),
+        Statement::Delete { target } => sub(target),
+        Statement::Return { value } => value.as_ref().map(&sub).unwrap_or(false),
+        Statement::IfElse { condition, if_body, else_body } => {
+            sub(condition) || body(if_body) || else_body.as_ref().map(body).unwrap_or(false)
+        }
+        Statement::ForLoop { iterable, body: b, .. } => sub(iterable) || body(b),
+        Statement::WhileLoop { condition, body: b } => sub(condition) || body(b),
+        Statement::Match { expr, arms } => {
+            sub(expr) || arms.iter().any(|a| a.body.iter().any(|s| stmt_calls_out(tc, class, &s.node, map)))
+        }
+        Statement::Expression(e) => sub(e),
+        // A raw low-level call and raw Yul can reach anywhere.
+        Statement::Call { .. } => true,
+        Statement::UnsafeBlock(_) => true,
+    }
+}
+
+// Per-method: does it, transitively, hand control to another contract? Resolved to a fixpoint so a caller inherits its callees, exactly like the mutability pass.
+pub fn analyze_external_calls(tc: &TypeChecker, class: &ClassDecl) -> HashMap<String, bool> {
+    let mut map: HashMap<String, bool> = class.methods.iter().map(|m| (m.name.clone(), false)).collect();
+    for _ in 0..class.methods.len() + 2 {
+        let mut changed = false;
+        for m in &class.methods {
+            if !map[&m.name] && m.body.iter().any(|s| stmt_calls_out(tc, class, &s.node, &map)) {
+                map.insert(m.name.clone(), true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    map
+}
+
+// Whether a function needs a reentrancy guard: only one that can actually hand control away can be re-entered.
+pub fn makes_external_call(f: &FnDecl, map: &HashMap<String, bool>) -> bool {
+    map.get(&f.name).copied().unwrap_or(true)
+}
