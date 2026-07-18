@@ -42,6 +42,33 @@ fn gum_str_len_helper_src() -> String {
         .to_string()
 }
 
+// Decimal itoa: an unsigned value to a gum String (header word holding the
+// length in its top 8 bytes, ASCII digits from p+32). Digits are written from
+// the least-significant end backwards, the same shape as OpenZeppelin's
+// Strings.toString. Zero is spelled "0" rather than the empty string.
+fn gum_uint_to_str_helper_src() -> String {
+    "function gum_uint_to_str(value) -> ptr {\n\
+     \x20   let len := 1\n\
+     \x20   let tmp := value\n\
+     \x20   for { } gt(tmp, 9) { } { tmp := div(tmp, 10) len := add(len, 1) }\n\
+     \x20   let padded := and(add(len, 31), not(31))\n\
+     \x20   ptr := allocate_memory(add(32, padded))\n\
+     \x20   mstore(ptr, shl(192, len))\n\
+     \x20   switch value\n\
+     \x20   case 0 { mstore8(add(ptr, 32), 48) }\n\
+     \x20   default {\n\
+     \x20       let cursor := add(add(ptr, 32), len)\n\
+     \x20       let v := value\n\
+     \x20       for { } gt(v, 0) { } {\n\
+     \x20           cursor := sub(cursor, 1)\n\
+     \x20           mstore8(cursor, add(48, mod(v, 10)))\n\
+     \x20           v := div(v, 10)\n\
+     \x20       }\n\
+     \x20   }\n\
+     }\n"
+        .to_string()
+}
+
 // String and Bytes share one in-memory shape, so every operation below works
 // on either.
 // Whether t is a user struct for storage-addressing purposes: an aggregate
@@ -789,7 +816,7 @@ pub fn is_abi_scalar(t: &Type) -> bool {
     matches!(t, Type::Primitive(n) if matches!(n.as_str(),
         "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
         "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
-        "bool" | "Account"))
+        "bool" | "Account" | "bytes4"))
 }
 
 // Moves one wire word into its packed memory field. Split out because the calldata and memory decoders differ only in how they fetch the word.
@@ -1288,6 +1315,14 @@ fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
         if let Some((bits, signed)) = numeric_meta(name) {
             return mask_to_width(val_expr, bits, signed);
         }
+        // A bytes4 rides the wire left-aligned (its 4 bytes in the high end of
+        // the word, like Solidity). We shift it down to a clean right-aligned
+        // value so it compares against a plain literal such as 0x01ffc9a7. This
+        // is a calldata-scalar representation, enough for interfaceId checks;
+        // it is not laid back out left-aligned for a bytes4 return or field.
+        if name == "bytes4" {
+            return format!("shr(224, {})", val_expr);
+        }
     }
     val_expr.to_string()
 }
@@ -1782,6 +1817,7 @@ pub struct Ctx<'c> {
     // functions must instead assign a named return variable and leave,
     // or they'd halt execution the moment anything called them mid-body.
     pub is_entry: bool,
+    pub try_ok_var: Option<String>,
     // Declared types of parameters and locals for the function/method
     // currently being translated. Codegen runs after the semantic pass has
     // already finished (and popped all its scopes), so we can't reuse
@@ -1807,6 +1843,7 @@ impl<'c> Ctx<'c> {
         Ctx {
             self_ctx: None,
             is_entry: true,
+            try_ok_var: None,
             locals: RefCell::new(HashMap::new()),
             return_type: None,
             lock_slot,
@@ -1817,6 +1854,7 @@ impl<'c> Ctx<'c> {
         Ctx {
             self_ctx,
             is_entry: false,
+            try_ok_var: None,
             locals: RefCell::new(HashMap::new()),
             return_type: None,
             lock_slot: None,
@@ -1913,6 +1951,16 @@ pub struct EventSchema {
     // The canonical Name(type,…) string topic0 was hashed from. Two log()
     // sites that disagree on it are two different events wearing one name.
     pub signature: String,
+}
+
+fn gum_exception_helpers_src() -> String {
+    "function gum_set_exception() {
+        tstore(0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff, 1)
+    }
+    function gum_check_exception() -> has_err {
+        has_err := tload(0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+        if has_err { tstore(0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff, 0) }
+    }\n".to_string()
 }
 
 impl<'a> Translator<'a> {
@@ -2390,6 +2438,9 @@ impl<'a> Translator<'a> {
             }
             Expr::PropertyAccess { base, property } => {
                 if let Type::Primitive(class_name) = self.static_type(base, ctx) {
+                    if class_name == "Account" && property == "code" {
+                        return Type::Primitive("AccountCode".to_string());
+                    }
                     if let Some(cd) = self.type_checker().loaded_classes.get(&class_name) {
                         if let Some(f) = cd.fields.iter().find(|f| &f.name == property) {
                             return f.type_def.clone();
@@ -2698,14 +2749,21 @@ impl<'a> Translator<'a> {
                     }
                 }
             }
-            Statement::Revert { error_name, args } => {
-                let error_decl = self.type_checker().loaded_errors.get(error_name).unwrap();
+            Statement::Revert { error } => {
+                let (base, method, args) = match error {
+                    Expr::MethodCall { base, method, args } => (base, method.as_str(), args.as_slice()),
+                    Expr::PropertyAccess { base, property } => (base, property.as_str(), &[] as &[Expr]),
+                    _ => unreachable!(),
+                };
+                let Expr::Identifier(enum_name) = &**base else { unreachable!() };
+                let enum_decl = self.type_checker().loaded_enums.get(enum_name).unwrap();
+                let variant = enum_decl.variants.iter().find(|v| v.name == method).unwrap();
                 let abi_gen = AbiGenerator::new(self.type_checker());
-                let selector = abi_gen.calculate_error_selector(error_decl);
+                let selector = abi_gen.calculate_error_selector(variant);
                 let types: Vec<Type> =
-                    error_decl.parameters.iter().map(|p| p.type_def.clone()).collect();
+                    variant.parameters.iter().map(|p| p.type_def.clone()).collect();
                 self.emit_revert_data(
-                    &format!("Revert {}", error_name),
+                    &format!("Revert {}", method),
                     &selector,
                     args,
                     &types,
@@ -2739,6 +2797,36 @@ impl<'a> Translator<'a> {
                 let cond_expr = self.translate_expr(condition, ctx);
                 let mut out = format!("for {{}} {} {{}} {{\n", cond_expr);
                 for s in body {
+                    out.push_str(&self.translate_statement(&s.node, ctx));
+                }
+                out.push_str("}\n");
+                out
+            }
+            Statement::TryCatch { try_body, catch_body } => {
+                self.ensure_helper("gum_exception_helpers", gum_exception_helpers_src);
+                let try_id = self.next_literal_id();
+                let try_ok_var = format!("__try_ok_{}", try_id);
+                let mut out = format!("let {} := 1\n", try_ok_var);
+                out.push_str("for {} 1 {} {\n");
+                
+                let mut inner_ctx = Ctx {
+                    self_ctx: ctx.self_ctx,
+                    is_entry: ctx.is_entry,
+                    try_ok_var: Some(try_ok_var.clone()),
+                    locals: ctx.locals.clone(),
+                    return_type: ctx.return_type.clone(),
+                    lock_slot: ctx.lock_slot.clone(),
+                    in_constructor: ctx.in_constructor,
+                };
+                
+                for s in try_body {
+                    out.push_str(&self.translate_statement(&s.node, &inner_ctx));
+                    out.push_str(&format!("    if gum_check_exception() {{\n        {} := 0\n        break\n    }}\n", try_ok_var));
+                }
+                out.push_str("    break\n}\n");
+                
+                out.push_str(&format!("if iszero({}) {{\n", try_ok_var));
+                for s in catch_body {
                     out.push_str(&self.translate_statement(&s.node, ctx));
                 }
                 out.push_str("}\n");
@@ -2792,26 +2880,7 @@ impl<'a> Translator<'a> {
                 out
             }
             Statement::Call { target, args } => {
-                let id = self.next_literal_id();
-                let ok_var = format!("__call_ok_{}", id);
-                self.ensure_helper("gum_bubble_revert", gum_bubble_revert_helper_src);
-                let on_fail = format!("if iszero({}) {{ gum_bubble_revert() }}\n", ok_var);
-                if let Some(payload) = args.first() {
-                    let payload_expr = self.translate_expr(payload, ctx);
-                    let pv = format!("__callpayload_{}", id);
-                    let mut out = format!("let {} := {}\n", pv, payload_expr);
-                    out.push_str(&format!(
-                        "let {} := call(gas(), {}, 0, add({}, 32), mload({}), 0, 0)\n",
-                        ok_var, target, pv, pv
-                    ));
-                    out.push_str(&on_fail);
-                    out
-                } else {
-                    let mut out =
-                        format!("let {} := call(gas(), {}, 0, 0, 0, 0, 0)\n", ok_var, target);
-                    out.push_str(&on_fail);
-                    out
-                }
+                return self.extcall_wrapper_src("Interface", target, args, ctx);
             }
             Statement::Expression(expr) => {
                 if let Expr::FnCall { name, args } = expr {
@@ -2819,7 +2888,18 @@ impl<'a> Translator<'a> {
                         return self.translate_log_stmt(args, ctx);
                     }
                 }
-                format!("{}\n", self.translate_expr(expr, ctx))
+                let code = self.translate_expr(expr, ctx);
+                // A call used as a statement discards its result. Yul rejects a
+                // top-level expression that returns a value, so pop it. A void
+                // call (a method with no return type) types as "unknown" here
+                // and is left as a bare statement.
+                let discards_value = matches!(expr, Expr::MethodCall { .. } | Expr::FnCall { .. })
+                    && !matches!(self.static_type(expr, ctx), Type::Primitive(ref n) if n == "unknown");
+                if discards_value {
+                    format!("pop({})\n", code)
+                } else {
+                    format!("{}\n", code)
+                }
             }
         }
     }
@@ -3152,6 +3232,11 @@ impl<'a> Translator<'a> {
             Expr::Not(inner) => format!("iszero({})", self.translate_expr(inner, ctx)),
             Expr::ArrayLiteral(elements) => self.translate_array_literal(elements, None, ctx),
             Expr::PropertyAccess { base, property } => {
+                if let Type::Primitive(class_name) = self.static_type(base, ctx) {
+                    if class_name == "Account" && property == "code" {
+                        return self.translate_expr(base, ctx);
+                    }
+                }
                 if let Expr::Identifier(base_name) = &**base {
                     let owner = if base_name == "self" {
                         ctx.self_ctx
@@ -4225,18 +4310,27 @@ impl<'a> Translator<'a> {
     }
 
     fn assert_failure_data(&self, msg: &Expr, ctx: &Ctx) -> String {
-        if let Expr::FnCall { name, args } = msg {
-            if let Some(err) = self.type_checker().loaded_errors.get(name) {
-                let abi_gen = AbiGenerator::new(self.type_checker());
-                let selector = abi_gen.calculate_error_selector(err);
-                let types: Vec<Type> = err.parameters.iter().map(|p| p.type_def.clone()).collect();
-                return self.emit_revert_data(
-                    &format!("assert failed: {}", name),
-                    &selector,
-                    args,
-                    &types,
-                    ctx,
-                );
+        let enum_call = match msg {
+            Expr::MethodCall { base, method, args } => Some((base, method.as_str(), args.as_slice())),
+            Expr::PropertyAccess { base, property } => Some((base, property.as_str(), &[] as &[Expr])),
+            _ => None,
+        };
+        if let Some((base, method, args)) = enum_call {
+            if let Expr::Identifier(enum_name) = &**base {
+                if let Some(enum_decl) = self.type_checker().loaded_enums.get(enum_name) {
+                    if let Some(variant) = enum_decl.variants.iter().find(|v| v.name == method) {
+                        let abi_gen = AbiGenerator::new(self.type_checker());
+                        let selector = abi_gen.calculate_error_selector(variant);
+                        let types: Vec<Type> = variant.parameters.iter().map(|p| p.type_def.clone()).collect();
+                        return self.emit_revert_data(
+                            &format!("assert failed: {}", method),
+                            &selector,
+                            args,
+                            &types,
+                            ctx,
+                        );
+                    }
+                }
             }
         }
         // A bare assert message is Error(string), the selector every tool already knows.
@@ -4304,6 +4398,7 @@ impl<'a> Translator<'a> {
                 match method {
                     "saturate" => return self.translate_saturate(base, ctx),
                     "as_bytes" | "as_bits" => return self.translate_as_bytes(base, ctx),
+                    "to_string" if name.starts_with('u') => return self.translate_to_string(base, ctx),
                     _ => {}
                 }
             }
@@ -4331,10 +4426,17 @@ impl<'a> Translator<'a> {
         }
 
         if let Type::Primitive(class_name) = self.static_type(base, ctx) {
+            if class_name == "AccountCode" {
+                if method == "len" {
+                    let self_expr = self.translate_expr(base, ctx);
+                    return format!("extcodesize({})", self_expr);
+                }
+            }
             if class_name == "Account" {
                 let self_expr = self.translate_expr(base, ctx);
                 match method {
                     "balance" => return format!("balance({})", self_expr),
+
                     "pay" if args.len() == 1 => {
                         self.ensure_helper("gum_pay", gum_pay_helper_src);
                         let amt = self.translate_expr(&args[0], ctx);
@@ -4551,7 +4653,10 @@ impl<'a> Translator<'a> {
         } = base
         {
             if self.type_checker().loaded_interfaces.contains(iface_name) && cast_args.len() == 1 {
-                return self.translate_external_call(iface_name, &cast_args[0], method, args, ctx);
+                // The interface target (cast_args[0]) must lead the arg list:
+                // extcall_wrapper_src reads arg_exprs[0] as the call target and
+                // treats the rest as the method's ABI args, in order.
+                return self.extcall_wrapper_src(iface_name, method, &std::iter::once(cast_args[0].clone()).chain(args.iter().cloned()).collect::<Vec<_>>(), ctx);
             }
         }
 
@@ -4954,6 +5059,12 @@ impl<'a> Translator<'a> {
         format!("as_bytes_u256({})", val)
     }
 
+    fn translate_to_string(&self, base: &Expr, ctx: &Ctx) -> String {
+        let val = self.translate_expr(base, ctx);
+        self.ensure_helper("gum_uint_to_str", gum_uint_to_str_helper_src);
+        format!("gum_uint_to_str({})", val)
+    }
+
     fn translate_string_literal(&self, s: &str) -> String {
         let fn_name = format!("__strlit_{}", self.next_literal_id());
         let mut body = String::new();
@@ -5180,32 +5291,29 @@ impl<'a> Translator<'a> {
         }
     }
 
-    // An interface call is the same ABI layout problem as a CREATE, only the prefix differs: a 4-byte selector instead of the child's creation code, so it shares abi_arg_blob_src.
-    // The parameter and return types come from the interface declaration rather than the argument expressions, because only the declaration says whether a value is a tuple, a string, or a scalar.
-    fn translate_external_call(
+    fn extcall_wrapper_src(
         &self,
         iface_name: &str,
-        target: &Expr,
         method: &str,
-        call_args: &[Expr],
+        args: &[Expr],
         ctx: &Ctx,
     ) -> String {
-        let target_expr = self.translate_expr(target, ctx);
-        let arg_exprs: Vec<String> = call_args
-            .iter()
-            .map(|a| self.translate_expr(a, ctx))
-            .collect();
-
         let decl = self
             .type_checker()
             .loaded_classes
             .get(iface_name)
-            .and_then(|c| c.methods.iter().find(|m| m.name == method))
-            .cloned();
+            .and_then(|c| c.methods.iter().find(|m| m.name == method));
+
+        let arg_exprs: Vec<String> = args
+            .iter()
+            .map(|a| self.translate_expr(a, ctx))
+            .collect();
+        let target_expr = arg_exprs[0].clone();
+        let arg_exprs = &arg_exprs[1..];
 
         let selector = decl
             .as_ref()
-            .map(|m| self.abi_gen.calculate_selector(m))
+            .map(|m| AbiGenerator::new(self.type_checker()).calculate_selector(m))
             .unwrap_or_else(|| "0x00000000".to_string());
 
         let n = arg_exprs.len();
@@ -5218,16 +5326,24 @@ impl<'a> Translator<'a> {
 
         let ret_src = self.extcall_return_src(&decl.and_then(|m| m.return_type.clone()));
         let (size_src, write_src) = self.abi_arg_blob_src(&types);
-        let fn_name = format!("__extcall_{}_{}", iface_name, method);
+        
+        let is_try = ctx.try_ok_var.is_some();
+        let fn_name = format!("__extcall_{}{}_{}", if is_try { "try_" } else { "" }, iface_name, method);
+        
+        if is_try {
+            self.ensure_helper("gum_exception_helpers", gum_exception_helpers_src);
+        }
         self.ensure_helper("gum_bubble_revert", gum_bubble_revert_helper_src);
         self.ensure_helper(&fn_name, || {
             let mut body = String::new();
             let params: Vec<String> = (0..n).map(|i| format!("a{}", i)).collect();
+            let has_return = decl.and_then(|m| m.return_type.clone()).is_some();
             body.push_str(&format!(
-                "function {}(target{}{}) -> result {{\n",
+                "function {}(target{}{}){} {{\n",
                 fn_name,
                 if params.is_empty() { "" } else { ", " },
-                params.join(", ")
+                params.join(", "),
+                if has_return { " -> result" } else { "" }
             ));
             body.push_str(&size_src);
             body.push_str("    let ptr := allocate_memory(add(4, alen))\n");
@@ -5235,14 +5351,18 @@ impl<'a> Translator<'a> {
             body.push_str("    let blob := add(ptr, 4)\n");
             body.push_str(&write_src);
             body.push_str("    let ok := call(gas(), target, 0, ptr, add(4, alen), 0, 0)\n");
-            body.push_str("    if iszero(ok) { gum_bubble_revert() }\n");
+            if is_try {
+                body.push_str("    if iszero(ok) { gum_set_exception() leave }\n");
+            } else {
+                body.push_str("    if iszero(ok) { gum_bubble_revert() }\n");
+            }
             body.push_str(&ret_src);
             body.push_str("}\n");
             body
         });
 
         let mut call = format!("{}({}", fn_name, target_expr);
-        for a in &arg_exprs {
+        for a in arg_exprs {
             call.push_str(", ");
             call.push_str(a);
         }

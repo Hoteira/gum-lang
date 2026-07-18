@@ -244,7 +244,7 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
                     expr(m, tc, out)
                 }
             }
-            Statement::Revert { args, .. } => args.iter().for_each(|a| expr(a, tc, out)),
+            Statement::Revert { error } => expr(error, tc, out),
             Statement::Return { value } => {
                 if let Some(v) = value {
                     expr(v, tc, out)
@@ -278,6 +278,10 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
                 expr(value, tc, out);
             }
             Statement::UnsafeBlock(_) => {}
+            Statement::TryCatch { try_body, catch_body } => {
+                body(try_body, out);
+                body(catch_body, out);
+            }
         }
     }
     for m in methods {

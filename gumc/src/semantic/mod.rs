@@ -34,7 +34,6 @@ pub struct TypeChecker {
     pub symbol_table: Vec<HashMap<String, SymbolInfo>>,
     pub loaded_classes: HashMap<String, ClassDecl>,
     pub loaded_enums: HashMap<String, EnumDecl>,
-    pub loaded_errors: HashMap<String, ErrorDecl>,
     // Names registered via extern class rather than plain class.
     // Codegen needs to tell them apart: calling a method on an extern class
     // means emitting a real external CALL, whereas calling one on a
@@ -63,13 +62,26 @@ pub struct TypeChecker {
     current_return_type: Option<Type>,
 }
 
+fn has_loop(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::ForLoop { .. } | Statement::WhileLoop { .. } => true,
+        Statement::IfElse { if_body, else_body, .. } => {
+            if_body.iter().any(|s| has_loop(&s.node)) || else_body.as_ref().map_or(false, |b| b.iter().any(|s| has_loop(&s.node)))
+        }
+        Statement::TryCatch { try_body, catch_body } => {
+            try_body.iter().any(|s| has_loop(&s.node)) || catch_body.iter().any(|s| has_loop(&s.node))
+        }
+        Statement::Match { arms, .. } => arms.iter().any(|a| a.body.iter().any(|s| has_loop(&s.node))),
+        _ => false,
+    }
+}
+
 impl TypeChecker {
     pub fn new() -> Self {
         TypeChecker {
             symbol_table: vec![HashMap::new()],
             loaded_classes: HashMap::new(),
             loaded_enums: HashMap::new(),
-            loaded_errors: HashMap::new(),
             loaded_interfaces: HashSet::new(),
             has_external_calls: Cell::new(false),
             class_order: Vec::new(),
@@ -375,7 +387,7 @@ impl TypeChecker {
     pub fn enum_has_payload(&self, name: &str) -> bool {
         self.loaded_enums
             .get(name)
-            .map(|e| e.variants.iter().any(|v| v.payload.is_some()))
+            .map(|e| e.variants.iter().any(|v| !v.parameters.is_empty()))
             .unwrap_or(false)
     }
 
@@ -478,10 +490,7 @@ impl TypeChecker {
                 Declaration::Enum(e) => {
                     self.loaded_enums.insert(e.name.clone(), e.clone());
                 }
-                Declaration::Error(err) => {
-                    self.loaded_errors.insert(err.name.clone(), err.clone());
-                }
-                _ => {}
+                    _ => {}
             }
         }
 
@@ -579,9 +588,6 @@ impl TypeChecker {
                     Declaration::Class(c) => self.register_class(c),
                     Declaration::Enum(e) => {
                         self.loaded_enums.insert(e.name.clone(), e.clone());
-                    }
-                    Declaration::Error(err) => {
-                        self.loaded_errors.insert(err.name.clone(), err.clone());
                     }
                     _ => {}
                 }
@@ -743,7 +749,7 @@ impl TypeChecker {
                     Type::Primitive(n) => self
                         .loaded_enums
                         .get(n)
-                        .map(|e| e.variants.iter().any(|v| v.payload.is_some()))
+                        .map(|e| e.variants.iter().any(|v| !v.parameters.is_empty()))
                         .unwrap_or(false),
                     _ => false,
                 }
@@ -1011,23 +1017,20 @@ impl TypeChecker {
                         }
                     }
                 }
+                Statement::TryCatch { try_body, catch_body } => {
+                    let try_returns = self.check_returns(try_body, expected)?;
+                    let catch_returns = self.check_returns(catch_body, expected)?;
+                    if try_returns && catch_returns {
+                        return Ok(true);
+                    }
+                }
                 Statement::Match { expr, arms } => {
                     if !arms.is_empty() {
-                        let match_type = self.eval_type(expr).ok();
+                        let _match_type = self.eval_type(expr).ok();
                         let mut all_return = true;
                         for arm in arms {
                             self.push_scope();
-                            if let Some(payload_var) = &arm.payload_var {
-                                if let Some(Type::Primitive(enum_name)) = &match_type {
-                                    if let Some(variant) = self.loaded_enums.get(enum_name)
-                                        .and_then(|e| e.variants.iter().find(|v| v.name == arm.variant).cloned())
-                                    {
-                                        if let Some(payload_type) = variant.payload {
-                                            self.insert_symbol(payload_var.clone(), SymbolInfo { is_const: false, type_def: payload_type });
-                                        }
-                                    }
-                                }
-                            }
+                            // payload is handled during main type checking
                             let arm_returns = self.check_returns(&arm.body, expected);
                             self.pop_scope();
                             if !arm_returns? {
@@ -1221,16 +1224,29 @@ impl TypeChecker {
     // Checks a custom-error invocation (revert E(..) or assert(c, E(..)))
     // against its declaration: it must exist, and the argument count and types
     // must match.
-    fn check_error_args(&mut self, error_name: &str, args: &[Expr], error_prefix: &str) -> Result<(), String> {
-        let error_decl = self.loaded_errors.get(error_name)
-            .ok_or_else(|| format!("{} Undeclared custom error '{}'", error_prefix, error_name))?.clone();
-        if args.len() != error_decl.parameters.len() {
-            return Err(format!("{} Custom error '{}' expects {} arguments, got {}", error_prefix, error_name, error_decl.parameters.len(), args.len()));
+    fn check_enum_variant_call(&mut self, expr: &Expr, error_prefix: &str) -> Result<(), String> {
+        let (base, method, args) = match expr {
+            Expr::MethodCall { base, method, args } => (base, method, args.as_slice()),
+            Expr::PropertyAccess { base, property } => (base, property, &[] as &[Expr]),
+            _ => return Err(format!("{} Expected an enum variant call, but got something else", error_prefix)),
+        };
+        let Expr::Identifier(enum_name) = &**base else {
+            return Err(format!("{} Expected an enum variant call, but base is not an identifier", error_prefix));
+        };
+        
+        let enum_decl = self.loaded_enums.get(enum_name)
+            .ok_or_else(|| format!("{} Undeclared enum '{}'", error_prefix, enum_name))?.clone();
+            
+        let variant = enum_decl.variants.iter().find(|v| v.name == *method)
+            .ok_or_else(|| format!("{} Enum '{}' has no variant '{}'", error_prefix, enum_name, method))?;
+            
+        if args.len() != variant.parameters.len() {
+            return Err(format!("{} Enum variant '{}.{}' expects {} arguments, got {}", error_prefix, enum_name, method, variant.parameters.len(), args.len()));
         }
         for (i, arg) in args.iter().enumerate() {
             let arg_type = self.eval_type(arg)?;
-            if !self.is_assignable(&error_decl.parameters[i].type_def, &arg_type) {
-                return Err(format!("{} Type mismatch in error '{}' argument {}: expected {:?}, got {:?}", error_prefix, error_name, i + 1, error_decl.parameters[i].type_def, arg_type));
+            if !self.is_assignable(&variant.parameters[i].type_def, &arg_type) {
+                return Err(format!("{} Type mismatch in variant '{}.{}' argument {}: expected {:?}, got {:?}", error_prefix, enum_name, method, i + 1, variant.parameters[i].type_def, arg_type));
             }
         }
         Ok(())
@@ -1344,6 +1360,20 @@ impl TypeChecker {
                 for inner_stmt in body { self.verify_statement(inner_stmt)?; }
                 self.pop_scope();
             }
+            Statement::TryCatch { try_body, catch_body } => {
+                self.push_scope();
+                for inner_stmt in try_body {
+                    if has_loop(&inner_stmt.node) {
+                        return Err(format!("{} Loops (for/while) are not allowed inside a try block due to EVM limitations. Place the try block inside the loop instead.", error_prefix));
+                    }
+                    self.verify_statement(inner_stmt)?;
+                }
+                self.pop_scope();
+
+                self.push_scope();
+                for inner_stmt in catch_body { self.verify_statement(inner_stmt)?; }
+                self.pop_scope();
+            }
             Statement::Match { expr, arms } => {
                 let match_type = self.eval_type(expr)?;
                 if let Type::Primitive(enum_name) = &match_type {
@@ -1351,21 +1381,14 @@ impl TypeChecker {
                         let mut covered_variants = std::collections::HashSet::new();
                         
                         for arm in arms {
-                            let variant = enum_decl.variants.iter().find(|v| v.name == arm.variant)
+                            let _variant = enum_decl.variants.iter().find(|v| v.name == arm.variant)
                                 .ok_or_else(|| format!("{} Unknown variant '{}' for enum '{}'", error_prefix, arm.variant, enum_name))?;
                                 
                             covered_variants.insert(arm.variant.clone());
                                 
                             self.push_scope();
-                            if let Some(payload_var) = &arm.payload_var {
-                                if let Some(payload_type) = &variant.payload {
-                                    self.insert_symbol(payload_var.clone(), SymbolInfo {
-                                        is_const: false,
-                                        type_def: payload_type.clone()
-                                    });
-                                } else {
-                                    return Err(format!("{} Variant '{}' does not have a payload", error_prefix, arm.variant));
-                                }
+                            if arm.payload_var.is_some() {
+                                return Err(format!("{} Enums with parameters cannot be used in match expressions", error_prefix));
                             }
                             
                             for inner_stmt in &arm.body {
@@ -1411,11 +1434,8 @@ impl TypeChecker {
                     return Err(format!("{} assert condition must be bool, found {:?}", error_prefix, cond_type));
                 }
                 if let Some(msg) = message {
-                    if let Expr::FnCall { name, args } = msg {
-                        if self.loaded_errors.contains_key(name) {
-                            self.check_error_args(name, args, error_prefix)?;
-                            return Ok(());
-                        }
+                    if let Ok(_) = self.check_enum_variant_call(msg, error_prefix) {
+                        return Ok(());
                     }
                     let msg_type = self.eval_type(msg)?;
                     if !matches!(&msg_type, Type::Primitive(n) if n == "String" || n == "Bytes") {
@@ -1432,8 +1452,8 @@ impl TypeChecker {
             Statement::UnsafeBlock(_) => {
                 self.has_external_calls.set(true);
             }
-            Statement::Revert { error_name, args } => {
-                self.check_error_args(error_name, args, error_prefix)?;
+            Statement::Revert { error } => {
+                self.check_enum_variant_call(error, error_prefix)?;
             }
             Statement::BitwiseFlip { name, index, value } => {
                 let symbol = self.lookup_symbol(name)
@@ -1573,17 +1593,28 @@ impl TypeChecker {
                         match method.as_str() {
                             "saturate" => return Ok(base_type.clone()),
                             "as_bytes" | "as_bits" => return Ok(Type::Array(Box::new(Type::Primitive("u8".to_string())))),
+                            // Decimal itoa is unsigned only; a signed or fixed-point .to_string() would print the raw two's-complement/scaled word.
+                            "to_string" if name.starts_with('u') => return Ok(Type::Primitive("String".to_string())),
                             _ => {}
                         }
                     }
                 }
                 if let Type::Primitive(class_name) = &base_type {
+                    if class_name == "AccountCode" {
+                        if method == "len" {
+                            if !args.is_empty() {
+                                return Err("AccountCode.len() takes no arguments".to_string());
+                            }
+                            return Ok(Type::Primitive("u256".to_string()));
+                        }
+                    }
                     if self.loaded_interfaces.contains(class_name) {
                         self.has_external_calls.set(true);
                     }
                     if class_name == "Account" {
                         match method.as_str() {
                             "balance" => return Ok(Type::Primitive("u256".to_string())),
+
                             "pay" => {
                                 if args.len() != 1 {
                                     return Err("Account.pay() expects 1 argument (the amount)".to_string());
@@ -1705,16 +1736,7 @@ impl TypeChecker {
                     } else if let Some(enum_decl) = self.loaded_enums.get(class_name) {
                         for variant in &enum_decl.variants {
                             if variant.name == *method {
-                                if let Some(payload_type) = &variant.payload {
-                                    if args.len() != 1 {
-                                        return Err(format!("Enum variant '{}.{}' expects 1 payload argument", class_name, method));
-                                    }
-                                    let arg_type = self.eval_type(&args[0])?;
-                                    if !self.is_assignable(payload_type, &arg_type) {
-                                        return Err(format!("Type mismatch in enum payload for '{}.{}'. Expected {:?}, got {:?}", class_name, method, payload_type, arg_type));
-                                    }
-                                }
-                                return Ok(Type::Primitive(class_name.clone()));
+                                return Err(format!("Parameterized enum variant '{}.{}' cannot be used as a value. It must be used directly in a revert or log statement.", class_name, method));
                             }
                         }
                         return Err(format!("Variant '{}' not found on enum '{}'", method, class_name));
@@ -1771,6 +1793,9 @@ impl TypeChecker {
             Expr::PropertyAccess { base, property } => {
                 let base_type = self.eval_type(base)?;
                 if let Type::Primitive(class_name) = &base_type {
+                    if class_name == "Account" && property == "code" {
+                        return Ok(Type::Primitive("AccountCode".to_string()));
+                    }
                     if let Some(class_decl) = self.loaded_classes.get(class_name) {
                         for field in &class_decl.fields {
                             if field.name == *property {
@@ -1787,8 +1812,8 @@ impl TypeChecker {
                     } else if let Some(enum_decl) = self.loaded_enums.get(class_name) {
                         for variant in &enum_decl.variants {
                             if variant.name == *property {
-                                if variant.payload.is_some() {
-                                    return Err(format!("Enum variant '{}.{}' requires a payload", class_name, property));
+                                if !variant.parameters.is_empty() {
+                                    return Err(format!("Enum variant '{}.{}' requires arguments and cannot be used as a value", class_name, property));
                                 }
                                 return Ok(Type::Primitive(class_name.clone()));
                             }
@@ -1943,6 +1968,7 @@ fn assigns_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> 
                 || else_body.as_ref().is_some_and(|b| assigns_field(b, class_name, field))
         }
         Statement::WhileLoop { body, .. } => assigns_field(body, class_name, field),
+        Statement::TryCatch { try_body, catch_body } => assigns_field(try_body, class_name, field) || assigns_field(catch_body, class_name, field),
         Statement::ForLoop { body, .. } => assigns_field(body, class_name, field),
         Statement::Match { arms, .. } => {
             arms.iter().any(|a| assigns_field(&a.body, class_name, field))
@@ -1991,7 +2017,8 @@ fn reads_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bo
         Statement::Assignment { value, .. } => re(value),
         Statement::VarDecl { value, .. } => value.as_ref().is_some_and(re),
         Statement::Assert { condition, message } => re(condition) || message.as_ref().is_some_and(re),
-        Statement::Revert { args, .. } | Statement::Call { args, .. } => args.iter().any(re),
+        Statement::Revert { error } => re(error),
+        Statement::Call { args, .. } => args.iter().any(re),
         Statement::Return { value } => value.as_ref().is_some_and(re),
         Statement::Expression(e) | Statement::Delete { target: e } => re(e),
         Statement::BitwiseFlip { index, value, .. } => re(index) || re(value),
@@ -2001,6 +2028,7 @@ fn reads_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bo
                 || else_body.as_ref().is_some_and(|b| reads_field(b, class_name, field))
         }
         Statement::WhileLoop { condition, body } => re(condition) || reads_field(body, class_name, field),
+        Statement::TryCatch { try_body, catch_body } => reads_field(try_body, class_name, field) || reads_field(catch_body, class_name, field),
         Statement::ForLoop { iterable, body, .. } => re(iterable) || reads_field(body, class_name, field),
         Statement::Match { expr, arms } => {
             re(expr) || arms.iter().any(|a| reads_field(&a.body, class_name, field))
@@ -2020,6 +2048,9 @@ fn diverges(body: &[Spanned<Statement>]) -> bool {
         Statement::Return { .. } | Statement::Revert { .. } => true,
         Statement::IfElse { if_body, else_body, .. } => {
             diverges(if_body) && else_body.as_ref().is_some_and(|b| diverges(b))
+        }
+        Statement::TryCatch { try_body, catch_body } => {
+            diverges(try_body) && diverges(catch_body)
         }
         Statement::Match { arms, .. } => arms.iter().all(|a| diverges(&a.body)),
         _ => false,
@@ -2116,11 +2147,6 @@ fn decl_refs(d: &Declaration) -> Vec<String> {
                 collect_type_names(rt, &mut out);
             }
         }
-        Declaration::Error(e) => {
-            for p in &e.parameters {
-                collect_type_names(&p.type_def, &mut out);
-            }
-        }
         _ => {}
     }
     out
@@ -2144,7 +2170,6 @@ fn decl_name(d: &Declaration) -> Option<String> {
     match d {
         Declaration::Class(c) => Some(c.name.clone()),
         Declaration::Enum(e) => Some(e.name.clone()),
-        Declaration::Error(e) => Some(e.name.clone()),
         Declaration::Function(f) => Some(f.name.clone()),
         _ => None,
     }

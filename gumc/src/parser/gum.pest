@@ -7,7 +7,7 @@ COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 // exclusion from ident.
 keyword = @{
     ("use" | "export" | "extern" | "interface" | "contract" | "once" | "payable" | "fn" | "class" |
-     "enum" | "error" | "const" | "mut" | "var" |
+     "enum" | "const" | "mut" | "var" |
      "assert" | "revert" | "match" | "for" | "in" | "if" | "else" | "return" | "while" |
      "unsafe" | "call" | "delete" | "transient") ~ !(ASCII_ALPHANUMERIC | "_")
 }
@@ -23,7 +23,7 @@ ident = @{ !keyword ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // only matches when there's a genuine type argument list.
 type_ident = @{ !keyword ~ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 number = @{ "0x" ~ ASCII_HEX_DIGIT+ | ASCII_DIGIT+ }
-string_literal = { "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+string_literal = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 // f-strings are captured whole (including the f"..." delimiters) and split
 // into literal/interpolation segments in parser/mod.rs, which re-invokes the
 // `expr` rule on each `{...}` span. Doing the split there instead of here
@@ -33,7 +33,7 @@ fstring_literal = @{ "f\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 primitive_type = {
     "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
     "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
-    "f32" | "f64" | "bool" | "Account"
+    "f32" | "f64" | "bool" | "Account" | "bytes4"
 }
 
 // e.g. Vec(u256) or HashMap(Account, Vec(u256))
@@ -106,7 +106,7 @@ assignment = { term ~ "=" ~ expr ~ ";" }
 compound_op = { "+=" | "-=" }
 compound_assignment = { term ~ compound_op ~ expr ~ ";" }
 assert_stmt = { "assert" ~ "(" ~ expr ~ ("," ~ expr)* ~ ")" ~ ";" }
-revert_stmt = { "revert" ~ ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" ~ ";" }
+revert_stmt = { "revert" ~ expr ~ ";" }
 // The value is optional: a function with no declared return type may `return`
 // bare to exit early.
 return_stmt = { "return" ~ expr? ~ ";" }
@@ -131,8 +131,9 @@ unsafe_block = { "unsafe" ~ "{" ~ unsafe_inner ~ "}" }
 while_stmt = { "while" ~ expr ~ fn_body }
 match_arm = { ident ~ ("(" ~ ident ~ ")")? ~ fn_body }
 match_stmt = { "match" ~ expr ~ "{" ~ match_arm* ~ "}" }
+try_stmt = { "try" ~ fn_body ~ "catch" ~ fn_body }
 
-statement = { match_stmt | unsafe_block | bitwise_flip | if_stmt | for_stmt | while_stmt | var_decl | assignment | compound_assignment | assert_stmt | revert_stmt | call_stmt | delete_stmt | return_stmt | expr_stmt }
+statement = { try_stmt | match_stmt | unsafe_block | bitwise_flip | if_stmt | for_stmt | while_stmt | var_decl | assignment | compound_assignment | assert_stmt | revert_stmt | call_stmt | delete_stmt | return_stmt | expr_stmt }
 
 // Parameters
 param = { is_mut? ~ type_keyword ~ ident }
@@ -190,13 +191,11 @@ class_decl = {
   | parents? ~ "class" ~ ident ~ generic_params? ~ (class_body | ";")
 }
 
-enum_variant = { ident ~ ("(" ~ type_keyword ~ ")")? ~ ";" }
+enum_variant = { ident ~ ("(" ~ param_list? ~ ")")? ~ ";" }
 enum_decl = { "enum" ~ ident ~ "{" ~ enum_variant* ~ "}" }
 
-error_decl = { "error" ~ ident ~ "(" ~ param_list? ~ ")" ~ ";" }
-
 // Program
-declaration = { use_decl | error_decl | enum_decl | class_decl | fn_decl }
+declaration = { use_decl | enum_decl | class_decl | fn_decl }
 program = { SOI ~ declaration* ~ EOI }
 // One declaration, parsed on its own. This is what error recovery uses: the
 // source is split into top-level declarations and each is parsed separately,

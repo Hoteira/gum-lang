@@ -1,42 +1,189 @@
-use gum.defaults.Account
+use gum.defaults.hashable
 use gum.defaults.Message
+use gum.defaults.String
 
-// A core ERC721. Exercises mapping(uint256 => address) (address-valued
-// mapping), address balances, and nested operator approvals.
-contract Erc721:
-    HashMap(u256, Account) owners
-    HashMap(Account, u256) balances
-    HashMap(u256, Account) approvals
-    HashMap(Account, HashMap(Account, bool)) operator_approvals
+interface IERC721Receiver:
+    fn onERC721Received(Account operator, Account from, u256 tokenId, Bytes data) -> u256
 
-    export fn mint(Account to, u256 id):
-        assert(Erc721.owners[id] == 0, "already minted")
-        Erc721.owners[id] = to
-        Erc721.balances[to] = Erc721.balances[to] + 1
+interface IERC721:
+    fn balanceOf(Account owner) -> u256
+    fn ownerOf(u256 tokenId) -> Account
+    fn transferFrom(Account from, Account to, u256 tokenId)
+    fn safeTransferFrom(Account from, Account to, u256 tokenId, Bytes data)
+    fn approve(Account to, u256 tokenId)
+    fn setApprovalForAll(Account operator, bool approved)
+    fn getApproved(u256 tokenId) -> Account
+    fn isApprovedForAll(Account owner, Account operator) -> bool
 
-    export fn owner_of(u256 id) -> Account:
-        return Erc721.owners[id]
+enum IERC721Errors:
+        ERC721InvalidOwner(Account owner)
+        ERC721NonexistentToken(u256 tokenId)
+        ERC721IncorrectOwner(Account sender, u256 tokenId, Account owner)
+        ERC721InvalidSender(Account sender)
+        ERC721InvalidReceiver(Account receiver)
+        ERC721InsufficientApproval(Account operator, u256 tokenId)
+        ERC721InvalidApprover(Account approver)
+        ERC721InvalidOperator(Account operator)
 
-    export fn balance_of(Account who) -> u256:
-        return Erc721.balances[who]
+enum ERC721Events:
+    Transfer
+    Approval
+    ApprovalForAll
 
-    export fn approve(Account to, u256 id):
-        Erc721.approvals[id] = to
+class Context:
+    fn _msgSender() -> Account:
+        return Message.sender()
 
-    export fn get_approved(u256 id) -> Account:
-        return Erc721.approvals[id]
+[IERC721, Context]
+contract ERC721:
+    String _name
+    String _symbol
 
-    export fn set_approval_for_all(Account op, bool ok):
-        Account owner = Message.sender()
-        Erc721.operator_approvals[owner][op] = ok
+    HashMap(u256, Account) _owners
+    HashMap(Account, u256) _balances
+    HashMap(u256, Account) _tokenApprovals
+    HashMap(Account, HashMap(Account, bool)) _operatorApprovals
 
-    export fn is_approved_for_all(Account owner, Account op) -> bool:
-        return Erc721.operator_approvals[owner][op]
+    fn new():
+        ERC721._name = "MockNFT"
+        ERC721._symbol = "MNFT"
 
-    export fn transfer_from(Account from, Account to, u256 id):
-        assert(Erc721.owners[id] == from, "not owner")
-        Erc721.owners[id] = to
-        Erc721.balances[from] = Erc721.balances[from] - 1
-        Erc721.balances[to] = Erc721.balances[to] + 1
-        Erc721.approvals[id] = 0
+    export fn mint(Account to, u256 tokenId):
+        ERC721._mint(to, tokenId)
 
+    export fn name() -> String:
+        return ERC721._name
+
+    export fn symbol() -> String:
+        return ERC721._symbol
+
+    export fn tokenURI(u256 tokenId) -> String:
+        ERC721._requireOwned(tokenId)
+        String base = "https://gum.nft/"
+        return base.concat(tokenId.to_string())
+
+    export fn balanceOf(Account owner) -> u256:
+        if owner == 0:
+            revert IERC721Errors.ERC721InvalidOwner(0)
+        return ERC721._balances[owner]
+
+    export fn ownerOf(u256 tokenId) -> Account:
+        Account owner = ERC721._requireOwned(tokenId)
+        return owner
+
+    export fn transferFrom(Account from, Account to, u256 tokenId):
+        if to == 0:
+            revert IERC721Errors.ERC721InvalidReceiver(0)
+        
+        Account previousOwner = ERC721._update(to, tokenId, ERC721.Context._msgSender())
+        if previousOwner != from:
+            revert IERC721Errors.ERC721IncorrectOwner(from, tokenId, previousOwner)
+
+    export fn safeTransferFrom(Account from, Account to, u256 tokenId, Bytes data):
+        ERC721.transferFrom(from, to, tokenId)
+        ERC721._checkOnERC721Received(from, to, tokenId, data)
+
+    export fn approve(Account to, u256 tokenId):
+        ERC721._approve(to, tokenId, ERC721.Context._msgSender())
+
+    export fn setApprovalForAll(Account operator, bool approved):
+        ERC721._setApprovalForAll(ERC721.Context._msgSender(), operator, approved)
+
+    export fn getApproved(u256 tokenId) -> Account:
+        ERC721._requireOwned(tokenId)
+        return ERC721._tokenApprovals[tokenId]
+
+    export fn isApprovedForAll(Account owner, Account operator) -> bool:
+        return ERC721._operatorApprovals[owner][operator]
+
+    export fn supportsInterface(bytes4 interfaceId) -> bool:
+        if interfaceId == 0x01ffc9a7:
+            return true
+        if interfaceId == 0x80ac58cd:
+            return true
+        if interfaceId == 0x5b5e139f:
+            return true
+        return false
+
+    fn _ownerOf(u256 tokenId) -> Account:
+        return ERC721._owners[tokenId]
+
+    fn _requireOwned(u256 tokenId) -> Account:
+        Account owner = ERC721._ownerOf(tokenId)
+        if owner == 0:
+            revert IERC721Errors.ERC721NonexistentToken(tokenId)
+        return owner
+
+    fn _update(Account to, u256 tokenId, Account auth) -> Account:
+        Account from = ERC721._ownerOf(tokenId)
+
+        if auth != 0:
+            ERC721._checkAuthorized(from, auth, tokenId)
+        
+        if from != 0:
+            ERC721._approveWithEmit(0, tokenId, 0, false)
+            ERC721._balances[from] = ERC721._balances[from] - 1
+
+        if to != 0:
+            ERC721._balances[to] = ERC721._balances[to] + 1
+
+        ERC721._owners[tokenId] = to
+
+        log(ERC721Events.Transfer, indexed(from), indexed(to), indexed(tokenId))
+        return from
+
+    fn _mint(Account to, u256 tokenId):
+        if to == 0:
+            revert IERC721Errors.ERC721InvalidReceiver(0)
+        Account previousOwner = ERC721._update(to, tokenId, 0)
+        if previousOwner != 0:
+            revert IERC721Errors.ERC721InvalidSender(0)
+
+    fn _burn(u256 tokenId):
+        Account previousOwner = ERC721._update(0, tokenId, 0)
+        if previousOwner == 0:
+            revert IERC721Errors.ERC721NonexistentToken(tokenId)
+
+    fn _checkAuthorized(Account owner, Account spender, u256 tokenId):
+        if !ERC721._isAuthorized(owner, spender, tokenId):
+            if owner == 0:
+                revert IERC721Errors.ERC721NonexistentToken(tokenId)
+            else:
+                revert IERC721Errors.ERC721InsufficientApproval(spender, tokenId)
+
+    fn _isAuthorized(Account owner, Account spender, u256 tokenId) -> bool:
+        if spender != 0:
+            if owner == spender:
+                return true
+            if ERC721.isApprovedForAll(owner, spender):
+                return true
+            if ERC721.getApproved(tokenId) == spender:
+                return true
+        return false
+
+    fn _approve(Account to, u256 tokenId, Account auth):
+        ERC721._approveWithEmit(to, tokenId, auth, true)
+
+    fn _approveWithEmit(Account to, u256 tokenId, Account auth, bool emitEvent):
+        if emitEvent || auth != 0:
+            Account owner = ERC721._requireOwned(tokenId)
+            if auth != 0 && auth != owner && !ERC721.isApprovedForAll(owner, auth):
+                revert IERC721Errors.ERC721InvalidApprover(auth)
+            if emitEvent:
+                log(ERC721Events.Approval, indexed(owner), indexed(to), indexed(tokenId))
+        ERC721._tokenApprovals[tokenId] = to
+
+    fn _setApprovalForAll(Account owner, Account operator, bool approved):
+        if operator == 0:
+            revert IERC721Errors.ERC721InvalidOperator(operator)
+        ERC721._operatorApprovals[owner][operator] = approved
+        log(ERC721Events.ApprovalForAll, indexed(owner), indexed(operator), approved)
+
+    fn _checkOnERC721Received(Account from, Account to, u256 tokenId, Bytes data):
+        if to.code.len() > 0:
+            try:
+                u256 retval = IERC721Receiver(to).onERC721Received(ERC721.Context._msgSender(), from, tokenId, data)
+                if retval != 0x150b7a02:
+                    revert IERC721Errors.ERC721InvalidReceiver(to)
+            catch:
+                revert IERC721Errors.ERC721InvalidReceiver(to)

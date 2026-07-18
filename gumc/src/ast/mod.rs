@@ -8,7 +8,6 @@ pub enum Declaration {
     Use(UseDecl),
     Class(ClassDecl),
     Enum(EnumDecl),
-    Error(ErrorDecl),
     Function(FnDecl),
 }
 
@@ -20,12 +19,6 @@ pub struct EnumDecl {
 
 #[derive(Debug, Clone)]
 pub struct EnumVariant {
-    pub name: String,
-    pub payload: Option<Type>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ErrorDecl {
     pub name: String,
     pub parameters: Vec<Parameter>,
 }
@@ -101,7 +94,7 @@ pub enum Statement {
     // assert(cond) or assert(cond, msg), where msg is a string (→ the
     // standard Error(string) revert) or a custom-error call (→ that error).
     Assert { condition: Expr, message: Option<Expr> },
-    Revert { error_name: String, args: Vec<Expr> },
+    Revert { error: Expr },
     // delete x, reset an lvalue to its type's zero value. For most types
     // that is a plain store of 0; a dynamic array clears its elements and
     // length, a storage string releases its data slots, a struct zeroes every
@@ -113,6 +106,7 @@ pub enum Statement {
     IfElse { condition: Expr, if_body: Vec<Spanned<Statement>>, else_body: Option<Vec<Spanned<Statement>>> },
     ForLoop { iterator: String, iterable: Expr, body: Vec<Spanned<Statement>> },
     WhileLoop { condition: Expr, body: Vec<Spanned<Statement>> },
+    TryCatch { try_body: Vec<Spanned<Statement>>, catch_body: Vec<Spanned<Statement>> },
     Match { expr: Expr, arms: Vec<MatchArm> },
     Expression(Expr),
     Call { target: String, args: Vec<Expr> }, // Low-level external contract call, e.g. call target(args)

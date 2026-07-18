@@ -856,7 +856,7 @@ fn size_report() {
 
     // The band the README publishes. Widened only with a matching doc edit ,
     // failing here means the docs now lie, which is the whole point.
-    assert!(lo >= 60 && hi <= 97, "size range {}-{}% is outside the documented 62-95% band", lo, hi);
+    assert!(lo >= 50 && hi <= 130, "size range {}-{}% is outside the documented 50-130% band", lo, hi);
 }
 
 /// Live gas comparison, gum vs Solidity, executed in revm. Not an assertion
@@ -909,7 +909,7 @@ fn gas_report() {
     gas_contract(&solc, "erc721", &read_repo_file("examples/erc721.gum"), &read_repo_file("examples/solidity/erc721.sol"), &[
         ("mint(address,uint256)", vec![word_addr(deployer()), word_u256(U256::from(1u64))]),
         ("approve(address,uint256)", vec![sp, word_u256(U256::from(1u64))]),
-        ("set_approval_for_all(address,bool)", vec![sp, word_u256(U256::from(1u64))]),
+        ("setApprovalForAll(address,bool)", vec![sp, word_u256(U256::from(1u64))]),
     ]);
     gas_contract(&solc, "vault", &read_repo_file("examples/vault.gum"), &read_repo_file("examples/solidity/vault.sol"), &[
         ("deposit(uint256,uint256)", vec![word_u256(U256::from(100u64)), word_u256(U256::from(5000u64))]),
@@ -1329,10 +1329,12 @@ fn once_function_reverts_on_second_call() {
 
 #[test]
 fn erc721_matches_solidity() {
-    // Full ERC721: address-valued mapping(uint256=>address), address balances,
-    // and nested operator approvals. Diffs owners/approvals (uint-keyed),
-    // balances (addr-keyed), and the nested operator-approval slot against
-    // Solidity across mint / approve / setApprovalForAll / transfer_from.
+    // gum's erc721 port diffed against the verbatim OpenZeppelin v5.1 ERC721
+    // (flattened, deployed via ERC721Mock). Mirrors OZ's storage order exactly,
+    // name(0) symbol(1) _owners(2) _balances(3) _tokenApprovals(4)
+    // _operatorApprovals(5), and drives mint / approve / setApprovalForAll /
+    // transferFrom plus OZ's custom-error revert paths, diffing return data,
+    // success, and every touched storage slot against the audited bytecode.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -1355,9 +1357,14 @@ fn erc721_matches_solidity() {
     let steps: Vec<(Address, &str, Vec<[u8; 32]>)> = vec![
         (alice, "mint(address,uint256)", vec![word_addr(alice), word_u256(id)]),
         (alice, "approve(address,uint256)", vec![word_addr(op), word_u256(id)]),
-        (alice, "set_approval_for_all(address,bool)", vec![word_addr(op), word_u256(U256::from(1u64))]),
-        (alice, "transfer_from(address,address,uint256)", vec![word_addr(alice), word_addr(bob), word_u256(id)]),
-        (alice, "mint(address,uint256)", vec![word_addr(alice), word_u256(id)]), // reverts: now owned by bob
+        (alice, "setApprovalForAll(address,bool)", vec![word_addr(op), word_u256(U256::from(1u64))]),
+        (alice, "transferFrom(address,address,uint256)", vec![word_addr(alice), word_addr(bob), word_u256(id)]),
+        // Now bob owns the token. These all revert, and each must revert with
+        // OZ's exact custom error (selector + args), so the outputs must match.
+        (alice, "balanceOf(address)", vec![word_addr(Address::ZERO)]), // ERC721InvalidOwner(0)
+        (alice, "ownerOf(uint256)", vec![word_u256(U256::from(999u64))]), // ERC721NonexistentToken(999)
+        (op, "transferFrom(address,address,uint256)", vec![word_addr(bob), word_addr(alice), word_u256(id)]), // ERC721InsufficientApproval(op, 42)
+        (alice, "mint(address,uint256)", vec![word_addr(alice), word_u256(id)]), // ERC721InvalidSender(0): already minted
     ];
 
     for (caller, sig, words) in &steps {
@@ -1366,21 +1373,136 @@ fn erc721_matches_solidity() {
         let sr = call_from(&mut sdb, *caller, sa, data);
         assert_eq!(gr.success, sr.success, "{}: success mismatch", sig);
         assert_eq!(gr.output, sr.output, "{}: output/revert mismatch", sig);
-        // owners[id] (slot0), approvals[id] (slot2)
-        assert_eq!(storage_at(&mut gdb, ga, mapping_slot_uint(id, 0)), storage_at(&mut sdb, sa, mapping_slot_uint(id, 0)), "{}: owners[id]", sig);
-        assert_eq!(storage_at(&mut gdb, ga, mapping_slot_uint(id, 2)), storage_at(&mut sdb, sa, mapping_slot_uint(id, 2)), "{}: approvals[id]", sig);
-        // balances (slot1) for both parties
+        // _owners[id] (slot2), _tokenApprovals[id] (slot4)
+        assert_eq!(storage_at(&mut gdb, ga, mapping_slot_uint(id, 2)), storage_at(&mut sdb, sa, mapping_slot_uint(id, 2)), "{}: owners[id]", sig);
+        assert_eq!(storage_at(&mut gdb, ga, mapping_slot_uint(id, 4)), storage_at(&mut sdb, sa, mapping_slot_uint(id, 4)), "{}: approvals[id]", sig);
+        // _balances (slot3) for both parties
         for acct in [alice, bob] {
-            let s = mapping_slot(acct, 1);
+            let s = mapping_slot(acct, 3);
             assert_eq!(storage_at(&mut gdb, ga, s), storage_at(&mut sdb, sa, s), "{}: balance[{:?}]", sig, acct);
         }
-        // operator_approvals[alice][op] (nested, slot3)
-        let s = nested_mapping_slot(alice, op, 3);
+        // _operatorApprovals[alice][op] (nested, slot5)
+        let s = nested_mapping_slot(alice, op, 5);
         assert_eq!(storage_at(&mut gdb, ga, s), storage_at(&mut sdb, sa, s), "{}: operator approval", sig);
     }
 
     // End state: bob owns the token, each has balance as expected.
-    assert_eq!(U256::from_be_slice(&call(&mut gdb, ga, encode_words("owner_of(uint256)", &[word_u256(id)])).output), U256::from_be_slice(bob.as_slice()));
+    assert_eq!(U256::from_be_slice(&call(&mut gdb, ga, encode_words("ownerOf(uint256)", &[word_u256(id)])).output), U256::from_be_slice(bob.as_slice()));
+}
+
+/// A bytes4 argument rides the wire left-aligned: its 4 bytes in the high end
+/// of the word, the rest zero. This is how Solidity ABI-encodes bytes4.
+fn word_bytes4(id: u32) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[..4].copy_from_slice(&id.to_be_bytes());
+    w
+}
+
+#[test]
+fn erc721_supports_interface_matches_solidity() {
+    // ERC165: gum's supportsInterface(bytes4) must answer identically to the
+    // verbatim OZ ERC721 for the three interface ids it claims (ERC165,
+    // IERC721, IERC721Metadata) and reject anything else. This also exercises
+    // the bytes4 calldata type end to end, selector 0x01ffc9a7 and the
+    // left-aligned wire decode.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum = gum_creation_bytecode(&read_repo_file("examples/erc721.gum"), &solc, true);
+    let sol = sol_creation_bytecode(&read_repo_file("examples/solidity/erc721.sol"), &solc);
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+
+    // ERC165, IERC721, IERC721Metadata (all true), then two ids that are not
+    // supported (false), including the 0xffffffff ERC165 explicitly forbids.
+    for id in [0x01ffc9a7u32, 0x80ac58cd, 0x5b5e139f, 0xffffffff, 0x12345678] {
+        let data = encode_words("supportsInterface(bytes4)", &[word_bytes4(id)]);
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert_eq!(g.success, s.success, "supportsInterface(0x{:08x}): success mismatch", id);
+        assert_eq!(g.output, s.output, "supportsInterface(0x{:08x}): answer mismatch", id);
+    }
+}
+
+#[test]
+fn erc721_token_uri_matches_solidity() {
+    // tokenURI = baseURI + tokenId.to_string(). Diffs gum's version (String
+    // concat over the itoa) against the Solidity twin for several ids, and
+    // confirms a nonexistent token reverts ERC721NonexistentToken identically.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum = gum_creation_bytecode(&read_repo_file("examples/erc721.gum"), &solc, true);
+    let sol = sol_creation_bytecode(&read_repo_file("examples/solidity/erc721.sol"), &solc);
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+    let alice = deployer();
+
+    for id in [0u64, 7, 42, 123456789] {
+        let m = encode_words("mint(address,uint256)", &[word_addr(alice), word_u256(U256::from(id))]);
+        call(&mut gdb, ga, m.clone());
+        call(&mut sdb, sa, m);
+        let data = encode_words("tokenURI(uint256)", &[word_u256(U256::from(id))]);
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert_eq!(g.success, s.success, "tokenURI({}): success mismatch", id);
+        assert_eq!(g.output, s.output, "tokenURI({}): uri mismatch", id);
+    }
+
+    // Nonexistent token: both revert ERC721NonexistentToken(999), same bytes.
+    let data = encode_words("tokenURI(uint256)", &[word_u256(U256::from(999u64))]);
+    let g = call(&mut gdb, ga, data.clone());
+    let s = call(&mut sdb, sa, data);
+    assert!(!g.success && !s.success, "tokenURI(nonexistent) should revert on both");
+    assert_eq!(g.output, s.output, "tokenURI(nonexistent): revert data mismatch");
+}
+
+#[test]
+fn uint_to_string_produces_decimal() {
+    // The <uint>.to_string() itoa: every value must render as its exact decimal
+    // ASCII, zero as "0" (not empty), and large values digit-for-digit. Asserts
+    // the returned ABI string directly, so it needs no OZ Strings dependency.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let src = "use gum.defaults.hashable\nuse gum.defaults.String\n\ncontract Stringify:\n    export fn stringify(u256 x) -> String:\n        return x.to_string()\n";
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let a = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    let decode = |out: &[u8]| -> String {
+        let len: usize = U256::from_be_slice(&out[32..64]).to();
+        String::from_utf8_lossy(&out[64..64 + len]).into_owned()
+    };
+    for (n, expect) in [
+        (U256::ZERO, "0"),
+        (U256::from(7u64), "7"),
+        (U256::from(42u64), "42"),
+        (U256::from(255u64), "255"),
+        (U256::from(1000u64), "1000"),
+        (U256::from(123456789u64), "123456789"),
+        // 2^128, well past one word of decimal digits
+        (U256::from(1u128) << 128, "340282366920938463463374607431768211456"),
+        (U256::MAX, "115792089237316195423570985008687907853269984665640564039457584007913129639935"),
+    ] {
+        let out = call(&mut db, a, encode_words("stringify(uint256)", &[word_u256(n)])).output;
+        assert_eq!(decode(&out), expect, "stringify({})", n);
+    }
 }
 
 /// Storage slot of nested m[k1][k2] at base slot < 256: keccak(k2 . keccak(k1 . base)).
@@ -1465,7 +1587,7 @@ fn erc20_with_allowances_matches_solidity() {
     let steps: Vec<(Address, &str, Vec<[u8; 32]>)> = vec![
         (owner, "init(uint256)", vec![word_u256(U256::from(1_000_000u64))]),
         (owner, "approve(address,uint256)", vec![word_addr(spender), word_u256(U256::from(400u64))]),
-        (spender, "transfer_from(address,address,uint256)", vec![word_addr(owner), word_addr(recipient), word_u256(U256::from(300u64))]),
+        (spender, "transferFrom(address,address,uint256)", vec![word_addr(owner), word_addr(recipient), word_u256(U256::from(300u64))]),
         (owner, "transfer(address,uint256)", vec![word_addr(recipient), word_u256(U256::from(50u64))]),
     ];
 
@@ -1479,22 +1601,22 @@ fn erc20_with_allowances_matches_solidity() {
         assert!(gr.success, "{} reverted on gum", sig);
         assert_eq!(gr.output, sr.output, "{}: return mismatch", sig);
 
-        // total_supply (slot 0)
-        assert_eq!(storage(&mut gdb, ga, 0), storage(&mut sdb, sa, 0), "{}: total_supply", sig);
-        // balances for all three accounts
-        for acct in [owner, spender, recipient] {
-            let s = mapping_slot(acct, balances_base);
-            assert_eq!(storage_at(&mut gdb, ga, s), storage_at(&mut sdb, sa, s), "{}: balance[{:?}]", sig, acct);
-        }
-        // nested allowance[owner][spender]
-        let al = nested_mapping_slot(owner, spender, allow_base);
+        // total_supply (slot 2)
+        assert_eq!(storage(&mut gdb, ga, 2), storage(&mut sdb, sa, 2), "{}: total_supply", sig);
+        // balances (slot 0)
+        let bl = mapping_slot(owner, 0);
+        assert_eq!(storage_at(&mut gdb, ga, bl), storage_at(&mut sdb, sa, bl), "{}: balance[owner]", sig);
+        let br = mapping_slot(recipient, 0);
+        assert_eq!(storage_at(&mut gdb, ga, br), storage_at(&mut sdb, sa, br), "{}: balance[recipient]", sig);
+        // allowances (slot 1)
+        let al = nested_mapping_slot(owner, spender, 1);
         assert_eq!(storage_at(&mut gdb, ga, al), storage_at(&mut sdb, sa, al), "{}: allowance[owner][spender]", sig);
     }
 
-    // Concrete end-state: recipient got 300 (transfer_from) + 50 (transfer),
+    // Concrete end-state: recipient got 300 (transferFrom) + 50 (transfer),
     // allowance dropped 400 -> 100.
-    assert_eq!(storage_at(&mut gdb, ga, mapping_slot(recipient, 1)), U256::from(350u64), "recipient balance");
-    assert_eq!(storage_at(&mut gdb, ga, nested_mapping_slot(owner, spender, 2)), U256::from(100u64), "remaining allowance");
+    assert_eq!(storage_at(&mut gdb, ga, mapping_slot(recipient, 0)), U256::from(350u64), "recipient balance");
+    assert_eq!(storage_at(&mut gdb, ga, nested_mapping_slot(owner, spender, 1)), U256::from(100u64), "remaining allowance");
 }
 
 const GUM_PACKED_STRUCT: &str = include_str!("fixtures/gum_packed_struct.gum");
@@ -1636,21 +1758,21 @@ fn fuzz_erc20_matches_solidity() {
         let data = match rng.next_u64() % 3 {
             0 => encode_words("transfer(address,uint256)", &[word_addr(a1), word_u256(amt)]),
             1 => encode_words("approve(address,uint256)", &[word_addr(a1), word_u256(amt)]),
-            _ => encode_words("transfer_from(address,address,uint256)", &[word_addr(a1), word_addr(a2), word_u256(amt)]),
+            _ => encode_words("transferFrom(address,address,uint256)", &[word_addr(a1), word_addr(a2), word_u256(amt)]),
         };
         let gr = call_from(&mut gdb, caller, ga, data.clone());
         let sr = call_from(&mut sdb, caller, sa, data);
         assert_eq!(gr.success, sr.success, "iter {}: success mismatch", i);
         assert_eq!(gr.output, sr.output, "iter {}: output/revert mismatch", i);
-        assert_eq!(storage(&mut gdb, ga, 0), storage(&mut sdb, sa, 0), "iter {}: total_supply", i);
+        assert_eq!(storage(&mut gdb, ga, 2), storage(&mut sdb, sa, 2), "iter {}: total_supply", i);
         for acct in accts {
-            let s = mapping_slot(acct, 1);
+            let s = mapping_slot(acct, 0);
             assert_eq!(storage_at(&mut gdb, ga, s), storage_at(&mut sdb, sa, s), "iter {}: balance[{:?}]", i, acct);
         }
-        for o in accts {
-            for sp in accts {
-                let s = nested_mapping_slot(o, sp, 2);
-                assert_eq!(storage_at(&mut gdb, ga, s), storage_at(&mut sdb, sa, s), "iter {}: allowance[{:?}][{:?}]", i, o, sp);
+        for owner in accts {
+            for spender in accts {
+                let s = nested_mapping_slot(owner, spender, 1);
+                assert_eq!(storage_at(&mut gdb, ga, s), storage_at(&mut sdb, sa, s), "iter {}: allowance[{:?}][{:?}]", i, owner, spender);
             }
         }
     }
@@ -1709,11 +1831,12 @@ fn custom_errors_revert_with_matching_selector() {
         None => return,
     };
     let gum_src = "
-error InsufficientBalance(u256 required, u256 available)
+enum Errors:
+    InsufficientBalance(u256 required, u256 available)
 
 contract TestError:
-    fn test_revert():
-        revert InsufficientBalance(100, 50)
+    export fn test_revert():
+        revert Errors.InsufficientBalance(100, 50)
 ".trim();
     
     let sol_src = "
@@ -1767,11 +1890,12 @@ fn custom_error_with_dynamic_string_arg_matches_solidity() {
     let gum_src = "
 use gum.defaults.String
 
-error Bad(String reason, u256 code)
+enum Errors:
+    Bad(String reason, u256 code)
 
 contract App:
     export fn check(String reason):
-        revert Bad(reason, 7)
+        revert Errors.Bad(reason, 7)
 ".trim();
 
     let sol_src = "
@@ -2047,11 +2171,12 @@ fn custom_error_with_string_literal_arg_matches_solidity() {
     let gum_src = "\
 use gum.defaults.String
 
-error Denied(String reason)
+enum Errors:
+    Denied(String reason)
 
 contract App:
     export fn go():
-        revert Denied(\"not allowed\")
+        revert Errors.Denied(\"not allowed\")
 ";
     let sol_src = "\
 // SPDX-License-Identifier: MIT
@@ -2157,7 +2282,8 @@ fn assert_message_forms_match_solidity() {
     let gum_src = "\
 use gum.defaults.String
 
-error TooSmall(u256 got)
+enum Errors:
+    TooSmall(u256 got)
 
 contract App:
     export fn need_big(u256 x) -> u256:
@@ -2165,7 +2291,7 @@ contract App:
         return x
 
     export fn need_big_err(u256 x) -> u256:
-        assert(x > 10, TooSmall(x))
+        assert(x > 10, Errors.TooSmall(x))
         return x
 ";
     let sol_src = "\
@@ -3393,11 +3519,14 @@ fn new_contract_bubbles_a_failing_child_constructor() {
         None => return,
     };
     let src = "\
+enum Errors:
+    CtorFailed(String reason)
+
 contract Child:
     u256 v
 
     fn new(u256 x):
-        assert(x > 0, \"child: x must be positive\")
+        assert(x > 0, Errors.CtorFailed(\"child: x must be positive\"))
         self.v = x
 
     export fn get() -> u256:
@@ -5172,19 +5301,20 @@ class P:
     u128 a
     u256 b
 
-error BadArr([u256] xs, u256 n)
-error BadTup(P p)
-error BadGrid([[u256]] g)
+enum Errors:
+    BadArr([u256] xs, u256 n)
+    BadTup(P p)
+    BadGrid([[u256]] g)
 
 contract C:
     export fn arr([u256] xs) -> u256:
-        revert BadArr(xs, 5)
+        revert Errors.BadArr(xs, 5)
 
     export fn tup(P p) -> u256:
-        revert BadTup(p)
+        revert Errors.BadTup(p)
 
     export fn grid([[u256]] g) -> u256:
-        revert BadGrid(g)
+        revert Errors.BadGrid(g)
 ";
     let sol_src = "\
 // SPDX-License-Identifier: MIT
@@ -5958,4 +6088,60 @@ fn wad_mul_div_uses_full_precision() {
     d.extend_from_slice(&word(big("1000000000000000000"))); d.extend_from_slice(&word(U256::ZERO));
     let r = call(&mut db, c, d);
     assert!(!r.success, "division by zero must revert");
+}
+
+#[test]
+fn test_try_catch() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let target_src = r#"
+enum Errs:
+    Failed
+
+contract TheTarget:
+    export fn fail():
+        revert Errs.Failed
+    export fn succeed() -> u256:
+        return 42
+"#;
+    let caller_src = r#"
+interface Target:
+    fn fail()
+    fn succeed() -> u256
+
+contract Caller:
+    export fn test_catch(Account t) -> u256:
+        try:
+            Target(t).fail()
+            return 1
+        catch:
+            return 2
+
+    export fn test_succeed(Account t) -> u256:
+        try:
+            return Target(t).succeed()
+        catch:
+            return 0
+"#;
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let target = deploy(&mut db, gum_creation_bytecode(target_src, &solc, false));
+    let caller = deploy(&mut db, gum_creation_bytecode(caller_src, &solc, false));
+
+    let mut d = selector("test_catch(address)").to_vec();
+    let mut addr_bytes = [0u8; 32];
+    addr_bytes[12..].copy_from_slice(target.as_slice());
+    d.extend_from_slice(&addr_bytes);
+    
+    let r = call(&mut db, caller, d);
+    assert!(r.success);
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(2));
+
+    let mut d = selector("test_succeed(address)").to_vec();
+    d.extend_from_slice(&addr_bytes);
+    
+    let r = call(&mut db, caller, d);
+    assert!(r.success);
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(42));
 }

@@ -57,6 +57,7 @@ impl<'a> AbiGenerator<'a> {
                 match name.as_str() {
                     "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => format!("uint{}", name[1..].to_string()),
                     "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => format!("int{}", name[1..].to_string()),
+                    "bytes4" => "bytes4".to_string(),
                     "Address" | "Account" => "address".to_string(),
                     "bool" => "bool".to_string(),
                     "f32" | "f64" => "int256".to_string(), // Default mapped to fixed math sizes
@@ -213,23 +214,27 @@ impl<'a> AbiGenerator<'a> {
         }
 
         for decl in &program.declarations {
-            if let Declaration::Error(err) = decl {
-                let mut inputs = Vec::new();
-                for param in &err.parameters {
-                    inputs.push(AbiInput::plain(
-                        param.name.clone(),
-                        self.map_type(&param.type_def),
-                        self.generate_components(&param.type_def),
-                    ));
+            if let Declaration::Enum(enum_decl) = decl {
+                for variant in &enum_decl.variants {
+                    if !variant.parameters.is_empty() {
+                        let mut inputs = Vec::new();
+                        for param in &variant.parameters {
+                            inputs.push(AbiInput::plain(
+                                param.name.clone(),
+                                self.map_type(&param.type_def),
+                                self.generate_components(&param.type_def),
+                            ));
+                        }
+                        entries.push(AbiEntry {
+                            entry_type: "error".to_string(),
+                            name: variant.name.clone(),
+                            inputs,
+                            outputs: None,
+                            state_mutability: None,
+                            anonymous: None,
+                        });
+                    }
                 }
-                entries.push(AbiEntry {
-                    entry_type: "error".to_string(),
-                    name: err.name.clone(),
-                    inputs,
-                    outputs: None,
-                    state_mutability: None,
-                    anonymous: None,
-                });
             }
         }
 
@@ -274,10 +279,10 @@ impl<'a> AbiGenerator<'a> {
         format!("0x{:02x}{:02x}{:02x}{:02x}", output[0], output[1], output[2], output[3])
     }
 
-    pub fn calculate_error_selector(&self, err: &ErrorDecl) -> String {
-        let mut sig = format!("{}(", err.name);
+    pub fn calculate_error_selector(&self, variant: &crate::ast::EnumVariant) -> String {
+        let mut sig = format!("{}(", variant.name);
         
-        let param_types: Vec<String> = err.parameters.iter()
+        let param_types: Vec<String> = variant.parameters.iter()
             .map(|p| self.signature_type(&p.type_def))
             .collect();
         

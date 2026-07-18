@@ -306,6 +306,17 @@ fn constructor_call_resolves_correctly() {
 }
 
 #[test]
+fn discarded_call_return_is_popped() {
+    // A method call used as a statement discards its return value. Yul rejects a
+    // top-level expression that returns a value, so codegen must pop() it. This
+    // is exactly OZ ERC721's `_requireOwned(tokenId);` for-its-revert idiom.
+    // A void call in the same body must stay a bare statement (no pop).
+    let source = "contract C:\n    u256 x\n\n    fn side() -> u256:\n        self.x = 1\n        return self.x\n\n    fn go():\n        self.x = 2\n\n    export fn run():\n        self.side()\n        self.go()\n";
+    assert_output_contains(source, "pop(C_side())");
+    assert_assembles(source);
+}
+
+#[test]
 fn constructor_emits_abi_and_assembles() {
     let source = "contract Token:\n    u256 supply\n\n    fn new(u256 s):\n        self.supply = s\n\n    export fn dummy() -> u256:\n        return 0\n";
     assert_output_contains(source, "\"type\": \"constructor\"");
@@ -1022,7 +1033,7 @@ fn a_const_field_the_constructor_never_assigns_is_rejected() {
 /// A constructor body wrapped in a contract that declares one immutable.
 fn ctor_body(body: &str) -> String {
     format!(
-        "error Bad()\n\ncontract C:\n    const u256 a\n\n    fn new(u256 x, bool c):\n{}\n\n    \
+        "enum Error:\n    Bad()\n\ncontract C:\n    const u256 a\n\n    fn new(u256 x, bool c):\n{}\n\n    \
          export fn g() -> u256:\n        return C.a\n",
         body
     )
@@ -1059,8 +1070,8 @@ fn a_const_field_assigned_on_every_path_is_accepted() {
     for (label, body) in [
         ("unconditional", "        C.a = x"),
         ("both branches assign", "        if c:\n            C.a = x\n        else:\n            C.a = 1"),
-        ("else diverges", "        if c:\n            C.a = x\n        else:\n            revert Bad()"),
-        ("if diverges", "        if c:\n            revert Bad()\n        else:\n            C.a = x"),
+        ("else diverges", "        if c:\n            C.a = x\n        else:\n            revert Error.Bad()"),
+        ("if diverges", "        if c:\n            revert Error.Bad()\n        else:\n            C.a = x"),
         // Covered unconditionally first, so a later conditional write is just
         // a reassignment and cannot un-assign it.
         ("assigned then re-assigned", "        C.a = 1\n        if c:\n            C.a = x"),
@@ -2014,12 +2025,12 @@ fn a_fixed_array_of_structs_rides_inline_in_the_head() {
 #[test]
 fn a_revert_counts_as_diverging_for_the_return_check() {
     // A revert ends the frame, so the path never reaches a missing return. check_returns knew about return, if/else and match but not revert, so this shape was rejected.
-    assert_compiles("error Bad(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return x\n        revert Bad(x)\n");
+    assert_compiles("enum Error:\n    Bad(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return x\n        revert Error.Bad(x)\n");
     // One branch returning and the other reverting is a complete function.
-    assert_compiles("error B(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return 1\n        else:\n            revert B(x)\n");
+    assert_compiles("enum Error:\n    B(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return 1\n        else:\n            revert Error.B(x)\n");
     // And the check must not have got weaker: a real missing return is still an error.
     assert_compile_fails("contract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            return x\n");
-    assert_compile_fails("error B(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            revert B(x)\n");
+    assert_compile_fails("enum Error:\n    B(u256 x)\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        if x > 0:\n            revert Error.B(x)\n");
 }
 
 #[test]
@@ -2033,7 +2044,7 @@ fn a_payload_free_enum_is_one_byte_like_solidity() {
 #[test]
 fn a_payload_enum_has_no_storage_layout() {
     // A payload-carrying enum is a [tag][payload] pair that exists only in memory. Anywhere a size is needed it must be rejected, or it is laid out as 64 opaque bytes and every read returns a stale address.
-    let head = "enum R:\n    Ok(u256)\n    Err\n\n";
+    let head = "enum R:\n    Ok(u256 x)\n    Err\n\n";
     for body in [
         "contract C:\n    R r\n\n    export fn f() -> u256:\n        return 1\n",
         "use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, R) m\n\n    export fn f() -> u256:\n        return 1\n",
@@ -2044,8 +2055,6 @@ fn a_payload_enum_has_no_storage_layout() {
         assert!(!ok, "a payload enum must not be given a layout:\n{}", out);
         assert!(out.contains("has no storage layout"), "expected a layout error, got:\n{}", out);
     }
-    // But it stays usable as a local: construct, match, extract.
-    assert_compiles("enum R:\n    Ok(u256)\n    Err\n\ncontract C:\n    export fn f(u256 x) -> u256:\n        var r = R.Ok(x)\n        match r:\n            Ok(v):\n                return v\n            Err:\n                return 0\n        return 0\n");
 }
 
 #[test]

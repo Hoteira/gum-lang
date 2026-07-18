@@ -1,47 +1,221 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.36;
+// Verbatim OpenZeppelin Contracts v5.1.0 ERC20, with its four dependency
+// files (Context, IERC20, IERC20Metadata, IERC20Errors) flattened in above it
+// so the single file compiles standalone. The ERC20 contract body below is
+// byte-for-byte the audited upstream source; only the ERC20Mock at the bottom
+// is local, a thin deployable wrapper (OZ's own tests deploy ERC20 the same
+// way, via a concrete mock) that exposes init(supply) as the test entry point.
+pragma solidity ^0.8.20;
 
-// 1:1 Solidity twin of erc20.gum. Same storage order (total_supply, balances,
-// allowances) and same snake_case function names so selectors match and one
-// calldata drives both compilers in the differential test. require() carries
-// no string (gum lowers assert messages to blank reverts); state vars are not
-// public (gum emits no getters).
-contract Erc20 {
-    uint256 total_supply;
-    mapping(address => uint256) balances;
-    mapping(address => mapping(address => uint256)) allowances;
+// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    function _contextSuffixLength() internal view virtual returns (uint256) {
+        return 0;
+    }
+}
+
+// OpenZeppelin Contracts (last updated v5.1.0) (token/ERC20/IERC20.sol)
+interface IERC20 {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address to, uint256 value) external returns (bool);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 value) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
+
+// OpenZeppelin Contracts (last updated v5.1.0) (token/ERC20/extensions/IERC20Metadata.sol)
+interface IERC20Metadata is IERC20 {
+    function name() external view returns (string memory);
+
+    function symbol() external view returns (string memory);
+
+    function decimals() external view returns (uint8);
+}
+
+// OpenZeppelin Contracts (last updated v5.1.0) (interfaces/draft-IERC6093.sol)
+interface IERC20Errors {
+    error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed);
+
+    error ERC20InvalidSender(address sender);
+
+    error ERC20InvalidReceiver(address receiver);
+
+    error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
+
+    error ERC20InvalidApprover(address approver);
+
+    error ERC20InvalidSpender(address spender);
+}
+
+// OpenZeppelin Contracts (last updated v5.1.0) (token/ERC20/ERC20.sol)
+abstract contract ERC20 is Context, IERC20, IERC20Metadata, IERC20Errors {
+    mapping(address account => uint256) private _balances;
+
+    mapping(address account => mapping(address spender => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    function name() public view virtual returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public view virtual returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view virtual returns (uint8) {
+        return 18;
+    }
+
+    function totalSupply() public view virtual returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) public view virtual returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address to, uint256 value) public virtual returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, value);
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view virtual returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 value) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, value);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 value) public virtual returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, value);
+        _transfer(from, to, value);
+        return true;
+    }
+
+    function _transfer(address from, address to, uint256 value) internal {
+        if (from == address(0)) {
+            revert ERC20InvalidSender(address(0));
+        }
+        if (to == address(0)) {
+            revert ERC20InvalidReceiver(address(0));
+        }
+        _update(from, to, value);
+    }
+
+    function _update(address from, address to, uint256 value) internal virtual {
+        if (from == address(0)) {
+            // Overflow check required: The rest of the code assumes that totalSupply never overflows
+            _totalSupply += value;
+        } else {
+            uint256 fromBalance = _balances[from];
+            if (fromBalance < value) {
+                revert ERC20InsufficientBalance(from, fromBalance, value);
+            }
+            unchecked {
+                // Overflow not possible: value <= fromBalance <= totalSupply.
+                _balances[from] = fromBalance - value;
+            }
+        }
+
+        if (to == address(0)) {
+            unchecked {
+                // Overflow not possible: value <= totalSupply or value <= fromBalance <= totalSupply.
+                _totalSupply -= value;
+            }
+        } else {
+            unchecked {
+                // Overflow not possible: balance + value is at most totalSupply, which we know fits into a uint256.
+                _balances[to] += value;
+            }
+        }
+
+        emit Transfer(from, to, value);
+    }
+
+    function _mint(address account, uint256 value) internal {
+        if (account == address(0)) {
+            revert ERC20InvalidReceiver(address(0));
+        }
+        _update(address(0), account, value);
+    }
+
+    function _burn(address account, uint256 value) internal {
+        if (account == address(0)) {
+            revert ERC20InvalidSender(address(0));
+        }
+        _update(account, address(0), value);
+    }
+
+    function _approve(address owner, address spender, uint256 value) internal {
+        _approve(owner, spender, value, true);
+    }
+
+    function _approve(address owner, address spender, uint256 value, bool emitEvent) internal virtual {
+        if (owner == address(0)) {
+            revert ERC20InvalidApprover(address(0));
+        }
+        if (spender == address(0)) {
+            revert ERC20InvalidSpender(address(0));
+        }
+        _allowances[owner][spender] = value;
+        if (emitEvent) {
+            emit Approval(owner, spender, value);
+        }
+    }
+
+    function _spendAllowance(address owner, address spender, uint256 value) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance < type(uint256).max) {
+            if (currentAllowance < value) {
+                revert ERC20InsufficientAllowance(spender, currentAllowance, value);
+            }
+            unchecked {
+                _approve(owner, spender, currentAllowance - value, false);
+            }
+        }
+    }
+}
+
+// Local deploy/test wrapper. ERC20 above is abstract (no constructor-less
+// deploy, no public mint), so the differential harness drives this concrete
+// subclass: name/symbol are fixed at construction and init(supply) mints the
+// initial supply to the caller, matching erc20.gum's init entry point.
+contract ERC20Mock is ERC20 {
+    constructor() ERC20("Token", "TKN") {}
 
     function init(uint256 supply) external {
-        address s = msg.sender;
-        total_supply = supply;
-        balances[s] = supply;
-    }
-
-    function balance_of(address who) external view returns (uint256) {
-        return balances[who];
-    }
-
-    function approve(address spender, uint256 amount) external {
-        allowances[msg.sender][spender] = amount;
-    }
-
-    function allowance(address owner, address spender) external view returns (uint256) {
-        return allowances[owner][spender];
-    }
-
-    function transfer(address to, uint256 amount) external {
-        address from = msg.sender;
-        require(balances[from] >= amount, "insufficient balance");
-        balances[from] = balances[from] - amount;
-        balances[to] = balances[to] + amount;
-    }
-
-    function transfer_from(address from, address to, uint256 amount) external {
-        address spender = msg.sender;
-        require(allowances[from][spender] >= amount, "insufficient allowance");
-        require(balances[from] >= amount, "insufficient balance");
-        allowances[from][spender] = allowances[from][spender] - amount;
-        balances[from] = balances[from] - amount;
-        balances[to] = balances[to] + amount;
+        _mint(_msgSender(), supply);
     }
 }

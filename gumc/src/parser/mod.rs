@@ -225,34 +225,28 @@ fn build_declaration(inner: pest::iterators::Pair<Rule>, program: &mut Program) 
                         for variant_pair in inner_rules {
                             let mut v_rules = variant_pair.into_inner();
                             let v_name = v_rules.next().unwrap().as_str().to_string();
-                            let payload = v_rules.next().map(|p| parse_type(p));
-                            variants.push(EnumVariant { name: v_name, payload });
+                            let mut parameters = Vec::new();
+                            if let Some(params_pair) = v_rules.next() {
+                                for param_pair in params_pair.into_inner() {
+                                    let mut param_rules = param_pair.into_inner();
+                                    let mut is_mut = false;
+                                    let mut type_pair = param_rules.next().unwrap();
+                                    if type_pair.as_rule() == Rule::is_mut {
+                                        is_mut = true;
+                                        type_pair = param_rules.next().unwrap();
+                                    }
+                                    let type_def = parse_type(type_pair);
+                                    let param_name = param_rules.next().unwrap().as_str().to_string();
+                                    parameters.push(Parameter { is_mut, type_def, name: param_name });
+                                }
+                            }
+                            variants.push(EnumVariant { name: v_name, parameters });
                         }
                         program.declarations.push(Declaration::Enum(EnumDecl { name, variants }));
                     }
                     Rule::fn_decl => {
                         program.declarations.push(Declaration::Function(parse_fn_decl(inner)));
                     }
-                    Rule::error_decl => {
-                        let mut inner_rules = inner.into_inner();
-                let name = inner_rules.next().unwrap().as_str().to_string();
-                let mut parameters = Vec::new();
-                if let Some(params_pair) = inner_rules.next() {
-                    for param_pair in params_pair.into_inner() {
-                        let mut param_rules = param_pair.into_inner();
-                        let mut is_mut = false;
-                        let mut type_pair = param_rules.next().unwrap();
-                        if type_pair.as_rule() == Rule::is_mut {
-                            is_mut = true;
-                            type_pair = param_rules.next().unwrap();
-                        }
-                        let type_def = parse_type(type_pair);
-                        let param_name = param_rules.next().unwrap().as_str().to_string();
-                        parameters.push(Parameter { is_mut, type_def, name: param_name });
-                    }
-                }
-                program.declarations.push(Declaration::Error(ErrorDecl { name, parameters }));
-            }
             _ => {}
         }
     }
@@ -345,9 +339,8 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Spanned<Statement> {
         }
         Rule::revert_stmt => {
             let mut inner_rules = inner.into_inner();
-            let error_name = inner_rules.next().unwrap().as_str().to_string();
-            let args = inner_rules.map(parse_expr).collect();
-            Statement::Revert { error_name, args }
+            let error = parse_expr(inner_rules.next().unwrap());
+            Statement::Revert { error }
         }
         Rule::delete_stmt => {
             Statement::Delete { target: parse_term(inner.into_inner().next().unwrap()) }
@@ -449,6 +442,18 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Spanned<Statement> {
                 body.push(parse_statement(stmt));
             }
             Statement::WhileLoop { condition, body }
+        }
+        Rule::try_stmt => {
+            let mut inner_rules = inner.into_inner();
+            let mut try_body = Vec::new();
+            for stmt in inner_rules.next().unwrap().into_inner() {
+                try_body.push(parse_statement(stmt));
+            }
+            let mut catch_body = Vec::new();
+            for stmt in inner_rules.next().unwrap().into_inner() {
+                catch_body.push(parse_statement(stmt));
+            }
+            Statement::TryCatch { try_body, catch_body }
         }
         Rule::match_stmt => {
             let mut inner_rules = inner.into_inner();

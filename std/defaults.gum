@@ -20,6 +20,7 @@ class Hashable:
 // give the type a name and a serializable shape.
 //
 //   a.balance()        -> u256     the account's wei balance (BALANCE)
+//   a.code.len()       -> u256     the account's bytecode size in bytes (EXTCODESIZE)
 //   a.pay(amount)      -> bool     send ETH; hands you the success flag to check
 //   a.transfer(amount)             send ETH; reverts on failure
 //   a.delegated_to()   -> Account  EIP-7702 delegate, or 0 if none

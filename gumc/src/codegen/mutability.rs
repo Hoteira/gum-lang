@@ -132,7 +132,7 @@ fn stmt_effect(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &MutMap)
         Statement::Assert { condition, message } => {
             sub(condition).max(message.as_ref().map(&sub).unwrap_or(Mut::Pure))
         }
-        Statement::Revert { args, .. } => max_of(args.iter().map(&sub)),
+        Statement::Revert { error } => sub(error),
         Statement::Delete { target } => {
             if storage_root(tc, class, target) {
                 Mut::NonPayable
@@ -148,6 +148,9 @@ fn stmt_effect(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &MutMap)
         Statement::WhileLoop { condition, body: b } => sub(condition).max(body(b)),
         Statement::Match { expr, arms } => {
             sub(expr).max(max_of(arms.iter().map(|a| stmts_effect(tc, class, &a.body, map))))
+        }
+        Statement::TryCatch { try_body, catch_body } => {
+            body(try_body).max(body(catch_body))
         }
         Statement::Expression(e) => sub(e),
         // A raw `call target(payload)`, and raw Yul, can do anything.
@@ -267,7 +270,7 @@ fn stmt_calls_out(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &Hash
         Statement::Assert { condition, message } => {
             sub(condition) || message.as_ref().map(&sub).unwrap_or(false)
         }
-        Statement::Revert { args, .. } => args.iter().any(&sub),
+        Statement::Revert { error } => sub(error),
         Statement::Delete { target } => sub(target),
         Statement::Return { value } => value.as_ref().map(&sub).unwrap_or(false),
         Statement::IfElse { condition, if_body, else_body } => {
@@ -278,6 +281,7 @@ fn stmt_calls_out(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &Hash
         Statement::Match { expr, arms } => {
             sub(expr) || arms.iter().any(|a| a.body.iter().any(|s| stmt_calls_out(tc, class, &s.node, map)))
         }
+        Statement::TryCatch { try_body, catch_body } => body(try_body) || body(catch_body),
         Statement::Expression(e) => sub(e),
         // A raw low-level call and raw Yul can reach anywhere.
         Statement::Call { .. } => true,
