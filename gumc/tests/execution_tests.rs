@@ -1591,8 +1591,6 @@ fn erc20_with_allowances_matches_solidity() {
         (owner, "transfer(address,uint256)", vec![word_addr(recipient), word_u256(U256::from(50u64))]),
     ];
 
-    let balances_base = 1u8;
-    let allow_base = 2u8;
     for (caller, sig, words) in &steps {
         let data = encode_words(sig, words);
         let gr = call_from(&mut gdb, *caller, ga, data.clone());

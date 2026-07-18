@@ -2809,7 +2809,7 @@ impl<'a> Translator<'a> {
                 let mut out = format!("let {} := 1\n", try_ok_var);
                 out.push_str("for {} 1 {} {\n");
                 
-                let mut inner_ctx = Ctx {
+                let inner_ctx = Ctx {
                     self_ctx: ctx.self_ctx,
                     is_entry: ctx.is_entry,
                     try_ok_var: Some(try_ok_var.clone()),
