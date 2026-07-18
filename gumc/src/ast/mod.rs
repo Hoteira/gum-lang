@@ -72,6 +72,8 @@ pub struct Spanned<T> {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub modifiers: Vec<String>,
+    // Bracketed attributes above the fn, like [Test]. Currently only the
+    pub attributes: Vec<String>,
     pub name: String,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<Type>,

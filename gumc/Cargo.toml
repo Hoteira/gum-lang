@@ -12,6 +12,10 @@ pest_derive = "2.8.7"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+# gumc test runs gum-compiled bytecode in an in-process EVM, so the runner
+# needs the same EVM the differential harness uses.
+revm = "41"
+hex = "0.4"
 
 [dev-dependencies]
 # Execution-level differential testing: run gum-compiled bytecode and the

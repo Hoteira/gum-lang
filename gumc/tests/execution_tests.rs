@@ -1490,6 +1490,27 @@ fn erc721_token_uri_matches_solidity() {
 }
 
 #[test]
+fn to_string_result_compares_as_a_string() {
+    // Regression (surfaced by gumc test): a var s = n.to_string() local must
+    // type as String, so s == "..." lowers to string equality, not a pointer
+    // compare of two distinct allocations.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let src = "use gum.defaults.hashable\nuse gum.defaults.String\n\ncontract C:\n    export fn is7(u256 n) -> bool:\n        var s = n.to_string()\n        return s == \"7\"\n";
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let a = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+    let yes = call(&mut db, a, encode_words("is7(uint256)", &[word_u256(U256::from(7u64))])).output;
+    assert_eq!(U256::from_be_slice(&yes), U256::from(1u8), "7.to_string() == \"7\"");
+    let no = call(&mut db, a, encode_words("is7(uint256)", &[word_u256(U256::from(8u64))])).output;
+    assert_eq!(U256::from_be_slice(&no), U256::from(0u8), "8.to_string() != \"7\"");
+}
+
+#[test]
 fn uint_to_string_produces_decimal() {
     // The <uint>.to_string() itoa: every value must render as its exact decimal
     // ASCII, zero as "0" (not empty), and large values digit-for-digit. Asserts

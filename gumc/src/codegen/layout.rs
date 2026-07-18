@@ -431,8 +431,6 @@ impl<'a> LayoutEngine<'a> {
     }
 
     // The compile-time value of a const field, when the constructor gives it
-    // one the compiler can already work out.
-    //
     pub fn const_field_value(&self, class_name: &str, field: &str) -> Option<String> {
         let class = self.type_checker.loaded_classes.get(class_name)?;
         let f = class.fields.iter().find(|f| f.is_const && f.name == field)?;

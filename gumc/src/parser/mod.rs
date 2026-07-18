@@ -236,12 +236,18 @@ fn build_declaration(inner: pest::iterators::Pair<Rule>, program: &mut Program) 
 fn parse_fn_decl(rule: pest::iterators::Pair<Rule>) -> FnDecl {
     let mut name = String::new();
     let mut modifiers = Vec::new();
+    let mut attributes = Vec::new();
     let mut parameters = Vec::new();
     let mut return_type = None;
     let mut body = Vec::new();
 
     for inner_rule in rule.into_inner() {
         match inner_rule.as_rule() {
+            Rule::fn_attrs => {
+                for a in inner_rule.into_inner() {
+                    attributes.push(a.as_str().to_string());
+                }
+            }
             Rule::modifier => modifiers.push(inner_rule.as_str().to_string()),
             Rule::ident => name = inner_rule.as_str().to_string(),
             Rule::param_list => {
@@ -269,7 +275,7 @@ fn parse_fn_decl(rule: pest::iterators::Pair<Rule>) -> FnDecl {
             _ => {}
         }
     }
-    FnDecl { modifiers, name, parameters, return_type, body }
+    FnDecl { modifiers, attributes, name, parameters, return_type, body }
 }
 
 fn parse_type(pair: pest::iterators::Pair<Rule>) -> Type {

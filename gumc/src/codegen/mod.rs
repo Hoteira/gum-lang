@@ -79,6 +79,7 @@ fn substitute_type(t: &Type, subst: &HashMap<String, Type>) -> Type {
 fn substitute_method(m: &FnDecl, subst: &HashMap<String, Type>) -> FnDecl {
     FnDecl {
         modifiers: m.modifiers.clone(),
+        attributes: m.attributes.clone(),
         name: m.name.clone(),
         parameters: m.parameters.iter().map(|p| Parameter {
             is_mut: p.is_mut,
@@ -275,6 +276,13 @@ fn is_exported(f: &FnDecl) -> bool {
     f.modifiers.iter().any(|m| m == "export")
 }
 
+// A [Test] function is a runnable test: gumc --test deploys and calls it.
+// It is treated as an entry point so it gets a dispatcher selector without
+// needing export; a plain fn in the same contract stays an internal helper.
+pub(crate) fn is_test(f: &FnDecl) -> bool {
+    f.attributes.iter().any(|a| a == "Test")
+}
+
 // A payable function may receive ETH; every other entry point rejects any
 // value-bearing call.
 fn is_payable(f: &FnDecl) -> bool {
@@ -297,7 +305,7 @@ fn is_fallback(f: &FnDecl) -> bool {
 }
 
 fn is_selector_entry(f: &FnDecl) -> bool {
-    is_exported(f) && !is_receive(f) && !is_fallback(f)
+    (is_exported(f) || is_test(f)) && !is_receive(f) && !is_fallback(f)
 }
 
 // Message/Block params are synthesized from opcodes at the call

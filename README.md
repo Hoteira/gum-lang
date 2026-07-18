@@ -197,12 +197,62 @@ gumc contract.gum --lock layout.json
 | `--solc <path>` | path to the `solc` binary (default: `solc` on PATH) |
 | `--lock <file>` | storage-layout lockfile; created on first use, enforced after |
 | `--rich-reverts` | emit `Panic(uint256)` reason data (larger, decodable) |
+| `--test` | run every `[Test]` function in an in-process EVM (needs `solc`) |
 | `-o, --output <file>` | with `--bytecode`, write the hex here instead of stdout |
 
 The standard library ([`std/defaults.gum`](std/defaults.gum)) is compiled into
 the binary, so `use gum.defaults.<Symbol>` resolves from any directory with no
 search path and nothing to install. `gumc` is one file. A `use` path is a module
 then a symbol: `gum.defaults` is the module, `Account` is a class in it.
+
+---
+
+## Testing contracts
+
+Mark a no-argument function with `[Test]` and run it with `--test`. A test
+**passes** if it returns and **fails** if it reverts; the revert reason (an
+`assert` string, a `Panic` code, a custom error) is shown, and any failure makes
+`gumc` exit non-zero so CI can gate on it. Each test runs against its own fresh
+deployment, so they never leak state into each other. A plain `fn` beside the
+tests is an ordinary helper, not run and callable from the tests.
+
+```python
+# demo_test.gum
+use gum.defaults.hashable
+
+contract DemoTests:
+    u256 counter
+
+    fn fresh_counter() -> u256:          # a helper, not a test
+        return DemoTests.counter
+
+    [Test]
+    fn storage_roundtrips():
+        DemoTests.counter = 7
+        assert(self.fresh_counter() == 7, "storage broke")
+
+    [Test]
+    fn itoa_works():
+        var n = 42
+        assert(n.to_string() == "42", "itoa wrong")
+```
+
+```sh
+gumc demo_test.gum --test --solc tools/solc.exe
+```
+
+```
+contract DemoTests
+  ok    storage_roundtrips
+  ok    itoa_works
+
+2 tests, 2 passed, 0 failed
+```
+
+`[Test]` makes a function a runnable entry point on its own, so it needs no
+`export`. The runner deploys with no constructor arguments, so a test contract
+needs either no `fn new` or a no-argument one. It runs the same in-process EVM
+(`revm`) the compiler's own differential suite uses.
 
 ---
 

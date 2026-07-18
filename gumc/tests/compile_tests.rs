@@ -290,6 +290,30 @@ fn constructor_call_resolves_correctly() {
 }
 
 #[test]
+fn test_runner_reports_pass_and_fail() {
+    // gumc --test deploys the contract and runs every no-arg export test().
+    // A passing test returns; a failing one reverts, and its reason is shown.
+    // Any failure makes the process exit non-zero, so CI can gate on it.
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping test runner check: no solc");
+            return;
+        }
+    };
+    let solc_arg = solc.to_string_lossy().into_owned();
+    // A [Test] fn is a test; a plain fn beside it is a helper and is not run.
+    let src = "use gum.defaults.hashable\n\ncontract Suite:\n    fn helper() -> u256:\n        return 1\n\n    [Test]\n    fn passes():\n        assert(self.helper() == 1, \"nope\")\n\n    [Test]\n    fn fails():\n        assert(1 == 2, \"boom\")\n";
+    let (ok, output) = run_gumc_with_args(src, &["--test", "--solc", &solc_arg]);
+    assert!(!ok, "a failing test must make gumc exit non-zero:\n{}", output);
+    assert!(output.contains("ok    passes"), "expected a pass line:\n{}", output);
+    assert!(output.contains("FAIL  fails"), "expected a fail line:\n{}", output);
+    assert!(output.contains("\"boom\""), "expected the revert reason:\n{}", output);
+    assert!(output.contains("1 passed, 1 failed"), "expected a summary:\n{}", output);
+    assert!(!output.contains("helper"), "a plain fn helper must not run as a test:\n{}", output);
+}
+
+#[test]
 fn discarded_call_return_is_popped() {
     // A method call used as a statement discards its return value. Yul rejects a
     // top-level expression that returns a value, so codegen must pop() it. This
@@ -1752,8 +1776,6 @@ fn new_on_a_contract_emits_create_not_an_allocation() {
 #[test]
 fn a_deployed_child_is_nested_inside_its_deployer_s_runtime() {
     // Child's object must appear inside Factory_runtime: only
-    // datasize(<runtime>) is copied out at deploy time, so a copy nested beside
-    // the runtime rather than within it would not exist in the deployed code,
     let src = "contract Child:\n    u256 v\n\ncontract Factory:\n    u256 n\n\n    export fn make() -> Account:\n        return new Child()\n";
     let (ok, output) = run_gumc(src);
     assert!(ok, "expected success, got:\n{}", output);

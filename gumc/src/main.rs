@@ -5,6 +5,7 @@ pub mod parser;
 pub mod ast;
 pub mod semantic;
 pub mod codegen;
+pub mod runner;
 
 use clap::{Arg, ArgAction, Command};
 use codegen::Backend;
@@ -82,6 +83,12 @@ fn main() {
                 .long("lock")
                 .help("Storage-layout lockfile (JSON). Created on first use, then enforced: existing fields keep their slots across recompiles (upgrade-safe), new fields are appended, incompatible changes error. Run at deploy time and keep it in version control."),
         )
+        .arg(
+            Arg::new("test")
+                .long("test")
+                .action(ArgAction::SetTrue)
+                .help("Run every '[Test]' function in an in-process EVM: each is deployed fresh and called. It passes if it returns, fails if it reverts. Needs solc."),
+        )
         .get_matches();
 
     let file_path = matches.get_one::<String>("file").unwrap();
@@ -120,6 +127,76 @@ fn main() {
             );
             match backend.generate(&ast, &type_checker) {
                 Ok(compiled_contracts) => {
+                    if matches.get_flag("test") {
+                        let solc = matches
+                            .get_one::<String>("solc")
+                            .map(String::as_str)
+                            .unwrap_or("solc");
+                        let (mut total, mut failed) = (0usize, 0usize);
+                        for (name, yul, _abi) in &compiled_contracts {
+                            let class = match type_checker.loaded_classes.get(name) {
+                                Some(c) => c,
+                                None => continue,
+                            };
+                            // A test is any [Test] function taking no
+                            // arguments; a plain fn beside it is a helper.
+                            let test_fns: Vec<String> = class
+                                .methods
+                                .iter()
+                                .filter(|m| {
+                                    m.attributes.iter().any(|a| a == "Test")
+                                        && m.parameters.is_empty()
+                                })
+                                .map(|m| m.name.clone())
+                                .collect();
+                            if test_fns.is_empty() {
+                                continue;
+                            }
+                            let bytecode = match assemble_yul(yul, solc) {
+                                Ok(h) => match hex::decode(&h) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        eprintln!("bad bytecode hex for {}: {}", name, e);
+                                        std::process::exit(1);
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("Assembler Error for {}: {}", name, e);
+                                    std::process::exit(1);
+                                }
+                            };
+                            println!("\ncontract {}", name);
+                            match runner::run_contract_tests(&bytecode, &test_fns) {
+                                Ok(outcomes) => {
+                                    for o in &outcomes {
+                                        total += 1;
+                                        if o.passed {
+                                            println!("  ok    {}", o.name);
+                                        } else {
+                                            failed += 1;
+                                            println!("  FAIL  {} -- {}", o.name, o.reason.as_deref().unwrap_or(""));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("  could not run tests for {}: {}", name, e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        if total == 0 {
+                            println!("\nno tests found. Mark a no-argument function with '[Test]' to run it as a test.");
+                        } else {
+                            println!(
+                                "\n{} test{}, {} passed, {} failed",
+                                total,
+                                if total == 1 { "" } else { "s" },
+                                total - failed,
+                                failed
+                            );
+                        }
+                        std::process::exit(if failed > 0 { 1 } else { 0 });
+                    }
                     for (name, yul, abi_json) in compiled_contracts {
                         println!("\n--- Contract: {} ---", name);
                         println!("\n{}", yul);

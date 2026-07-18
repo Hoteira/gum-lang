@@ -144,7 +144,10 @@ param_list = { param ~ ("," ~ param)* }
 
 // Function
 fn_body = { "{" ~ statement* ~ "}" }
-fn_decl = { modifier* ~ "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ( "->" ~ type_keyword )? ~ (fn_body | ";") }
+// Bracketed attributes above a fn, e.g. `[Test]`, same shape as a class's
+// parents attribute but attached to a single function.
+fn_attrs = { "[" ~ ident ~ ("," ~ ident)* ~ "]" }
+fn_decl = { fn_attrs? ~ modifier* ~ "fn" ~ ident ~ "(" ~ param_list? ~ ")" ~ ( "->" ~ type_keyword )? ~ (fn_body | ";") }
 
 // Class
 parents = { "[" ~ ident ~ ("," ~ ident)* ~ "]" }

@@ -7,15 +7,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tiny_keccak::{Hasher, Keccak};
 
 // The Yul local holding an immutable's value while fn new runs. The
-// constructor returns these, and the deploy block feeds them to setimmutable
-// once the runtime code is in memory. Prefixed to keep it out of the way of
 pub fn immutable_local(field: &str) -> String {
     format!("_imm_{}", field)
 }
 
 // The deploy block's own binding for an immutable, distinct from
-// immutable_local. Yul permits no shadowing whatsoever, not even a
-// function's return variable over an outer let, and the constructor's
 pub fn immutable_deploy_local(field: &str) -> String {
     format!("_immv_{}", field)
 }
@@ -26,16 +22,12 @@ fn mask_hex(size: usize) -> String {
 }
 
 // Copies len bytes from src to dst in 32-byte strides. May overwrite up
-// to 31 bytes past len at the tail end, harmless here since every caller
-// either immediately overwrites that tail with the next chunk, or it spills
 fn gum_str_len_helper_src() -> String {
     "function gum_str_len(p) -> n {\n    n := and(shr(192, mload(p)), 0xffffffffffffffff)\n}\n"
         .to_string()
 }
 
 // Decimal itoa: an unsigned value to a gum String (header word holding the
-// length in its top 8 bytes, ASCII digits from p+32). Digits are written from
-// the least-significant end backwards, the same shape as OpenZeppelin's
 fn gum_uint_to_str_helper_src() -> String {
     "function gum_uint_to_str(value) -> ptr {\n\
      \x20   let len := 1\n\
@@ -60,8 +52,6 @@ fn gum_uint_to_str_helper_src() -> String {
 }
 
 // String and Bytes share one in-memory shape, so every operation below works
-// on either.
-// Whether t is a user struct for storage-addressing purposes: an aggregate
 pub fn is_struct_type(tc: &TypeChecker, t: &Type) -> bool {
     match t {
         Type::Primitive(name) => {
@@ -81,8 +71,6 @@ pub fn is_enum_type(tc: &TypeChecker, t: &Type) -> bool {
 }
 
 // Materializes a compile-time-known string into ptr as a String value.
-//
-// The content is written a word at a time (one mstore per 32 chars),
 fn str_literal_body_src(ptr: &str, s: &str) -> String {
     let bytes = s.as_bytes();
     let padded = (bytes.len() + 31) / 32 * 32;
@@ -108,8 +96,6 @@ fn str_literal_body_src(ptr: &str, s: &str) -> String {
 }
 
 // Content equality for String/Bytes. Compares length first, then whole 32-byte
-// words, then the trailing partial word with the bytes past the length shifted
-// off, so leftover allocator garbage after the last byte can never make two
 fn gum_str_eq_helper_src() -> String {
     "function gum_str_eq(a, b) -> r {\n\
      \x20   r := 0\n\
@@ -132,8 +118,6 @@ fn gum_str_eq_helper_src() -> String {
 }
 
 // Reverts with Selector(string), one 4-byte selector, a head holding the
-// single tail offset (always 0x20), then the string's length word and its
-// zero-padded bytes.
 fn gum_revert_str_helper_src() -> String {
     "function gum_revert_str(sel, s) {\n\
      \x20   let p := mload(0x40)\n\
@@ -150,8 +134,6 @@ fn gum_revert_str_helper_src() -> String {
 }
 
 // --- Solidity-compatible storage strings ---
-//
-// A String/Bytes contract field occupies exactly one slot, encoded the way
 
 fn gum_sstr_base_helper_src() -> String {
     "function gum_sstr_base(slot) -> b {\n\
@@ -214,8 +196,6 @@ fn gum_sstr_clear_helper_src(tr: bool) -> String {
 }
 
 // Stores a memory String into a storage string slot.
-//
-// Old long-form data slots are zeroed first: Solidity releases them on
 fn gum_sstr_store_helper_src(tr: bool) -> String {
     with_kind(
         "function gum_sstr_store{K}(slot, ptr) {\n\
@@ -253,8 +233,6 @@ fn gum_sstr_store_helper_src(tr: bool) -> String {
 }
 
 // keccak256 over a dynamic byte value's contents.
-//
-// Yul's keccak256 takes (offset, length); gum's takes one value, so the length
 fn gum_keccak_arr_helper_src() -> String {
     "function gum_keccak_arr(p) -> h {\n    h := keccak256(add(p, 32), mload(p))\n}\n".to_string()
 }
@@ -265,8 +243,6 @@ fn gum_keccak_str_helper_src() -> String {
 }
 
 // secp256k1 public-key recovery via the precompile at address 1.
-//
-// Returns the zero address when recovery fails. The returndatasize check is
 fn gum_ecrecover_helper_src() -> String {
     "function gum_ecrecover(h, v, r, s) -> a {\n\
      \x20   let p := mload(0x40)\n\
@@ -283,8 +259,6 @@ fn gum_ecrecover_helper_src() -> String {
 }
 
 // to.pay(amount), send ETH.
-//
-// EIP-5920's PAY opcode would do this without handing control to the recipient
 fn gum_pay_helper_src() -> String {
     "function gum_pay(to, amount) -> ok {\n\
      \x20   ok := call(gas(), to, amount, 0, 0, 0, 0)\n\
@@ -293,8 +267,6 @@ fn gum_pay_helper_src() -> String {
 }
 
 // --- Storage kind ---
-//
-// A field is either persistent (SLOAD/SSTORE) or transient (TLOAD/TSTORE,
 fn kind_suffix(tr: bool) -> &'static str {
     if tr { "_t" } else { "" }
 }
@@ -308,8 +280,6 @@ fn st_op(tr: bool) -> &'static str {
 }
 
 // Bounds-checked element address for a dynamic memory array.
-//
-// Word 0 holds the length in bytes, not elements, the convention the
 fn gum_marr_addr_helper_src(rich: bool) -> String {
     format!(
         "function gum_marr_addr(ptr, i, esz) -> a {{\n\
@@ -332,8 +302,6 @@ fn gum_farr_addr_helper_src(rich: bool) -> String {
 }
 
 // --- Dynamic-array ABI ---
-//
-// The wire format and gum's memory format are not the same shape, which is why
 fn gum_abi_arr_cd_helper_src() -> String {
     "function gum_abi_arr_cd(off, esz) -> ptr {\n\
      \x20   if lt(calldatasize(), add(off, 32)) { revert(0, 0) }\n\
@@ -373,8 +341,6 @@ fn gum_abi_arr_mem_helper_src() -> String {
 }
 
 // A fixed array is not a dynamic one on the wire: T[N] is N inline words in
-// the head, with no offset and no count. It still needs converting rather than
-// copying, for the same reason, memory packs at esz, the wire doesn't.
 fn gum_abi_farr_cd_helper_src() -> String {
     "function gum_abi_farr_cd(off, n, esz) -> ptr {\n\
      \x20   if lt(calldatasize(), add(off, mul(n, 32))) { revert(0, 0) }\n\
@@ -841,8 +807,6 @@ fn abi_starr_size_helper_src(fname: &str, wire: usize, packed: usize) -> String 
 }
 
 // Re-revert with the callee's own revert data, verbatim.
-//
-// A sub-call that fails has a reason, "ERC20: transfer amount exceeds
 fn gum_bubble_revert_helper_src() -> String {
     "function gum_bubble_revert() {\n\
      \x20   returndatacopy(0, 0, returndatasize())\n\
@@ -852,8 +816,6 @@ fn gum_bubble_revert_helper_src() -> String {
 }
 
 // Account.create(code, value) / Account.create2(code, value, salt), deploy
-// a contract from creation bytecode held in memory.
-//
 fn gum_create_helper_src() -> String {
     "function gum_create(codeptr, value) -> addr {\n\
      \x20   addr := create(value, add(codeptr, 32), gum_str_len(codeptr))\n\
@@ -886,8 +848,6 @@ fn gum_create2_address_helper_src() -> String {
 }
 
 // to.transfer(amount), send ETH, revert if it fails.
-//
-// The checked companion to pay: same CALL, but an unsuccessful send aborts
 fn gum_transfer_helper_src() -> String {
     "function gum_transfer(to, amount) {\n\
      \x20   if iszero(call(gas(), to, amount, 0, 0, 0, 0)) {\n\
@@ -899,8 +859,6 @@ fn gum_transfer_helper_src() -> String {
 }
 
 // secp256r1 (P-256) signature verification via the precompile at 0x100
-// EIP-7951 on L1, interface-identical to RIP-7212 already live on L2s, so the
-// same bytecode works on both. Enables Apple Secure Enclave / Android Keystore
 fn gum_p256_verify_helper_src() -> String {
     "function gum_p256_verify(h, r, s, qx, qy) -> ok {\n\
      \x20   let p := mload(0x40)\n\
@@ -918,8 +876,6 @@ fn gum_p256_verify_helper_src() -> String {
 }
 
 // EIP-7702 delegation target, or 0 if the account isn't delegated.
-//
-// A 7702-delegated EOA's code is exactly 23 bytes: the 0xef0100 marker followed
 fn gum_delegate_of_helper_src() -> String {
     "function gum_delegate_of(a) -> target {\n\
      \x20   target := 0\n\
@@ -985,8 +941,6 @@ fn bytes_copy_helper_src() -> String {
 }
 
 // Reads a packed field: shift the containing word right so the field's
-// bytes land at the bottom, then mask off anything to their left that
-// belongs to a neighboring field. When a field fills its whole 32-byte
 fn read_slot_packed(container_expr: &str, offset: usize, size: usize) -> String {
     if size >= 32 && offset == 0 {
         return container_expr.to_string();
@@ -1030,8 +984,6 @@ fn read_packed(container_expr: &str, offset_in_container: usize, size: usize) ->
 }
 
 // Read-modify-write for a packed field: preserve every byte in the
-// container except this field's own range, then OR in the new value shifted
-// into position. Degenerates to a plain overwrite when the field fills its
 fn write_packed(
     container_expr: &str,
     offset_in_container: usize,
@@ -1050,8 +1002,6 @@ fn write_packed(
 }
 
 // Bit width and signedness of a scalar integer type, or None for anything
-// else (bool, classes, arrays, ...). Used to pick the right overflow bound
-// and signed/unsigned opcode variant for a binary operation.
 fn literal_u128(expr: &Expr) -> Option<u128> {
     if let Expr::Number(n) = expr {
         n.parse::<u128>().ok()
@@ -1061,8 +1011,6 @@ fn literal_u128(expr: &Expr) -> Option<u128> {
 }
 
 // Solidity/ABI type name for a gum type, used to build canonical event
-// signatures for topic0 hashing. Account is the EVM address type; the uN/iN
-// families map straight to uintN/intN. Anything unrecognized falls back to
 
 fn numeric_meta(name: &str) -> Option<(usize, bool)> {
     match name {
@@ -1090,8 +1038,6 @@ fn is_fixed_point(t: &Type) -> bool {
 }
 
 // Truncates a value down to a narrower integer width. Unsigned types just
-// mask off the high bits; signed types must use SIGNEXTEND instead of a
-// plain AND-mask, or a negative value (all-1s in its upper bits under two's
 fn mask_to_width(val_expr: &str, bits: usize, signed: bool) -> String {
     if bits >= 256 {
         return val_expr.to_string();
@@ -1104,8 +1050,6 @@ fn mask_to_width(val_expr: &str, bits: usize, signed: bool) -> String {
 }
 
 // Like mask_to_width, but takes the gum Type directly and is a no-op for
-// The byte count of a fixed-bytes type: byte_width("b4") == Some(4). Valid
-// b1..b32; anything else (bool, u256, a class name) is None.
 pub fn byte_width(name: &str) -> Option<usize> {
     let n = name.strip_prefix('b')?.parse::<usize>().ok()?;
     (1..=32).contains(&n).then_some(n)
@@ -1117,10 +1061,6 @@ fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
             return mask_to_width(val_expr, bits, signed);
         }
         // A fixed-bytes value rides the wire left-aligned (its bytes in the high
-        // end of the word, like Solidity). For a sub-word width we shift it down
-        // to a clean right-aligned value so it compares against a plain literal
-        // like 0x01ffc9a7; a full b32 already fills the word, so it is left as
-        // is. Sub-word values are re-aligned on the way out (see Return).
         if let Some(w) = byte_width(name) {
             return if w == 32 {
                 val_expr.to_string()
@@ -1133,8 +1073,6 @@ fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
 }
 
 // The revert body used inside the checked helpers. With rich reverts off it's
-// a bare revert(0, 0) (smallest possible, zero return data). With it on it
-// encodes Solidity's Panic(uint256): selector 0x4e487b71 followed by a code
 fn panic_revert(rich: bool, code: &str) -> String {
     if rich {
         format!(
@@ -1171,8 +1109,6 @@ fn arr_data_base_helper_src() -> String {
 }
 
 // Element addressing for a storage array, packed exactly as Solidity packs it.
-//
-// Every element width is handled by one scheme, parameterized by:
 fn pk_read_helper_src(tr: bool) -> String {
     format!(
         "function pk_read{k}(base, i, per, es, esz) -> v {{\n\
@@ -1229,15 +1165,11 @@ fn sarr_to_mem_helper_src(name: &str, esz: usize, per: usize, es: usize, tr: boo
 }
 
 // How many whole slots one struct element of an array occupies.
-//
-// Unlike a scalar element, a struct element is never packed with its
 fn struct_elem_slots(size: usize) -> usize {
     size.div_ceil(32).max(1)
 }
 
 // The base slot of struct element i, bounds-checked.
-//
-// The check runs before the multiply: mul(i, es) on a huge index wraps, and
 fn sarr_base_helper_src(rich: bool) -> String {
     format!(
         "function sarr_base(base, i, len, es) -> b {{\n\
@@ -1249,8 +1181,6 @@ fn sarr_base_helper_src(rich: bool) -> String {
 }
 
 // arr.pop() for a struct array: zero every slot of the removed element (as
-// Solidity does, for the refund) then shrink. Struct elements own their slots
-// outright, so unlike the packed scalar pop there are no neighbours to preserve
 fn dsarr_pop_helper_src(rich: bool, tr: bool) -> String {
     format!(
         "function dsarr_pop{k}(len_slot, es) {{\n\
@@ -1612,8 +1542,6 @@ impl<'c> Ctx<'c> {
     }
 
     // Binds the class an entry point belongs to. Entry points are declared
-    // inside a contract, so their bodies can say self.field, without a
-    // self context that resolves as a memory field on an unbound self
     pub fn with_self(mut self, self_ctx: Option<&'c SelfCtx>) -> Self {
         self.self_ctx = self_ctx;
         self
@@ -1739,8 +1667,6 @@ impl<'a> Translator<'a> {
     }
 
     // Files one log() site's schema, or reports the name as ambiguous.
-    //
-    // Two sites may legitimately log the same event repeatedly, but they must
     fn record_event(&self, name: &str, schema: EventSchema) -> Result<(), String> {
         let mut events = self.events.borrow_mut();
         match events.get(name) {
@@ -2102,8 +2028,6 @@ impl<'a> Translator<'a> {
     }
 
     // How many bytes this type occupies in an ABI head: one word for a
-    // scalar or a dynamic type's offset, N words inline for a fixed array.
-    // Shared so the calldata-length guard, the head layout, and the decoders
     pub fn abi_head_bytes(&self, t: &Type) -> usize {
         if self.abi_is_dynamic(t) {
             return 32;
@@ -2133,8 +2057,6 @@ impl<'a> Translator<'a> {
     }
 
     // Resolves an expression's static type without relying on the semantic
-    // checker's symbol table, which is already stale by codegen time (its
-    // per-function scopes were pushed and popped during the earlier
     fn static_type(&self, expr: &Expr, ctx: &Ctx) -> Type {
         match expr {
             Expr::Number(_) => Type::Primitive("u256".to_string()),
@@ -2207,6 +2129,10 @@ impl<'a> Translator<'a> {
                         && matches!(method.as_str(), "concat" | "slice")
                     {
                         return base_ty.clone();
+                    }
+                    // A numeric .to_string() yields a String. Without this a
+                    if method == "to_string" && is_numeric_primitive(class_name) {
+                        return Type::Primitive("String".to_string());
                     }
                     if let Some(cd) = self.type_checker().loaded_classes.get(class_name) {
                         if let Some(m) = cd.methods.iter().find(|m| &m.name == method) {
@@ -2368,8 +2294,6 @@ impl<'a> Translator<'a> {
                 let mut arr_ret: Option<(String, String, bool, usize)> = None;
                 if let Some(ret_ty) = &ctx.return_type {
                     // A fixed-bytes value keeps its internal (right-aligned) form
-                    // for gum-to-gum returns; the entry return below re-aligns it
-                    // to the wire. mask_for_type here would shr it (decode direction).
                     if !matches!(ret_ty, Type::Primitive(n) if byte_width(n).is_some()) {
                         val_expr = mask_for_type(&val_expr, ret_ty);
                     }
@@ -2454,7 +2378,6 @@ impl<'a> Translator<'a> {
                         )
                     } else {
                         // A sub-word fixed-bytes return is laid out left-aligned
-                        // on the wire; b32 (and non-byte scalars) go out as is.
                         let enc = match &ctx.return_type {
                             Some(Type::Primitive(rn)) => match byte_width(rn) {
                                 Some(w) if w < 32 => format!("shl({}, {})", (32 - w) * 8, val_expr),
@@ -4950,8 +4873,6 @@ impl<'a> Translator<'a> {
     }
 
     // An interface call is the same ABI layout problem as a CREATE, only the prefix differs: a 4-byte selector instead of the child's creation code, so it shares abi_arg_blob_src.
-    // The parameter types come from the interface declaration rather than the argument expressions, because only the declaration says whether a value is a tuple, a string, or a scalar.
-    // Output is taken via returndatacopy rather than a call-supplied buffer, since with dynamic args the arg blob is no longer conveniently at least a word wide.
     fn extcall_return_src(&self, ret_ty: &Option<Type>) -> String {
         let t = match ret_ty {
             Some(t) => t,
