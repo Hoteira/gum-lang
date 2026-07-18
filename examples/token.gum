@@ -37,7 +37,7 @@ contract TokenState:
 
         log(TokenLogs.Mint, indexed(to), amount)
 
-    // No `export`, so this is internal and gets no ABI selector.
+    // No export, so this is internal and gets no ABI selector.
     fn calculate_bonus(u256 amount) -> u256:
         return amount / 100
 

@@ -1,13 +1,3 @@
-// What a function does to chain state, which is what the ABI's stateMutability
-// tells callers. Getting it wrong in one direction is only untidy: calling a
-// view function "nonpayable" makes a wallet prompt for gas to read a balance.
-// Getting it wrong the other way is dangerous: a caller told a function is
-// "view" reaches it with eth_call, so a write silently never happens.
-//
-// So the analysis is a whitelist, not a blacklist. Anything it does not
-// positively recognise as read-only counts as a write, and an unknown call is
-// assumed to do the worst thing.
-
 use crate::ast::*;
 use crate::semantic::TypeChecker;
 use std::collections::HashMap;
@@ -22,8 +12,8 @@ pub enum Mut {
 
 pub type MutMap = HashMap<String, Mut>;
 
-// Whether an lvalue or expression bottoms out at contract storage, `Vault.total` or `self.x` inside a contract, as opposed to a local or a memory value.
-// Walks to the root of the chain, so `Vault.stakes[who].amount` counts.
+// Whether an lvalue or expression bottoms out at contract storage, Vault.total or self.x inside a contract, as opposed to a local or a memory value.
+// Walks to the root of the chain, so Vault.stakes[who].amount counts.
 fn storage_root(tc: &TypeChecker, class: &ClassDecl, e: &Expr) -> bool {
     match e {
         Expr::Identifier(n) => {
@@ -69,7 +59,7 @@ fn expr_effect(tc: &TypeChecker, class: &ClassDecl, e: &Expr, map: &MutMap) -> M
             let own = if storage_root(tc, class, base) { Mut::View } else { Mut::Pure };
             own.max(sub(base)).max(sub(index))
         }
-        // `new Child(...)` on a contract is a CREATE; on a plain class it is a memory allocation.
+        // new Child(...) on a contract is a CREATE; on a plain class it is a memory allocation.
         Expr::Instantiation { type_def, args } => {
             let own = if is_contract_type(tc, type_def) { Mut::NonPayable } else { Mut::Pure };
             own.max(max_of(args.iter().map(sub)))
@@ -85,7 +75,7 @@ fn expr_effect(tc: &TypeChecker, class: &ClassDecl, e: &Expr, map: &MutMap) -> M
         }
         Expr::MethodCall { base, method, args } => {
             let a = max_of(args.iter().map(sub));
-            // `IERC20(addr).transfer(...)`: a real CALL, and gum emits CALL rather than STATICCALL even for a getter, so it is never view.
+            // IERC20(addr).transfer(...): a real CALL, and gum emits CALL rather than STATICCALL even for a getter, so it is never view.
             if let Expr::FnCall { name, .. } = &**base {
                 if tc.loaded_interfaces.contains(name) {
                     return Mut::NonPayable;
@@ -153,7 +143,7 @@ fn stmt_effect(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &MutMap)
             body(try_body).max(body(catch_body))
         }
         Statement::Expression(e) => sub(e),
-        // A raw `call target(payload)`, and raw Yul, can do anything.
+        // A raw call target(payload), and raw Yul, can do anything.
         Statement::Call { .. } => Mut::NonPayable,
         Statement::UnsafeBlock(_) => Mut::NonPayable,
     }
@@ -184,7 +174,7 @@ pub fn analyze_class(tc: &TypeChecker, class: &ClassDecl) -> MutMap {
 }
 
 // The ABI's stateMutability for one function.
-// `payable` is a declaration, not something to infer. A `once` function writes its has-run flag, so it is never view however clean its body looks.
+// payable is a declaration, not something to infer. A once function writes its has-run flag, so it is never view however clean its body looks.
 pub fn state_mutability(f: &FnDecl, map: &MutMap) -> &'static str {
     if f.modifiers.iter().any(|m| m == "payable") {
         return "payable";
@@ -199,7 +189,7 @@ pub fn state_mutability(f: &FnDecl, map: &MutMap) -> &'static str {
     }
 }
 
-// Whether a function only reads. Such a function cannot be harmed by reentrancy, so it needs no guard, and it must not carry one: a guard is a TSTORE, which reverts inside the STATICCALL that `view` invites callers to use.
+// Whether a function only reads. Such a function cannot be harmed by reentrancy, so it needs no guard, and it must not carry one: a guard is a TSTORE, which reverts inside the STATICCALL that view invites callers to use.
 pub fn is_read_only(f: &FnDecl, map: &MutMap) -> bool {
     matches!(state_mutability(f, map), "view" | "pure")
 }

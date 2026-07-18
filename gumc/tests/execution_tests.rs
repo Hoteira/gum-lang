@@ -1,16 +1,3 @@
-// Execution-level differential testing.
-//
-// Every other test in this crate proves gum's output *assembles*; these prove
-// it *runs correctly*, by executing the real bytecode in an in-process EVM
-// (revm) and, crucially, diffing it against the Solidity reference compiled
-// from an equivalent source. Identical calldata must produce identical
-// storage, return data, and success/revert on both. This is what converts
-// "looks right" into "provably behaves like solc".
-//
-// Needs solc (see solc_path below for how it is found); skips gracefully if
-// absent, since solc is optional tooling rather than a build dependency. CI
-// sets GUM_REQUIRE_SOLC so a skip there is a failure instead.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +19,6 @@ fn repo_root() -> PathBuf {
 // Finds solc: $SOLC first, then tools/solc(.exe), then whatever is on PATH.
 // The bare name is the fallback rather than the default so a local tools/ copy still wins, which is what keeps a developer's runs on the version this repo was verified against.
 //
-// Returning None makes the caller skip, since solc is optional tooling and not a build dependency. That is right on a laptop and wrong in CI, where a silent skip would turn 68 differential tests into a green tick that asserted nothing. GUM_REQUIRE_SOLC=1 turns the skip into a failure; the workflow sets it.
 fn solc_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SOLC") {
         let p = PathBuf::from(p);
@@ -63,15 +49,15 @@ fn tmp_path(ext: &str) -> PathBuf {
     p
 }
 
-/// Compiles gum source all the way to creation bytecode via gumc --bytecode.
-/// With rich, enables Panic(uint256) revert data so revert bytes can be
-/// diffed against Solidity's.
+// Compiles gum source all the way to creation bytecode via gumc --bytecode.
+// With rich, enables Panic(uint256) revert data so revert bytes can be
+// diffed against Solidity's.
 fn gum_creation_bytecode(src: &str, solc: &Path, rich: bool) -> Vec<u8> {
     gum_creation_bytecode_for(src, solc, rich, "")
 }
 
-/// Runs gumc without assembling, returning (succeeded, combined output), for
-/// asserting on diagnostics rather than bytecode.
+// Runs gumc without assembling, returning (succeeded, combined output), for
+// asserting on diagnostics rather than bytecode.
 fn run_gumc_exec(src: &str) -> (bool, String) {
     let path = tmp_path("gum");
     std::fs::write(&path, src).unwrap();
@@ -85,8 +71,8 @@ fn run_gumc_exec(src: &str) -> (bool, String) {
     (out.status.success(), text)
 }
 
-/// Creation bytecode for one contract out of a source that may declare several.
-/// name empty means "the first one" (the single-contract case).
+// Creation bytecode for one contract out of a source that may declare several.
+// name empty means "the first one" (the single-contract case).
 fn gum_creation_bytecode_for(src: &str, solc: &Path, rich: bool, name: &str) -> Vec<u8> {
     let path = tmp_path("gum");
     std::fs::write(&path, src).unwrap();
@@ -119,8 +105,8 @@ fn gum_creation_bytecode_for(src: &str, solc: &Path, rich: bool, name: &str) -> 
     hex::decode(&hex[2..]).expect("bad gum hex")
 }
 
-/// Like gum_creation_bytecode but under a storage lock at lock_path (created
-/// on first use, enforced after), for upgrade-safety tests.
+// Like gum_creation_bytecode but under a storage lock at lock_path (created
+// on first use, enforced after), for upgrade-safety tests.
 fn gum_creation_bytecode_locked(src: &str, solc: &Path, lock_path: &Path) -> Vec<u8> {
     let path = tmp_path("gum");
     std::fs::write(&path, src).unwrap();
@@ -143,13 +129,13 @@ fn gum_creation_bytecode_locked(src: &str, solc: &Path, lock_path: &Path) -> Vec
     hex::decode(&hex[2..]).expect("bad gum hex")
 }
 
-/// Compiles a Solidity contract to creation bytecode via solc --bin.
+// Compiles a Solidity contract to creation bytecode via solc --bin.
 fn sol_creation_bytecode(src: &str, solc: &Path) -> Vec<u8> {
     sol_creation_bytecode_for(src, solc, "")
 }
 
-/// Same, selecting one contract out of a source that declares several. solc
-/// prints a "======= <path>:<Name> =======" banner before each.
+// Same, selecting one contract out of a source that declares several. solc
+// prints a "======= <path>:<Name> =======" banner before each.
 fn sol_creation_bytecode_for(src: &str, solc: &Path, name: &str) -> Vec<u8> {
     let path = tmp_path("sol");
     std::fs::write(&path, src).unwrap();
@@ -179,19 +165,19 @@ fn deployer() -> Address {
     Address::from([0x11u8; 20])
 }
 
-/// Builds an EVM over $db pinned to the Osaka hardfork.
-///
-/// The spec is load-bearing, not incidental: it's what makes EIP-7702
-/// delegation indicators and the EIP-7951 secp256r1 precompile at 0x100 exist
-/// at all. On an older fork those features silently don't, and the tests that
-/// cover them would be verifying nothing.
-///
-/// A macro rather than a function because the concrete MainnetEvm<...> type
-/// is unnameable in practice and impl Trait loses the associated types the
-/// call sites need.
-/// Per-transaction gas limit. Osaka caps this at 2^24 (EIP-7825), so the old
-/// "just pass u64::MAX" trick is now a hard transaction error. Sits at the cap:
-/// far above anything these contracts need (the priciest deploy is ~550k).
+// Builds an EVM over $db pinned to the Osaka hardfork.
+//
+// The spec is load-bearing, not incidental: it's what makes EIP-7702
+// delegation indicators and the EIP-7951 secp256r1 precompile at 0x100 exist
+// at all. On an older fork those features silently don't, and the tests that
+// cover them would be verifying nothing.
+//
+// A macro rather than a function because the concrete MainnetEvm<...> type
+// is unnameable in practice and impl Trait loses the associated types the
+// call sites need.
+// Per-transaction gas limit. Osaka caps this at 2^24 (EIP-7825), so the old
+// "just pass u64::MAX" trick is now a hard transaction error. Sits at the cap:
+// far above anything these contracts need (the priciest deploy is ~550k).
 const TX_GAS_LIMIT: u64 = 16_777_216;
 
 macro_rules! evm_for {
@@ -210,12 +196,12 @@ macro_rules! evm_for {
     };
 }
 
-/// Deploys creation bytecode; returns the new contract address.
+// Deploys creation bytecode; returns the new contract address.
 fn deploy(db: &mut Db, creation: Vec<u8>) -> Address {
     deploy_with_gas(db, creation).0
 }
 
-/// Deploys and also returns the gas the deployment transaction consumed.
+// Deploys and also returns the gas the deployment transaction consumed.
 fn deploy_with_gas(db: &mut Db, creation: Vec<u8>) -> (Address, u64) {
     let mut evm = evm_for!(db);
     let tx = TxEnv::builder()
@@ -241,18 +227,18 @@ struct CallResult {
     gas: u64,
 }
 
-/// Sends calldata to to from deployer() and commits the result.
+// Sends calldata to to from deployer() and commits the result.
 fn call(db: &mut Db, to: Address, data: Vec<u8>) -> CallResult {
     call_from(db, deployer(), to, data)
 }
 
-/// Sends calldata to to from an arbitrary caller and commits the result.
+// Sends calldata to to from an arbitrary caller and commits the result.
 fn call_from(db: &mut Db, caller: Address, to: Address, data: Vec<u8>) -> CallResult {
     call_with_value(db, caller, to, data, U256::ZERO)
 }
 
-/// Like call_from but attaches ETH, for exercising payable / nonpayable guards.
-/// The caller is funded first so the transfer itself can't be what fails.
+// Like call_from but attaches ETH, for exercising payable / nonpayable guards.
+// The caller is funded first so the transfer itself can't be what fails.
 fn call_with_value(db: &mut Db, caller: Address, to: Address, data: Vec<u8>, value: U256) -> CallResult {
     if value > U256::ZERO {
         let mut info = db.basic(caller).unwrap().unwrap_or_default();
@@ -308,7 +294,7 @@ fn word_addr(a: Address) -> [u8; 32] {
     w
 }
 
-/// Selector + raw 32-byte words, for calls mixing address and uint256 args.
+// Selector + raw 32-byte words, for calls mixing address and uint256 args.
 fn encode_words(sig: &str, words: &[[u8; 32]]) -> Vec<u8> {
     let mut v = selector(sig).to_vec();
     for w in words {
@@ -329,9 +315,9 @@ fn storage_at(db: &mut Db, addr: Address, slot: U256) -> U256 {
     db.storage(addr, slot).expect("storage read failed")
 }
 
-/// Storage slot of mapping[key] for a base slot < 256, per the standard EVM
-/// layout keccak256(pad32(key) . pad32(base)), the exact scheme both solc
-/// and gum's gum_hash_slot use, so a match here proves they agree.
+// Storage slot of mapping[key] for a base slot < 256, per the standard EVM
+// layout keccak256(pad32(key) . pad32(base)), the exact scheme both solc
+// and gum's gum_hash_slot use, so a match here proves they agree.
 fn mapping_slot(key: Address, base: u8) -> U256 {
     use tiny_keccak::{Hasher, Keccak};
     let mut buf = [0u8; 64];
@@ -354,8 +340,8 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
         z ^ (z >> 31)
     }
-    /// A random U256. wide occasionally yields near-max values to provoke
-    /// overflow paths; otherwise stays in u64 range for mostly-succeeding ops.
+    // A random U256. wide occasionally yields near-max values to provoke
+    // overflow paths; otherwise stays in u64 range for mostly-succeeding ops.
     fn next_u256(&mut self, wide: bool) -> U256 {
         if wide && self.next_u64() % 4 == 0 {
             // Near the top of the range: forces checked-arithmetic reverts.
@@ -411,9 +397,9 @@ const SOL_ABI_MIX: &str = include_str!("fixtures/sol_abi_mix.sol");
 
 const SOL_STORE_CONSTRUCTOR: &str = include_str!("fixtures/sol_store_constructor.sol");
 
-/// Deploys both, replays the same call vector on each, and asserts identical
-/// success, return data, and slot-0 storage after every step. rich compiles
-/// gum with --rich-reverts so revert *reason bytes* are comparable too.
+// Deploys both, replays the same call vector on each, and asserts identical
+// success, return data, and slot-0 storage after every step. rich compiles
+// gum with --rich-reverts so revert reason bytes are comparable too.
 fn diff_run(calls: &[(&str, Vec<U256>)], rich: bool) {
     let solc = match solc_path() {
         Some(p) => p,
@@ -648,7 +634,7 @@ fn amm_external_calls_storage_and_events_match_solidity() {
     assert_eq!(storage_at(&mut gdb, gamm, mapping_slot(deployer(), 5)), U256::from(1000), "shares[sender]");
 
     // Final sanity on the actual numbers: add_liquidity(1000,2000) then
-    // swap(tokenA,500): reserveA = 1000+500, reserveB = 2000 - (2000*500/1500).
+    // swap(tokenA,500): reserveA = 1000+500, reserveB = 2000 - (2000500/1500).
     assert_eq!(storage(&mut gdb, gamm, 2), U256::from(1500), "reserve_a");
     assert_eq!(storage(&mut gdb, gamm, 3), U256::from(2000u64 - (2000u64 * 500 / 1500)), "reserve_b");
 }
@@ -675,7 +661,7 @@ const SOL_MAP_CSE: &str = include_str!("fixtures/sol_map_cse.sol");
 // layout. Fields are declared in a deliberately cache-unfriendly order
 // (small, big, small): Solidity keeps that order, a(slot0), big(slot1),
 // b(slot2) = 3 slots. gum reorders by size, big(slot0), a+b(slot1) = 2 slots
-//, so writing all three touches one fewer cold slot (~one fewer 20k SSTORE).
+// , so writing all three touches one fewer cold slot (~one fewer 20k SSTORE).
 const GUM_PACK: &str = include_str!("fixtures/gum_pack.gum");
 
 const SOL_PACK: &str = include_str!("fixtures/sol_pack.sol");
@@ -726,7 +712,7 @@ fn gas_probe_mapping_cse() {
     assert!(g.success && s.success);
 }
 
-// v1: two u128s pack into slot 0. v2: a u256 is *prepended* (worst case for
+// v1: two u128s pack into slot 0. v2: a u256 is prepended (worst case for
 // reordering) and appended fields added. Under a lock, a/b must stay at
 // slot 0 so v2's code reads the storage v1 wrote.
 const LOCK_V1: &str = include_str!("fixtures/lock_v1.gum");
@@ -756,7 +742,7 @@ fn storage_lock_keeps_v1_storage_readable_by_v2() {
     let v1_slot0 = storage(&mut db1, a1, 0);
     assert_eq!(U256::from_be_slice(&call(&mut db1, a1, encode("get_a()", &[])).output), U256::from(7u64));
 
-    // Simulate an upgrade: deploy v2 fresh, then seed it with the *exact*
+    // Simulate an upgrade: deploy v2 fresh, then seed it with the exact
     // storage v1 left behind. If the lock held, v2's get_a/get_b read the
     // inherited slot-0 correctly and big (fresh slot) reads zero.
     let mut db2: Db = CacheDB::new(EmptyDB::default());
@@ -796,15 +782,15 @@ fn gas_contract(solc: &Path, name: &str, gum_src: &str, sol_src: &str, steps: &[
     }
 }
 
-/// Runtime bytecode size, gum vs Solidity, for every reference contract.
-///
-///     cargo test --test execution_tests size_report -- --nocapture
-///
-/// Unlike gas_report this *asserts* the range the README publishes. The size
-/// figures had drifted (the README claimed 62-93% and 63-94% in two places,
-/// while the truth was 62-95%) precisely because nothing checked them, whereas
-/// the gas numbers next door stayed accurate, they have a test. A published
-/// number with no test is a number that is already rotting.
+// Runtime bytecode size, gum vs Solidity, for every reference contract.
+//
+// cargo test --test execution_tests size_report -- --nocapture
+//
+// Unlike gas_report this asserts the range the README publishes. The size
+// figures had drifted (the README claimed 62-93% and 63-94% in two places,
+// while the truth was 62-95%) precisely because nothing checked them, whereas
+// the gas numbers next door stayed accurate, they have a test. A published
+// number with no test is a number that is already rotting.
 #[test]
 fn size_report() {
     let solc = match solc_path() {
@@ -816,7 +802,7 @@ fn size_report() {
     };
     // Solidity appends ~54 bytes of CBOR metadata by default; gum emits none.
     // Comparing against that would credit gum for bytes it simply doesn't
-    // write, and the README's claim is about *codegen density*, so measure
+    // write, and the README's claim is about codegen density, so measure
     // solc without it. This is the comparison that can be lost, not won by
     // default.
     let cases: [(&str, &str); 5] = [
@@ -859,11 +845,11 @@ fn size_report() {
     assert!(lo >= 50 && hi <= 130, "size range {}-{}% is outside the documented 50-130% band", lo, hi);
 }
 
-/// Live gas comparison, gum vs Solidity, executed in revm. Not an assertion
-/// test, run it to see the numbers:
-///     cargo test --test execution_tests gas_report -- --nocapture
-/// Gas figures include the 21000 intrinsic tx cost (identical on both sides,
-/// so deltas reflect real execution/deploy differences).
+// Live gas comparison, gum vs Solidity, executed in revm. Not an assertion
+// test, run it to see the numbers:
+// cargo test --test execution_tests gas_report -- --nocapture
+// Gas figures include the 21000 intrinsic tx cost (identical on both sides,
+// so deltas reflect real execution/deploy differences).
 #[test]
 fn gas_report() {
     let solc = match solc_path() {
@@ -982,11 +968,11 @@ fn time_contract(solc: &Path, name: &str, gum_src: &str, sol_src: &str, steps: &
     print_time_row(name, gt, st, reps);
 }
 
-/// Wall-clock execution time in revm, gum vs Solidity, averaged over many
-/// deploy+call reps on fresh state each time. Run it with:
-///     cargo test --test execution_tests timing_report -- --nocapture
-/// CAVEAT: wall-clock is NOT the on-chain cost (gas is) and is noisy; treat
-/// this as a rough relative signal only. It broadly tracks opcode/gas counts.
+// Wall-clock execution time in revm, gum vs Solidity, averaged over many
+// deploy+call reps on fresh state each time. Run it with:
+// cargo test --test execution_tests timing_report -- --nocapture
+// CAVEAT: wall-clock is NOT the on-chain cost (gas is) and is noisy; treat
+// this as a rough relative signal only. It broadly tracks opcode/gas counts.
 #[test]
 fn timing_report() {
     let solc = match solc_path() {
@@ -1066,7 +1052,7 @@ fn timing_report() {
 fn fuzz_store_matches_solidity() {
     // Hundreds of random set/add ops against Store, diffed step-by-step. Wide
     // values regularly hit checked-add overflow, so this also asserts gum and
-    // solc revert on the *same* inputs (and leave storage unchanged), with
+    // solc revert on the same inputs (and leave storage unchanged), with
     // --rich-reverts so the Panic reason bytes are compared too.
     let solc = match solc_path() {
         Some(p) => p,
@@ -1177,7 +1163,7 @@ fn fuzz_amm_matches_solidity() {
     }
 }
 
-/// Storage slot of m[id] for a uint256-keyed mapping at base slot < 256.
+// Storage slot of m[id] for a uint256-keyed mapping at base slot < 256.
 fn mapping_slot_uint(key: U256, base: u8) -> U256 {
     use tiny_keccak::{Hasher, Keccak};
     let mut buf = [0u8; 64];
@@ -1190,7 +1176,7 @@ fn mapping_slot_uint(key: U256, base: u8) -> U256 {
     U256::from_be_bytes(out)
 }
 
-/// keccak256(pad32(len_slot)), the data base of a dynamic storage array.
+// keccak256(pad32(len_slot)), the data base of a dynamic storage array.
 fn dyn_array_data_base(len_slot: u64) -> U256 {
     use tiny_keccak::{Hasher, Keccak};
     let mut k = Keccak::v256();
@@ -1390,8 +1376,8 @@ fn erc721_matches_solidity() {
     assert_eq!(U256::from_be_slice(&call(&mut gdb, ga, encode_words("ownerOf(uint256)", &[word_u256(id)])).output), U256::from_be_slice(bob.as_slice()));
 }
 
-/// A bytes4 argument rides the wire left-aligned: its 4 bytes in the high end
-/// of the word, the rest zero. This is how Solidity ABI-encodes bytes4.
+// A bytes4 argument rides the wire left-aligned: its 4 bytes in the high end
+// of the word, the rest zero. This is how Solidity ABI-encodes bytes4.
 fn word_bytes4(id: u32) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[..4].copy_from_slice(&id.to_be_bytes());
@@ -1505,7 +1491,7 @@ fn uint_to_string_produces_decimal() {
     }
 }
 
-/// Storage slot of nested m[k1][k2] at base slot < 256: keccak(k2 . keccak(k1 . base)).
+// Storage slot of nested m[k1][k2] at base slot < 256: keccak(k2 . keccak(k1 . base)).
 fn nested_mapping_slot(k1: Address, k2: Address, base: u8) -> U256 {
     use tiny_keccak::{Hasher, Keccak};
     let inner = mapping_slot(k1, base); // keccak(k1 . base)
@@ -1921,10 +1907,9 @@ contract App:
     assert_eq!(gr.output, sr.output, "gum dynamic custom-error data must match Solidity byte-for-byte");
 }
 
-/// An ABI argument: either a static 32-byte word or a dynamic byte string.
-/// How a string/bytes return arrives on the wire: a head word holding the
-/// offset (always 32, it is the only return value), a length word, then the
-/// bytes zero-padded to a word.
+// An ABI argument: either a static 32-byte word or a dynamic byte string.
+// How a string/bytes return arrives on the wire: a head word holding the
+// offset (always 32, it is the only return value), a length word, then the
 fn encode_abi_return_string(bytes: &[u8]) -> Vec<u8> {
     let mut v = U256::from(32u64).to_be_bytes::<32>().to_vec();
     v.extend_from_slice(&U256::from(bytes.len()).to_be_bytes::<32>());
@@ -1937,15 +1922,15 @@ fn encode_abi_return_string(bytes: &[u8]) -> Vec<u8> {
 enum Arg<'a> {
     Static([u8; 32]),
     Dyn(&'a [u8]),
-    /// A T[]: a count word then **one word per element**, however narrow the
-    /// element type is, the ABI never packs an array the way memory or storage
-    /// does.
+    // A T[]: a count word then one word per element, however narrow the
+    // element type is, the ABI never packs an array the way memory or storage
+    // does.
     Arr(&'a [U256]),
 }
 
-/// Encodes selector + head + tail for a mix of static and dynamic args,
-/// exactly as Solidity lays out a call (heads in order; each dynamic head is
-/// the byte offset from the start of the head region to its length word).
+// Encodes selector + head + tail for a mix of static and dynamic args,
+// exactly as Solidity lays out a call (heads in order; each dynamic head is
+// the byte offset from the start of the head region to its length word).
 fn encode_abi(sig: &str, args: &[Arg]) -> Vec<u8> {
     let head_size = args.len() * 32;
     let mut head = Vec::new();
@@ -2092,8 +2077,8 @@ contract State:
     }
 }
 
-/// ABI-encodes a single dynamic string/bytes return value the way the EVM
-/// returns it: offset(32), length, then zero-padded data.
+// ABI-encodes a single dynamic string/bytes return value the way the EVM
+// returns it: offset(32), length, then zero-padded data.
 fn abi_encode_string(s: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
@@ -2106,7 +2091,7 @@ fn abi_encode_string(s: &[u8]) -> Vec<u8> {
 
 #[test]
 fn string_literal_return_matches_solidity() {
-    // A string *literal* is a first-class String: returning it ABI-encodes
+    // A string literal is a first-class String: returning it ABI-encodes
     // byte-for-byte like Solidity returning the same string literal.
     let solc = match solc_path() {
         Some(p) => p,
@@ -2160,7 +2145,7 @@ contract App:
 
 #[test]
 fn custom_error_with_string_literal_arg_matches_solidity() {
-    // Passing a string *literal* to a custom error now works (literals are
+    // Passing a string literal to a custom error now works (literals are
     // Strings), and encodes byte-for-byte like Solidity.
     let solc = match solc_path() {
         Some(p) => p,
@@ -2326,8 +2311,6 @@ contract A {
 #[test]
 fn dynamic_constructor_args_match_solidity() {
     // A constructor taking a dynamic String alongside a static u256. The
-    // args blob is located via datasize (not a compile-time constant length),
-    // and the string is decoded from the tail. Differential vs a Solidity twin.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -2401,7 +2384,7 @@ const SOL_PAYABLE: &str = include_str!("fixtures/sol_payable.sol");
 #[test]
 fn payable_accepts_eth_and_nonpayable_still_rejects_it() {
     // The regression this guards: the ETH-rejection guard used to be hoisted to
-    // the dispatcher entry and *skipped entirely* the moment any function was
+    // the dispatcher entry and skipped entirely the moment any function was
     // payable, which would have let poke() and total_of() silently accept
     // and trap ETH. Each non-payable case must carry its own guard.
     let solc = match solc_path() {
@@ -2509,7 +2492,7 @@ const GUM_REENTRANT: &str = include_str!("fixtures/gum_reentrant.gum");
 // Calls poke() again from inside ping(), i.e. re-enters while the first poke is
 // still in flight. It does NOT swallow the failure, so a blocked re-entry
 // propagates out and fails the whole transaction.
-// Same shape as GUM_REENTRANT, but poke() *returns a value*, a different
+// Same shape as GUM_REENTRANT, but poke() returns a value, a different
 // codegen path for the lock release, and the one exercised below.
 const GUM_GUARDED_RETURNING: &str = include_str!("fixtures/gum_guarded_returning.gum");
 
@@ -2519,7 +2502,7 @@ const SOL_BATCHER: &str = include_str!("fixtures/sol_batcher.sol");
 
 #[test]
 fn guard_releases_the_lock_on_a_value_returning_entry_point() {
-    // The reentrancy lock must be *released* when a guarded entry point
+    // The reentrancy lock must be released when a guarded entry point
     // returns, not merely set. Transient storage clears at the end of the
     // transaction, not the call frame, so a lock left set stays set for the
     // rest of the tx, and the next perfectly legitimate call into the contract
@@ -2548,7 +2531,7 @@ fn guard_releases_the_lock_on_a_value_returning_entry_point() {
 // and the two contracts agree slot-for-slot: a->0, f->1, sentinel->2.
 // An array whose element is a struct wider than a word. Solidity gives each
 // such element whole slots, never packing two into one, so stakes[i] starts
-// at base + i*2 and its two fields sit at +0 and +1.
+// at base + i2 and its two fields sit at +0 and +1.
 const GUM_STRUCT_ARR: &str = include_str!("fixtures/gum_struct_arr.gum");
 
 const SOL_STRUCT_ARR: &str = r#"
@@ -2580,7 +2563,7 @@ fn struct_array_layout_matches_solidity() {
     // just addressed by index instead of by hash.
     //
     // Diff the raw slots, not only the getters. This path used to store the
-    // pushed struct's *memory pointer* into a single slot and mload it back on
+    // pushed struct's memory pointer into a single slot and mload it back on
     // read, which returned zero for every field once memory was fresh; a
     // getters-only test that compared gum against gum would have looked fine.
     let solc = match solc_path() {
@@ -2658,7 +2641,7 @@ fn struct_array_layout_matches_solidity() {
     let oob = both!("get_amount(uint256)", &[word_u256(U256::from(3u64))]);
     assert!(!oob.success, "index 3 of a 3-element array must revert");
 
-    // pop must zero *both* of the removed element's slots, like Solidity.
+    // pop must zero both of the removed element's slots, like Solidity.
     both!("drop()", &[]);
     same_storage!("pop");
     let n = both!("len()", &[]);
@@ -2787,7 +2770,7 @@ fn delete_matches_solidity() {
     // dynamic array's elements and length, a fixed array, a mapping entry, and
     // a struct behind a mapping. Diff raw slots against Solidity's own
     // delete, since the whole point is releasing storage, a delete that only
-    // *reads back* as zero while leaving words behind would pass a getter test
+    // reads back as zero while leaving words behind would pass a getter test
     // and still be wrong.
     let solc = match solc_path() {
         Some(p) => p,
@@ -2866,7 +2849,7 @@ fn delete_matches_solidity() {
     }
 }
 
-// A Vec(T) *contract field* is a storage vector: same layout as [T], and both
+// A Vec(T) contract field is a storage vector: same layout as [T], and both
 // spellings of each operation (get/[i], len()/.length) reach it.
 const GUM_STORAGE_VEC: &str = include_str!("fixtures/gum_storage_vec.gum");
 
@@ -2959,7 +2942,7 @@ fn storage_vec_matches_a_solidity_dynamic_array() {
 // holding the ledger, a middle layer adding ownership, a contract adding its
 // own field and overriding a method.
 //
-// credit and claim are exported on the *bases*. Neither base is a
+// credit and claim are exported on the bases. Neither base is a
 // contract, so they are not entry points there, they become entry points on
 // Bank by being inherited, which is the whole point: a base class carries a
 // reusable slice of a contract's public surface (Ownable, ERC20) instead of
@@ -2973,7 +2956,7 @@ fn inheritance_matches_solidity() {
     // Solidity lays inherited state out most-base-first, and so does gum, so a
     // three-level chain must agree slot-for-slot: total->0, owner->1, fee->2.
     // The override must win at every level, and an inherited method must bind
-    // to the *child's* storage.
+    // to the child's storage.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -3168,7 +3151,7 @@ fn receive_and_fallback_match_solidity() {
 
 #[test]
 fn a_payable_receive_does_not_disarm_the_guard_on_other_functions() {
-    // The hoisted nonpayable guard is only sound when *nothing* is payable. A
+    // The hoisted nonpayable guard is only sound when nothing is payable. A
     // payable receive makes something payable, so the hoist must be
     // suppressed and every other entry point must carry its own guard ,
     // otherwise poke() would silently accept and trap ETH.
@@ -3205,9 +3188,9 @@ const SOL_CHILD: &str = include_str!("fixtures/sol_child.sol");
 
 const SOL_BAD_CHILD: &str = include_str!("fixtures/sol_bad_child.sol");
 
-/// EIP-1014: keccak256(0xff ++ deployer ++ salt ++ keccak256(code))[12:].
-/// Computed here independently rather than asking a second Solidity contract,
-/// so the test checks gum against the spec and not against another guess.
+// EIP-1014: keccak256(0xff ++ deployer ++ salt ++ keccak256(code))[12:].
+// Computed here independently rather than asking a second Solidity contract,
+// so the test checks gum against the spec and not against another guess.
 fn create2_address(deployer: Address, salt: U256, code: &[u8]) -> Address {
     use tiny_keccak::{Hasher, Keccak};
     let mut code_hash = [0u8; 32];
@@ -3291,7 +3274,6 @@ fn factory_create_and_create2_deploy_real_contracts() {
     assert!(g.success && g.output == word_u256(U256::from(42u64)).to_vec(), "the create2'd child should work");
 
     // Same salt twice: the address is taken, so CREATE2 returns 0 and gum must
-    // revert rather than hand back the zero address.
     let r = call(
         &mut db,
         factory,
@@ -3363,7 +3345,7 @@ fn deploy_named(db: &mut Db, solc: &Path, src: &str, name: &str) -> Address {
 
 #[test]
 fn new_contract_deploys_a_real_child() {
-    // The child's creation code has to travel inside the factory's *runtime*,
+    // The child's creation code has to travel inside the factory's runtime,
     // its constructor has to run with the factory as msg.sender, and the
     // returned address has to be a live contract. Diffed against Solidity's
     // new Child(x), which is the same operation.
@@ -3412,7 +3394,7 @@ fn new_contract_deploys_a_real_child() {
     assert_eq!(storage(&mut gdb, gfac, 0), U256::from(1u64));
     assert_eq!(addr_from_word(&call(&mut gdb, gfac, selector("last()").to_vec()).output), child);
 
-    // Each call makes a *distinct* child (CREATE bumps the factory's nonce).
+    // Each call makes a distinct child (CREATE bumps the factory's nonce).
     let r2 = both!("make(uint256)", &[word_u256(U256::from(7u64))]);
     let child2 = addr_from_word(&r2.output);
     assert_ne!(child2, child, "a second make() must deploy a distinct contract");
@@ -3423,15 +3405,11 @@ fn new_contract_deploys_a_real_child() {
     assert_eq!(g.output, word_u256(U256::from(42u64)).to_vec(), "the first child must be unaffected");
 
     // gum and Solidity agree on the addresses too: CREATE is
-    // keccak(rlp(deployer, nonce)), so identical nonces give identical results.
     let s = call(&mut sdb, sfac, encode_words("make(uint256)", &[word_u256(U256::from(1u64))]));
     assert!(s.success);
 }
 
 // A child taking a String constructor argument, deployed by a factory. The
-// factory has to head/tail-encode it and append it to the creation code; the
-// child decodes it back out. Both static and dynamic args, and two dynamic ones,
-// so the tail offsets have to actually be computed rather than guessed.
 const GUM_NEW_DYN: &str = include_str!("fixtures/gum_new_dyn.gum");
 
 const SOL_NEW_DYN: &str = include_str!("fixtures/sol_new_dyn.sol");
@@ -3439,9 +3417,6 @@ const SOL_NEW_DYN: &str = include_str!("fixtures/sol_new_dyn.sol");
 #[test]
 fn new_contract_passes_dynamic_constructor_args() {
     // A real ERC20-shaped deploy: new Token(name, supply, symbol). The
-    // factory encodes the args after the creation code (head of one word each,
-    // then a tail per dynamic arg), and the child decodes them back. Diffed
-    // against Solidity's own new Token(...), which does exactly this.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -3455,7 +3430,6 @@ fn new_contract_passes_dynamic_constructor_args() {
     let sdep = deploy(&mut sdb, sol_creation_bytecode_for(SOL_NEW_DYN, &solc, "Deployer"));
 
     // Walk the short/long storage-string boundary, and an empty string, so the
-    // tail offsets can't be right by accident.
     let cases: &[(&[u8], u64, &[u8])] = &[
         (b"Gum Token", 1_000_000, b"GUM"),
         (b"", 0, b""),
@@ -3476,7 +3450,6 @@ fn new_contract_passes_dynamic_constructor_args() {
         let schild = addr_from_word(&s.output);
 
         // The child decoded exactly what the factory encoded, checked against
-        // Solidity's bytes, not just against gum's own round-trip.
         for sig in ["name()", "symbol()", "supply()"] {
             let gr = call(&mut gdb, gchild, selector(sig).to_vec());
             let sr = call(&mut sdb, schild, selector(sig).to_vec());
@@ -3485,7 +3458,6 @@ fn new_contract_passes_dynamic_constructor_args() {
         }
 
         // ...and the storage the child wrote matches Solidity's slot-for-slot,
-        // so the strings really landed, not merely read back consistently.
         for slot in 0..3u64 {
             assert_eq!(
                 storage(&mut gdb, gchild, slot),
@@ -3586,7 +3558,7 @@ const SOL_ARR_ABI: &str = include_str!("fixtures/sol_arr_abi.sol");
 
 #[test]
 fn array_abi_args_and_returns_match_solidity() {
-    // [T] used to decode as a scalar: the head word is an *offset*, and the
+    // [T] used to decode as a scalar: the head word is an offset, and the
     // body got handed that offset as if it were the array pointer, while the
     // published ABI said uint256[], so callers encoded it properly. Silent
     // garbage. Every case here is diffed against Solidity's own encoding.
@@ -3663,8 +3635,6 @@ fn array_abi_args_and_returns_match_solidity() {
 }
 
 // A child whose constructor takes an array, deployed by a factory: the factory
-// has to ABI-encode the array after the creation code, and the child decodes it
-// out of the codecopy'd blob.
 const GUM_NEW_ARR: &str = include_str!("fixtures/gum_new_arr.gum");
 
 const SOL_NEW_ARR: &str = include_str!("fixtures/sol_new_arr.sol");
@@ -3709,9 +3679,7 @@ fn new_contract_passes_array_constructor_args() {
     }
 }
 
-// Fixed arrays across the ABI. T[N] is a *static* type on the wire: N inline
-// words in the head, no offset and no count, a different shape from T[], and
-// still not the same as memory's packed layout.
+// Fixed arrays across the ABI. T[N] is a static type on the wire: N inline
 const GUM_FARR_ABI: &str = include_str!("fixtures/gum_farr_abi.gum");
 
 const SOL_FARR_ABI: &str = include_str!("fixtures/sol_farr_abi.sol");
@@ -3719,8 +3687,6 @@ const SOL_FARR_ABI: &str = include_str!("fixtures/sol_farr_abi.sol");
 #[test]
 fn fixed_array_abi_matches_solidity() {
     // [u256; 3] used to work by luck, a flat calldatacopy is right only
-    // because its memory stride happens to equal the ABI's word. [u8; 3] took
-    // the scalar path and read the first calldata word as a pointer.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -3767,20 +3733,11 @@ fn fixed_array_abi_matches_solidity() {
 }
 
 // Transient storage (EIP-1153) with the full collection surface: a scalar, a
-// mapping, a dynamic array, and a string, the things the "just write it in
-// unsafe" approach cannot express, because a gum class cannot learn its own
-// slot.
-//
-// a/t and parr/tarr deliberately collide on slot numbers: the two
-// keyspaces are separate, so a transient slot 0 and a persistent slot 0 are
-// different locations, and neither may disturb the other.
 const GUM_TRANSIENT: &str = include_str!("fixtures/gum_transient.gum");
 
 #[test]
 fn transient_fields_hold_within_a_transaction() {
-    // The whole point: a transient field is real storage *during* the call ,
-    // scalar, mapping, array and string alike, with the identical slot/keccak
-    // layout, just tstore/tload.
+    // The whole point: a transient field is real storage during the call ,
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -3808,9 +3765,7 @@ fn transient_fields_hold_within_a_transaction() {
 
 #[test]
 fn transient_fields_clear_at_the_end_of_the_transaction() {
-    // ...and the whole *catch*: transient storage clears when the transaction
-    // ends, not when the call frame does. A second call sees nothing, while the
-    // persistent twin of every field survives.
+    // ...and the whole catch: transient storage clears when the transaction
     let solc = match solc_path() {
         Some(p) => p,
         None => return,
@@ -3848,7 +3803,6 @@ fn transient_fields_clear_at_the_end_of_the_transaction() {
     );
 
     // The persistent half is untouched, proving the two keyspaces are separate
-    // even though these fields share slot numbers.
     let r = call(&mut db, addr, selector("read_a()").to_vec());
     assert_eq!(r.output, word_u256(U256::from(11u64)).to_vec(), "the persistent scalar must survive");
     let r = call(&mut db, addr, selector("parr_len()").to_vec());
@@ -3862,8 +3816,6 @@ fn transient_fields_clear_at_the_end_of_the_transaction() {
 #[test]
 fn transient_and_persistent_slots_do_not_collide() {
     // A transient field and a persistent one can share a slot number, they are
-    // different keyspaces. Read the raw *persistent* slots: after a transaction
-    // that wrote both halves, only the persistent values may be there.
     let solc = match solc_path() {
         Some(p) => p,
         None => return,
@@ -3875,8 +3827,7 @@ fn transient_and_persistent_slots_do_not_collide() {
     let data = encode_abi("set_all(address,string)", &[Arg::Static(word_addr(who)), Arg::Dyn(b"hi")]);
     assert!(call(&mut db, addr, data).success);
 
-    // The transient writes used slots 0..3 of the *transient* keyspace. If they
-    // had leaked into persistent storage, one of these would hold 22/202/2002.
+    // The transient writes used slots 0..3 of the transient keyspace. If they
     let persistent: Vec<U256> = (0..4u64).map(|s| storage(&mut db, addr, s)).collect();
     for v in [22u64, 202, 2002] {
         assert!(
@@ -3901,7 +3852,6 @@ fn reentrancy_guard_blocks_a_real_attack_and_unsafe_opts_out() {
     };
 
     // Guarded (default): the re-entrant poke() must hit the lock and revert,
-    // which propagates back out and fails the whole call. counter stays 0.
     {
         let mut db: Db = CacheDB::new(EmptyDB::default());
         let vault = deploy(&mut db, gum_creation_bytecode(&GUM_REENTRANT.replace("{MOD}", ""), &solc, false));
@@ -3915,7 +3865,6 @@ fn reentrancy_guard_blocks_a_real_attack_and_unsafe_opts_out() {
     }
 
     // unsafe opts out: the same attack now goes through, proving the guard is
-    // what was doing the blocking (and that unsafe is a real escape hatch).
     {
         let mut db: Db = CacheDB::new(EmptyDB::default());
         let vault = deploy(&mut db, gum_creation_bytecode(&GUM_REENTRANT.replace("{MOD}", "unsafe "), &solc, false));
@@ -3936,8 +3885,6 @@ fn reentrancy_guard_blocks_a_real_attack_and_unsafe_opts_out() {
 #[test]
 fn reentrancy_lock_does_not_leak_across_calls_in_one_transaction() {
     // Transient storage persists for the whole transaction, so a guarded call
-    // that returns normally must clear the lock, otherwise a second, entirely
-    // legitimate call would find it still held.
     let solc = match solc_path() {
         Some(p) => p,
         None => return,
@@ -4010,9 +3957,6 @@ contract V:
 #[test]
 fn account_transfer_sends_eth_and_reverts_on_failure() {
     // to.transfer(amount) is the checked companion to pay(): it moves the ETH
-    // and aborts if the send fails, rather than handing back a bool. The failure
-    // half is the point, this is what the old stdlib stub got catastrophically
-    // wrong by returning true while moving nothing.
     let solc = match solc_path() {
         Some(p) => p,
         None => return,
@@ -4049,7 +3993,6 @@ contract V:
     assert_eq!(storage(&mut db, vault, 0), U256::from(3_000u64));
 
     // Sad path: a recipient that rejects the money, reverting with 0xdeadbeef.
-    //   PUSH32 <0xdeadbeef padded> ; PUSH0 ; MSTORE ; PUSH1 4 ; PUSH0 ; REVERT
     let mut code = vec![0x7fu8];
     code.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
     code.extend_from_slice(&[0u8; 28]);
@@ -4079,9 +4022,6 @@ const GUM_P256: &str = include_str!("fixtures/gum_p256.gum");
 #[test]
 fn p256_verify_accepts_a_real_signature_and_rejects_tampering() {
     // A genuine secp256r1 signature, verified through gum's Crypto.verify_p256
-    // against the live EIP-7951 precompile at 0x100 (present because the EVM is
-    // pinned to Osaka). This is the curve behind Secure Enclave / Android
-    // Keystore / WebAuthn passkeys, which ecrecover cannot check.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -4119,7 +4059,6 @@ fn p256_verify_accepts_a_real_signature_and_rejects_tampering() {
     );
 
     // Every single-field tamper must be rejected, otherwise "returns true" is
-    // meaningless.
     let tampered: &[(&str, [U256; 5])] = &[
         ("wrong hash", [h ^ U256::from(1u64), r, s, qx, qy]),
         ("wrong r", [h, r ^ U256::from(1u64), s, qx, qy]),
@@ -4138,9 +4077,6 @@ fn p256_verify_accepts_a_real_signature_and_rejects_tampering() {
 #[test]
 fn eip7702_delegated_to_reads_the_delegation_indicator() {
     // A 7702-delegated EOA's code is exactly 0xef0100 ++ <20-byte target>.
-    // revm models this natively (Bytecode::new_eip7702), and the EVM is pinned
-    // to Osaka, so this exercises the real thing rather than hand-planted bytes
-    //, which the previous revm (14) rejected outright for its 0xEF prefix.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -4208,9 +4144,6 @@ const SOL_CRYPTO: &str = include_str!("fixtures/sol_crypto.sol");
 #[test]
 fn keccak256_and_ecrecover_match_solidity() {
     // Both were declared in the stdlib but never wired to codegen: keccak256
-    // emitted a 1-arg call to the 2-arg Yul builtin (assembly error), and the
-    // crypto module didn't even import. Prove they now produce the same values
-    // Solidity does.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -4223,8 +4156,7 @@ fn keccak256_and_ecrecover_match_solidity() {
     let gaddr = deploy(&mut gdb, gum_creation_bytecode(GUM_CRYPTO, &solc, false));
     let saddr = deploy(&mut sdb, sol_creation_bytecode(SOL_CRYPTO, &solc));
 
-    // keccak256 must hash the *contents*, not the header or the pointer ,
-    // including the empty string and values crossing a 32-byte boundary.
+    // keccak256 must hash the contents, not the header or the pointer ,
     for msg in [
         b"".as_ref(),
         b"a".as_ref(),
@@ -4239,7 +4171,6 @@ fn keccak256_and_ecrecover_match_solidity() {
     }
 
     // ecrecover against a real secp256k1 signature: gum must recover the same
-    // signer Solidity does, and agree on the failure case (zero address).
     let sig = "rec(uint256,uint8,uint256,uint256)";
     let cases: &[[U256; 4]] = &[
         // A genuine mainnet-style signature triple.
@@ -4270,10 +4201,6 @@ const SOL_SSTR: &str = include_str!("fixtures/sol_sstr.sol");
 #[test]
 fn storage_string_layout_matches_solidity() {
     // The thing standing between gum and a real ERC20 name/symbol.
-    // Solidity's storage-string encoding is: short (<=31 bytes) packed inline
-    // with len*2 in the low byte; long tagged len*2+1 with data at
-    // keccak256(slot). Diff the raw slots, not just the getters, so an
-    // encoding difference can't hide behind a correct-looking read.
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -4287,7 +4214,6 @@ fn storage_string_layout_matches_solidity() {
     let saddr = deploy(&mut sdb, sol_creation_bytecode(SOL_SSTR, &solc));
 
     // Walk the short/long boundary deliberately, and end shorter than we
-    // started so the long-form cleanup path is exercised.
     let cases: &[&[u8]] = &[
         b"",
         b"a",
@@ -4313,7 +4239,6 @@ fn storage_string_layout_matches_solidity() {
             "storage string header slot differs for len {}", name.len()
         );
         // ...and every data slot at keccak256(0), including the ones a previous
-        // longer value used (they must be zeroed the way Solidity zeroes them).
         let base = dyn_array_data_base(0);
         for i in 0..5u64 {
             let slot = base + U256::from(i);
@@ -4332,7 +4257,6 @@ fn storage_string_layout_matches_solidity() {
     }
 
     // The neighbouring scalar must be untouched by all that: a storage string
-    // owns its whole slot and must not have packed into slot 1.
     let d = encode("set_supply(uint256)", &[U256::from(4242u64)]);
     assert!(call(&mut gdb, gaddr, d.clone()).success);
     assert!(call(&mut sdb, saddr, d).success);
@@ -4342,14 +4266,7 @@ fn storage_string_layout_matches_solidity() {
 
 #[test]
 fn const_fields_are_baked_in_per_deployment() {
-    // Two deployments of the *same* creation code with different constructor
-    // args must read back different values. This is exactly why a const whose
-    // value comes from a constructor argument cannot be folded into a
-    // compile-time constant: one compiled contract, many deployments, a
-    // different value in each. Only the deploy-time patch can express that.
-    //
-    // The ordinary storage field alongside them guards the layout: const
-    // fields reserve no slot, so counter must still work.
+    // Two deployments of the same creation code with different constructor
     let solc = match solc_path() {
         Some(p) => p,
         None => {
@@ -4455,7 +4372,7 @@ fn a_storage_array_copies_into_memory() {
 }
 
 // A struct crossing the ABI is the case where memory and the wire disagree about everything.
-// P's fields are declared a(u128) b(u256) c(u8) d(address) e(bool), but memory sorts them widest-first, so b and d sit *before* a: declaration order and memory order are deliberately different here.
+// P's fields are declared a(u128) b(u256) c(u8) d(address) e(bool), but memory sorts them widest-first, so b and d sit before a: declaration order and memory order are deliberately different here.
 // That makes any copy that treats the tuple as a block, rather than moving each field, come back transposed instead of merely shifted.
 #[test]
 fn a_struct_crosses_the_abi_like_solidity() {
@@ -4516,7 +4433,6 @@ fn a_struct_crosses_the_abi_like_solidity() {
 }
 
 // A constructor's struct arg travels a different path from a dispatcher's: it arrives appended to the creation code and is codecopy'd in, so it decodes from memory rather than calldata.
-// Deploying both compilers with byte-identical trailing args is what proves the two decoders agree on where each field starts.
 #[test]
 fn a_struct_constructor_arg_matches_solidity() {
     let solc = match solc_path() {
@@ -4553,8 +4469,7 @@ fn a_struct_constructor_arg_matches_solidity() {
     assert_eq!(U256::from_be_slice(&gd.output), U256::from_be_slice(who.as_slice()), "address field");
 }
 
-// A struct passed to `new Child(...)` goes through the CREATE arg encoder, a third path that neither the dispatcher nor the constructor decode touches.
-// The child's decoder reads one word per field, so a parent that wrote the struct's memory pointer as a single word would hand it a garbage address and a zero.
+// A struct passed to new Child(...) goes through the CREATE arg encoder, a third path that neither the dispatcher nor the constructor decode touches.
 #[test]
 fn a_struct_passed_to_new_contract_matches_solidity() {
     let solc = match solc_path() {
@@ -4579,8 +4494,7 @@ fn a_struct_passed_to_new_contract_matches_solidity() {
     assert_eq!(U256::from_be_slice(&gr.output), U256::from(77u64), "child read field b");
 }
 
-// gum calling *Solidity* over an interface, which is the strongest available check on the arg encoder: solc's decoder is the reference, and it reverts on a malformed head or tail rather than guessing.
-// Covers a tuple, a string, and a dynamic array, the three shapes that used to go out as a bare memory pointer in one word, plus a tuple coming back.
+// gum calling Solidity over an interface, which is the strongest available check on the arg encoder: solc's decoder is the reference, and it reverts on a malformed head or tail rather than guessing.
 #[test]
 fn interface_calls_encode_non_scalar_args_for_solidity() {
     let solc = match solc_path() {
@@ -4627,7 +4541,7 @@ fn interface_calls_encode_non_scalar_args_for_solidity() {
     assert!(r.success, "fwd_arr reverted");
     assert_eq!(U256::from_be_slice(&r.output), U256::from(60u64), "solidity summed the array");
 
-    // A struct array through an interface, the one arg shape that is dynamic *and* has a per-element codec: an offset word, a count, then inline tuples.
+    // A struct array through an interface, the one arg shape that is dynamic and has a per-element codec: an offset word, a count, then inline tuples.
     let mut td = selector("fwd_starr(address,(uint128,uint256)[])").to_vec();
     td.extend_from_slice(&word_addr(sink));
     td.extend_from_slice(&word_u256(U256::from(64u64)));
@@ -4647,8 +4561,7 @@ fn interface_calls_encode_non_scalar_args_for_solidity() {
     );
     assert!(r.success, "fwd_mk reverted");
     assert_eq!(U256::from_be_slice(&r.output), U256::from(99u64), "gum decoded field b of solidity's returned tuple");
-    // Non-scalar *returns*: a string, a scalar array, and a struct array coming back out of returndata.
-    // Solidity is the encoder here, so these pin that gum reads the real ABI rather than its own idea of one; a decoder that took the offset word for a value would report 32 and look plausible.
+    // Non-scalar returns: a string, a scalar array, and a struct array coming back out of returndata.
     let r = call(&mut db, caller, encode_words("fwd_name_len(address)", &[word_addr(sink)]));
     assert!(r.success, "fwd_name_len reverted");
     assert_eq!(U256::from_be_slice(&r.output), U256::from(7u64), "length of \"gumball\", not the offset word");
@@ -4671,8 +4584,7 @@ fn interface_calls_encode_non_scalar_args_for_solidity() {
 
 }
 
-// An array of static structs: elements are inline on the wire at the tuple's full width, but inline and *packed* in memory at a different width, and in a different field order.
-// P is 96 bytes on the wire and 80 packed in memory, so every one of count, stride, and field order has to be right independently; getting only two of the three still passes a length check.
+// An array of static structs: elements are inline on the wire at the tuple's full width, but inline and packed in memory at a different width, and in a different field order.
 #[test]
 fn a_struct_array_crosses_the_abi_like_solidity() {
     let solc = match solc_path() {
@@ -4770,7 +4682,6 @@ fn a_struct_array_crosses_the_abi_like_solidity() {
 }
 
 // Message and Block are the ambient EVM state, so each accessor is only correct if it reaches the right opcode.
-// address() is the one that moved classes, being frame-scoped like sender and value rather than block-scoped, and number() was block_number, so both are checked by value rather than by shape.
 #[test]
 fn message_and_block_read_the_same_state_as_solidity() {
     let solc = match solc_path() {
@@ -4812,7 +4723,6 @@ fn message_and_block_read_the_same_state_as_solidity() {
 }
 
 // An enum is one uint8 word on the wire but a pointer to [tag][payload] in memory, so every boundary converts.
-// The decoder used to copy size_of(enum) = 64 bytes, which ate the *next* argument as the payload and left every later one reading past calldata as zero, and the return handed back the memory pointer instead of the tag. Both looked fine: right selector, right ABI, wrong numbers.
 #[test]
 fn enums_cross_the_abi_like_solidity() {
     let solc = match solc_path() {
@@ -4885,8 +4795,7 @@ fn enums_cross_the_abi_like_solidity() {
 
 }
 
-// A function the ABI calls `view` has to survive STATICCALL, which is what solc emits when one contract calls another's view function. Anything that writes state reverts in there.
-// That is the catch in inferring view: every entry point carries a transient-storage reentrancy guard when the contract makes external calls, and a TSTORE is a write. Advertising view while keeping the guard would make the getter uncallable from any Solidity contract.
+// A function the ABI calls view has to survive STATICCALL, which is what solc emits when one contract calls another's view function. Anything that writes state reverts in there.
 #[test]
 fn view_functions_survive_a_staticcall() {
     let solc = match solc_path() {
@@ -4940,8 +4849,7 @@ fn view_functions_survive_a_staticcall() {
 }
 
 
-// An enum in storage, in a mapping, and in a log. All three used to write the enum's *memory pointer* rather than its value, because size_of(enum) claimed 64 bytes for a [tag][payload] pair.
-// A payload-free enum is a u8, exactly as Solidity lays one out, so this diffs the raw slots rather than only the getters: a getter that reads back what it wrongly wrote would agree with itself.
+// An enum in storage, in a mapping, and in a log. All three used to write the enum's memory pointer rather than its value, because size_of(enum) claimed 64 bytes for a [tag][payload] pair.
 #[test]
 fn enum_state_matches_solidity() {
     let solc = match solc_path() {
@@ -4968,7 +4876,6 @@ fn enum_state_matches_solidity() {
     }
 
     // The enum must occupy one byte, not a whole slot and certainly not two.
-    // gum packs size-first, so its slot numbers need not match solidity's; what must hold is that the value is a byte and the neighbour is untouched.
     assert!(call(&mut gdb, g, encode("set_after(uint256)", &[U256::from(12345u64)])).success);
     let gr = call(&mut gdb, g, encode("get_after()", &[]));
     assert_eq!(U256::from_be_slice(&gr.output), U256::from(12345u64), "the field after an enum is not clobbered");
@@ -5002,7 +4909,6 @@ fn enum_state_matches_solidity() {
 }
 
 // The wire form of a uint256[][] body: a count, then one offset per row, then the rows.
-// The offsets are relative to the start of the offset table rather than to the array, which is the detail a nested decoder gets wrong first.
 fn enc_rows(rows: &[Vec<u64>]) -> Vec<u8> {
     let mut head: Vec<u8> = word_u256(U256::from(rows.len() as u64)).to_vec();
     let mut tail: Vec<u8> = Vec::new();
@@ -5021,7 +4927,6 @@ fn enc_rows(rows: &[Vec<u64>]) -> Vec<u8> {
 }
 
 // A nested array is the first shape where an element carries an offset instead of its bytes, so the wire grows an indirection the memory form does not have.
-// uint256[][] is the flagship: ragged rows make a wrong stride, a wrong offset base, and a wrong count each produce a different wrong answer.
 #[test]
 fn a_nested_array_crosses_the_abi_like_solidity() {
     let solc = match solc_path() {
@@ -5082,7 +4987,6 @@ fn a_nested_array_crosses_the_abi_like_solidity() {
 }
 
 // Three levels deep, a fixed array of dynamic ones, a dynamic array of fixed ones, and both struct-array shapes.
-// Each is a different answer to "does the element carry an offset" and "is the count in the type or in the data", which is what the codec recursion has to decide per level.
 #[test]
 fn nested_array_shapes_match_solidity() {
     let solc = match solc_path() {
@@ -5208,7 +5112,6 @@ fn nested_array_shapes_match_solidity() {
 }
 
 // Event data is an ABI argument list, and the log path used to write one word per field: for an array, a string or a struct that word was the memory pointer.
-// The ABI JSON said uint256[] the whole time, so a decoder read the pointer as a plausible small number rather than failing. Diffing the raw log bytes against Solidity is the only thing that catches that.
 #[test]
 fn logging_a_non_scalar_encodes_it_like_solidity() {
     let solc = match solc_path() {
@@ -5284,7 +5187,6 @@ fn logging_a_non_scalar_encodes_it_like_solidity() {
 }
 
 // A custom error's revert data is an ABI argument list too, and its encoder was hand-rolled: it handled scalars and strings and wrote the memory pointer for an array or a struct.
-// The selector is hashed from the real type, so ethers and viem decode the pointer as a plausible value rather than throwing.
 #[test]
 fn a_custom_error_with_a_non_scalar_field_matches_solidity() {
     let solc = match solc_path() {
@@ -5375,7 +5277,6 @@ contract C {
 }
 
 // An aggregate local with no initializer used to bind 0, so every read of it went to scratch memory at address 0 rather than to a value of its own.
-// Address 0 is where gum_hash_slot stages its keccak input, so a mapping read anywhere earlier in the function leaves a key sitting there and the "zero value" comes back as that key.
 #[test]
 fn an_uninitialized_aggregate_local_is_its_own_zero_value() {
     let solc = match solc_path() {
@@ -5477,7 +5378,6 @@ contract C:
     assert_eq!(U256::from_be_slice(&r.output), U256::from(9u64), "0 + 9");
 
     // delete on a memory-backed local clears its block. Assigning 0 nulled the pointer instead, and a plain read-back would still say zero, since scratch memory is usually zero anyway.
-    // Reading the mapping after the delete puts a live key in scratch, so a nulled pointer reads that key back rather than the cleared field.
     let r = call(&mut db, c, encode_words("delete_struct(address)", &[word_addr(key)]));
     assert!(r.success, "delete_struct reverted");
     assert_eq!(U256::from_be_slice(&r.output), U256::ZERO, "delete left the struct set");
@@ -5498,7 +5398,6 @@ contract C:
 }
 
 // A struct as a direct contract field: C.p.b = v compiled to a write into a fresh memory copy of the struct, which was then discarded, so the storage write was a silent no-op.
-// The same struct as a mapping value was always correct, which is why no test caught this: every fixture used the mapping form.
 #[test]
 fn a_struct_contract_field_persists_like_solidity() {
     let solc = match solc_path() {
@@ -5577,7 +5476,6 @@ contract C {
 }
 
 // Vec(P) and [P] are the same storage layout spelled two ways, but only the [P] form reached the struct path: Vec(P) fell through to the packed-scalar reader, so v.get(i).b read a storage word and used it as a memory pointer.
-// The .get(i) spelling was the other half of it, since only a mapping's .get resolved to a struct base.
 #[test]
 fn a_storage_vec_of_structs_matches_solidity() {
     let solc = match solc_path() {
@@ -5652,7 +5550,6 @@ contract C {
 }
 
 // checked_add and checked_sub guard with unsigned lt, and the "-" arm never branched on signedness at all.
-// So for a signed type any subtraction that goes negative reverted, and adding a negative number reverted, even though the ABI declares int256 and comparisons and division were already signed-aware.
 #[test]
 fn signed_add_and_sub_match_solidity() {
     let solc = match solc_path() {
@@ -5719,8 +5616,7 @@ contract C {
     assert_eq!(gr.output, sr.output, "sub8 1-2 differs from solidity");
 }
 
-// f32 and f64 are documented and type-checked as WAD fixed point, 1.0 being 10^18, but codegen never scaled them: a * b was a bare mul, so 1.0 * 1.0 came out as 10^36 rather than 1.0.
-// The twin does the scaling by hand, which is what a Solidity author writes because solc has no fixed point of its own: fixed and ufixed are reserved and unimplemented.
+// f32 and f64 are documented and type-checked as WAD fixed point, 1.0 being 10^18, but codegen never scaled them: a  b was a bare mul, so 1.0  1.0 came out as 10^36 rather than 1.0.
 #[test]
 fn wad_fixed_point_math_matches_hand_scaled_solidity() {
     let solc = match solc_path() {
@@ -5771,7 +5667,7 @@ contract C {
     };
     const ONE: i128 = 1_000_000_000_000_000_000;
 
-    // 1.0 * 1.0 must be 1.0. A bare mul gives 10^36.
+    // 1.0  1.0 must be 1.0. A bare mul gives 10^36.
     let d = encode_words("mul(int256,int256)", &[w(ONE), w(ONE)]);
     let gr = call(&mut gdb, g, d.clone());
     let sr = call(&mut sdb, s, d);
@@ -5779,7 +5675,7 @@ contract C {
     assert_eq!(gr.output, sr.output, "1.0 * 1.0 differs from solidity");
     assert_eq!(U256::from_be_slice(&gr.output), U256::from(ONE as u128), "1.0 * 1.0 is not 1.0");
 
-    // 2.5 * 4.0 = 10.0, and a negative operand, which the old unsigned guards would have reverted on.
+    // 2.5  4.0 = 10.0, and a negative operand, which the old unsigned guards would have reverted on.
     for (a, b) in [(ONE * 5 / 2, ONE * 4), (-ONE, ONE * 3), (ONE / 3, ONE * 3)] {
         let d = encode_words("mul(int256,int256)", &[w(a), w(b)]);
         let gr = call(&mut gdb, g, d.clone());
@@ -5820,8 +5716,7 @@ contract C {
     assert!(!call(&mut gdb, g, d).success, "div by zero did not revert");
 }
 
-// Returning a dynamic value straight from an external call, `return I(t).name()`, substituted the call expression twice: once to read the length, once to copy the bytes.
-// The counter proves it is now one call. Before, it was two, which is double gas and, for a callee free to answer differently, a length and a body from different calls.
+// Returning a dynamic value straight from an external call, return I(t).name(), substituted the call expression twice: once to read the length, once to copy the bytes.
 #[test]
 fn returning_an_external_dynamic_result_calls_once() {
     let solc = match solc_path() {
@@ -5877,7 +5772,6 @@ contract Counter {
 }
 
 // The type checker knows String.concat and String.slice return a String, but codegen's static_type did not, so it typed the intermediate as unknown and a.concat(b).length fell through to the property-offset catch-all.
-// This is the same two-resolvers-disagree shape as the Vec(P) bug: the semantic pass accepts what codegen then cannot resolve.
 #[test]
 fn chained_string_method_length_matches_solidity() {
     let solc = match solc_path() {
@@ -5948,7 +5842,6 @@ contract C {
 }
 
 // Child.Ancestor.method() calls that ancestor's version, distinct from Child.method() which is the child's override.
-// Solidity spells the same thing Base.method(), so the twin calls Ledger.tally / the override directly.
 #[test]
 fn ancestor_qualified_call_reaches_the_parent_version() {
     let solc = match solc_path() {
@@ -6021,8 +5914,7 @@ contract C is Ledger {
     assert_eq!(storage(&mut gdb, g, 0), U256::from(102u64), "shared total in slot 0");
 }
 
-// 512-bit mulDiv: a WAD multiply where the raw product a*b overflows int256 but the scaled result (a*b)/1e18 fits.
-// The old checked_smul-then-sdiv reverted on the intermediate; full mulDiv holds the product in two words and only fails if the true result exceeds int256.
+// 512-bit mulDiv: a WAD multiply where the raw product ab overflows int256 but the scaled result (ab)/1e18 fits.
 #[test]
 fn wad_mul_div_uses_full_precision() {
     let solc = match solc_path() {
@@ -6047,7 +5939,7 @@ fn wad_mul_div_uses_full_precision() {
     // two's complement of a positive magnitude
     let negw = |u: U256| word((U256::ZERO).wrapping_sub(u));
 
-    // mul: 2e38 * 3e38 -> 6e58. Raw product 6e76 overflows int256; result fits.
+    // mul: 2e38  3e38 -> 6e58. Raw product 6e76 overflows int256; result fits.
     let a = big("200000000000000000000000000000000000000");
     let b = big("300000000000000000000000000000000000000");
     let want = big("60000000000000000000000000000000000000000000000000000000000");
@@ -6057,14 +5949,14 @@ fn wad_mul_div_uses_full_precision() {
     assert!(r.success, "mul reverted on a product the scaled result can hold");
     assert_eq!(U256::from_be_slice(&r.output), want, "2e38 * 3e38 (WAD) = 6e58");
 
-    // negative: -2e38 * 3e38 -> -6e58
+    // negative: -2e38  3e38 -> -6e58
     let mut d = selector("mul(int256,int256)").to_vec();
     d.extend_from_slice(&negw(a)); d.extend_from_slice(&word(b));
     let r = call(&mut db, c, d);
     assert!(r.success, "signed mul reverted");
     assert_eq!(r.output.as_slice(), negw(want), "-2e38 * 3e38 = -6e58");
 
-    // div: 6e58 / 3e38 -> 2e38. Numerator 6e58 * 1e18 = 6e76 overflows int256; result fits.
+    // div: 6e58 / 3e38 -> 2e38. Numerator 6e58  1e18 = 6e76 overflows int256; result fits.
     let n = big("60000000000000000000000000000000000000000000000000000000000");
     let dd = big("300000000000000000000000000000000000000");
     let dwant = big("200000000000000000000000000000000000000");
@@ -6074,7 +5966,7 @@ fn wad_mul_div_uses_full_precision() {
     assert!(r.success, "div reverted on a numerator the result can hold");
     assert_eq!(U256::from_be_slice(&r.output), dwant, "6e58 / 3e38 (WAD) = 2e38");
 
-    // true overflow: 1e58 * 1e58 / 1e18 = 1e98 > int256 max, must revert.
+    // true overflow: 1e58  1e58 / 1e18 = 1e98 > int256 max, must revert.
     let huge = big("10000000000000000000000000000000000000000000000000000000000");
     let mut d = selector("mul(int256,int256)").to_vec();
     d.extend_from_slice(&word(huge)); d.extend_from_slice(&word(huge));

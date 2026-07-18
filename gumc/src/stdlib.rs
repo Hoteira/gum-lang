@@ -1,8 +1,3 @@
-// The standard library, compiled into the binary rather than read off disk.
-// gumc is a single executable with no install step and no search path: a `use gum.*` resolves the same way from any directory, on any machine, with nothing to point at.
-
-// A `use` path is a module followed by the symbol wanted out of it, so `gum.defaults.Account` is the class Account from module gum.defaults.
-// Keys are the module path lowercased; module names are case-insensitive, symbols are matched against the module's own declarations.
 static MODULES: &[(&str, &str)] = &[("gum.defaults", include_str!("../../std/defaults.gum"))];
 
 pub fn is_std_path(path: &str) -> bool {
@@ -15,7 +10,7 @@ pub fn lookup(module: &str) -> Option<&'static str> {
 }
 
 // Splits a use path into the longest prefix that names a module, plus the symbol after it.
-// Tried longest-first so a module whose name happens to prefix another still wins, and so `use gum.defaults` with no symbol is a module import of the whole thing.
+// Tried longest-first so a module whose name happens to prefix another still wins, and so use gum.defaults with no symbol is a module import of the whole thing.
 pub fn split_module(path: &str) -> Option<(String, Option<String>)> {
     if lookup(path).is_some() {
         return Some((path.to_string(), None));

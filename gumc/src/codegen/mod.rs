@@ -17,7 +17,6 @@ pub trait Backend {
 // Whether a type is an EVM address (160-bit) for masking purposes. Account is
 // the stdlib's address type; its single u256 address field is a storage
 // convenience, but on-chain it names a 20-byte account, so it's masked to 160
-// bits at trust boundaries just like Solidity's address.
 pub(crate) fn is_address_type(t: &Type) -> bool {
     matches!(t, Type::Primitive(name) if name == "Account")
 }
@@ -65,10 +64,6 @@ pub fn generic_suffix(args: &[Type]) -> String {
 // Replaces occurrences of a generic class's own parameter names (e.g. Vec's
 // T, HashMap's K/V) with the concrete types from one specific
 // instantiation. Only applied to a method's parameter/return types, method
-// bodies here are either raw unsafe Yul (opaque, nothing gum-level to
-// substitute) or don't reference the class's generic parameters directly, so
-// a deeper statement-tree substitution isn't needed for the classes this
-// compiler actually ships (HashMap, Vec).
 fn substitute_type(t: &Type, subst: &HashMap<String, Type>) -> Type {
     match t {
         Type::Primitive(name) => subst.get(name).cloned().unwrap_or_else(|| t.clone()),
@@ -137,16 +132,6 @@ fn scan_stmts_for_generics(stmts: &[Spanned<Statement>], found: &mut HashMap<Str
 // Finds every concrete instantiation of every generic class actually used in
 // the program (class fields, function/method signatures, and var_decls in
 // any body, including nested blocks) so each one can get its own compiled
-// specialization. A generic class with zero observed instantiations simply
-// gets no compiled methods at all, dead code elimination, not a bug.
-//
-// Note: program.declarations only holds locally-declared top-level
-// functions at this point (imported ones were merged into the semantic
-// checker's own copy of the Program during check(), which isn't
-// propagated back to the caller), so a generic instantiation used only
-// inside an *imported* top-level function (not a class method) won't be
-// found here. Not a concern for anything currently in the stdlib, which
-// only uses generics via class fields and class methods.
 fn collect_generic_instantiations(program: &Program, type_checker: &TypeChecker) -> HashMap<String, Vec<Vec<Type>>> {
     let mut found: HashMap<String, Vec<Vec<Type>>> = HashMap::new();
     for class_decl in type_checker.loaded_classes.values() {
@@ -176,13 +161,6 @@ fn collect_generic_instantiations(program: &Program, type_checker: &TypeChecker)
 // Every contract these method bodies deploy with new X(...), in first-seen
 // order. Each one's creation code has to be embedded as a sub-object of the
 // deployer, so codegen needs to know the set before it emits the parent.
-//
-// Unlike scan_stmts_for_generics, which only inspects declared *types*, this
-// has to walk expressions: new X() is an expression, and it can appear
-// anywhere one can, including inside a condition, an argument, or an arm of a
-// match. Missing a site would emit dataoffset() for an object that was never
-// nested, which solc rejects outright (better than silently deploying nothing,
-// but still a compiler bug).
 fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Vec<String>) {
     fn expr(e: &Expr, tc: &TypeChecker, out: &mut Vec<String>) {
         match e {
@@ -307,18 +285,9 @@ fn is_unsafe(f: &FnDecl) -> bool {
     f.modifiers.iter().any(|m| m == "unsafe")
 }
 
-// receive and fallback are entry points reached by *shape of the call*
+// receive and fallback are entry points reached by shape of the call
 // rather than by selector, so they never appear in the dispatcher's switch and
 // have no ABI selector of their own:
-//
-//   receive  , empty calldata (a plain ETH send). Must be payable; without one
-//               declared, a bare send/transfer to the contract reverts.
-//   fallback , calldata that matches no selector (including 1-3 stray bytes,
-//               which are too few to hold one).
-//
-// The names are reserved: the semantic pass rejects any other shape for them,
-// so a typo'd fn recieve() stays a plain internal function and a wrong-shaped
-// fn receive(u256 x) is an error rather than a silently-never-called one.
 fn is_receive(f: &FnDecl) -> bool {
     is_exported(f) && f.name == "receive"
 }
@@ -798,7 +767,7 @@ impl EvmYulBackend {
                         }
 
                         // An enum is one uint8 word on the wire holding the tag, but a pointer to [tag][payload] in memory, so it is rebuilt rather than copied.
-                        // Copying size_of(enum) = 64 bytes instead read the *next* argument as the payload and then read every later one past the end of calldata as zero.
+                        // Copying size_of(enum) = 64 bytes instead read the next argument as the payload and then read every later one past the end of calldata as zero.
                         if is_enum_type(layout_engine.type_checker, &p.type_def) {
                             yul.push_str(&format!(
                                 "          let {} := and(calldataload({}), 0xff)\n",
@@ -892,7 +861,7 @@ impl EvmYulBackend {
             }
             {
                 // Must agree with the dispatcher's guard decision above: this is the other half of the same lock, the clear on the return path.
-                // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its `view` invites.
+                // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its view invites.
                 let requires_guard = has_ext
                     && mutability::makes_external_call(f, &ext)
                     && !is_unsafe(f)

@@ -1,9 +1,3 @@
-// Converts gum's colon and indentation blocks into the brace form the pest grammar understands: a line ending in ':' opens a block, and a later line at an indentation at or below the header's closes it.
-// Every other code line gets a trailing ';' injected, because the grammar treats newlines as plain whitespace and f(x) followed by [1] would otherwise parse as one index expression.
-// Output keeps exactly one line per input line, so a closing brace is appended to the previous line's code rather than given its own, or every later line number would shift and semantic errors would point at the wrong place.
-
-// One emitted line, kept split so block-closing braces can be appended to
-// the code portion without being eaten by a trailing comment.
 struct OutLine {
     code: String,
     comment: Option<String>,
@@ -112,7 +106,7 @@ pub fn preprocess(source: &str) -> Result<String, String> {
     Ok(out)
 }
 
-// A parent-list attribute, `[Owned]` on its own line above a class.
+// A parent-list attribute, [Owned] on its own line above a class.
 // It gets no trailing ';' unlike every other code line: parser/mod.rs splits top-level declarations at ';', so one here would tear the attribute off the class it annotates.
 // Nothing else is written as a line that both opens with '[' and closes with ']', so this cannot swallow a real statement.
 fn is_attribute(code: &str) -> bool {

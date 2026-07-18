@@ -43,7 +43,6 @@ pub struct GenericParam {
 }
 
 // is_const: fixed at deploy, no storage slot. Assigned once in fn new.
-// is_transient: transient storage (EIP-1153), cleared each transaction.
 #[derive(Debug, Clone)]
 pub struct ClassField {
     pub is_const: bool,
@@ -92,16 +91,11 @@ pub enum Statement {
     Assignment { target: Expr, value: Expr },
     BitwiseFlip { name: String, index: Expr, value: Expr }, // Syntax sugar
     // assert(cond) or assert(cond, msg), where msg is a string (→ the
-    // standard Error(string) revert) or a custom-error call (→ that error).
     Assert { condition: Expr, message: Option<Expr> },
     Revert { error: Expr },
     // delete x, reset an lvalue to its type's zero value. For most types
-    // that is a plain store of 0; a dynamic array clears its elements and
-    // length, a storage string releases its data slots, a struct zeroes every
-    // field.
     Delete { target: Expr },
     // return expr in a value-returning function; bare return (value: None)
-    // early-exits a function that declares no return type.
     Return { value: Option<Expr> },
     IfElse { condition: Expr, if_body: Vec<Spanned<Statement>>, else_body: Option<Vec<Spanned<Statement>>> },
     ForLoop { iterator: String, iterable: Expr, body: Vec<Spanned<Statement>> },

@@ -1,16 +1,3 @@
-// Integration tests for gumc.
-//
-// gumc is a binary-only crate (no lib target), so these drive the actual
-// compiled gumc binary end-to-end against inline .gum source, the same way
-// every feature in this compiler has been manually verified so far, this
-// just automates that. cargo test builds the binary first and exposes its
-// path via CARGO_BIN_EXE_gumc.
-//
-// This is a starting point, not exhaustive coverage: it exercises both real
-// contracts, every stdlib file, and a representative sample of the language
-// features added this session. Extending it is just adding another
-// assert_compiles/assert_output_contains/assert_compile_fails call.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,8 +34,8 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// Writes source to a uniquely-named temp file, runs it through the real
-/// gumc binary, and returns (succeeded, combined stdout+stderr).
+// Writes source to a uniquely-named temp file, runs it through the real
+// gumc binary, and returns (succeeded, combined stdout+stderr).
 fn run_gumc(source: &str) -> (bool, String) {
     run_gumc_with_args(source, &[])
 }
@@ -72,11 +59,9 @@ fn run_gumc_with_args(source: &str, extra_args: &[&str]) -> (bool, String) {
     (output.status.success(), combined)
 }
 
-/// Asserts the source compiles all the way down to EVM bytecode via
-/// --bytecode. Doubles as a *Yul validity* check: gumc itself never parses
-/// the Yul it emits, so solc's strict-assembly front-end is the only thing
-/// that can catch malformed Yul. Skips silently when no solc is present
-/// (solc is optional tooling, not a build dependency).
+// Asserts the source compiles all the way down to EVM bytecode via
+// --bytecode. Doubles as a Yul validity check: gumc itself never parses
+// the Yul it emits, so solc's strict-assembly front-end is the only thing
 fn assert_assembles(source: &str) {
     let solc = match find_solc() {
         Some(p) => p,
@@ -116,10 +101,9 @@ fn assert_output_contains(source: &str, needle: &str) {
     );
 }
 
-/// Asserts the output contains prefix<digits>suffix. Codegen names thunks
-/// with a shared counter (log_ptr_3, __strlit_7, …) whose value shifts
-/// whenever unrelated codegen changes, so tests that care about the *shape* of
-/// the emitted Yul must not pin the number.
+// Asserts the output contains prefix<digits>suffix. Codegen names thunks
+// with a shared counter (log_ptr_3, __strlit_7, …) whose value shifts
+// whenever unrelated codegen changes, so tests that care about the shape of
 fn assert_output_contains_numbered(source: &str, prefix: &str, suffix: &str) {
     let (ok, output) = run_gumc(source);
     assert!(ok, "expected successful compile, got:\n{}", output);
@@ -298,7 +282,7 @@ fn compound_assignment_desugars_to_checked_arithmetic() {
 #[test]
 fn constructor_call_resolves_correctly() {
     // Regression test for the type_ident grammar fix: new Counter(start)
-    // used to be misparsed as instantiating a *generic* class.
+    // used to be misparsed as instantiating a generic class.
     assert_output_contains(
         "class Counter:\n    u256 value\n\n    fn new(u256 start):\n        self.value = start\n\n    fn get() -> u256:\n        return self.value\n\ncontract App:\n    export fn make(u256 start) -> u256:\n        mut Counter c = new Counter(start)\n        return c.get()\n",
         "__new_Counter",
@@ -309,8 +293,7 @@ fn constructor_call_resolves_correctly() {
 fn discarded_call_return_is_popped() {
     // A method call used as a statement discards its return value. Yul rejects a
     // top-level expression that returns a value, so codegen must pop() it. This
-    // is exactly OZ ERC721's `_requireOwned(tokenId);` for-its-revert idiom.
-    // A void call in the same body must stay a bare statement (no pop).
+    // is exactly OZ ERC721's _requireOwned(tokenId); for-its-revert idiom.
     let source = "contract C:\n    u256 x\n\n    fn side() -> u256:\n        self.x = 1\n        return self.x\n\n    fn go():\n        self.x = 2\n\n    export fn run():\n        self.side()\n        self.go()\n";
     assert_output_contains(source, "pop(C_side())");
     assert_assembles(source);
@@ -381,7 +364,7 @@ fn constant_arithmetic_is_folded_not_checked() {
 
 #[test]
 fn unprovable_constant_overflow_keeps_the_runtime_check() {
-    // u128::MAX * 2 overflows the u128 folding accumulator, so const_fold
+    // u128::MAX  2 overflows the u128 folding accumulator, so const_fold
     // must bail to the checked runtime path rather than emit a wrong literal.
     let (ok, output) = run_gumc(
         "contract App:\n    export fn f() -> u256:\n        u256 x = 340282366920938463463374607431768211455 * 2\n        return x\n",
@@ -705,10 +688,6 @@ fn no_reentrancy_guard_when_nothing_can_yield() {
     // A contract that never hands control to another address cannot be
     // re-entered, so it pays nothing for the guard.
     //
-    // The needle is tload(0x…, the guard's keccak-derived lock slot,
-    // rather than a bare "tload", which would also match the transient-storage
-    // helpers a contract emits when it has transient fields. Those are
-    // unrelated to the guard, so matching them would make this test lie.
     let (ok, out) = run_gumc("contract S:\n    u256 t\n\n    export fn a():\n        S.t = 1\n\n    export fn b() -> u256:\n        return S.t\n");
     assert!(ok, "expected successful compile, got:\n{}", out);
     assert!(!out.contains("tload(0x"), "a contract with no external calls must emit no guard:\n{}", out);
@@ -720,7 +699,7 @@ fn a_persistent_only_contract_has_no_transient_opcodes_in_its_bytecode() {
     // kind actually used, so a contract with no transient fields must not
     // contain a transient opcode at all.
     //
-    // This asserts on the *bytecode* rather than the Yul because that is where
+    // This asserts on the bytecode rather than the Yul because that is where
     // the claim lives: the emitted Yul is what we control, but only the
     // assembled bytecode proves nothing crept in through a helper.
     let solc = match find_solc() {
@@ -835,7 +814,7 @@ fn super_outside_a_method_is_rejected() {
     assert!(out.contains("only available inside a method"), "unexpected error:\n{}", out);
 }
 
-/// A contract with two immutables and one ordinary storage field.
+// A contract with two immutables and one ordinary storage field.
 fn const_field_src() -> &'static str {
     "contract Cfg:\n    const Account owner\n    const u256 cap\n    u256 counter\n\n    \
      fn new(Account o, u256 c):\n        Cfg.owner = o\n        Cfg.cap = c\n\n    \
@@ -911,7 +890,7 @@ fn a_const_field_is_absent_from_the_storage_lock() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The assembled runtime hex for a source, or None when solc is absent.
+// The assembled runtime hex for a source, or None when solc is absent.
 fn bytecode_of(src: &str) -> Option<String> {
     let solc = find_solc()?;
     let solc_arg = solc.to_string_lossy().into_owned();
@@ -956,8 +935,6 @@ fn a_const_field_the_compiler_can_evaluate_costs_nothing() {
 #[test]
 fn a_const_field_the_compiler_cannot_evaluate_is_patched_at_deploy() {
     // The other side of the same decision. A constructor argument does not
-    // exist at compile time, one compiled contract, a different value per
-    // deployment, so this one must keep the real deploy-time patch.
     let (ok, out) = run_gumc(
         "contract A:\n    const u256 cap\n\n    fn new(u256 c):\n        A.cap = c\n\n    \
          export fn get() -> u256:\n        return A.cap\n",
@@ -1030,7 +1007,7 @@ fn a_const_field_the_constructor_never_assigns_is_rejected() {
     assert!(out.contains("never assigned"), "unexpected error:\n{}", out);
 }
 
-/// A constructor body wrapped in a contract that declares one immutable.
+// A constructor body wrapped in a contract that declares one immutable.
 fn ctor_body(body: &str) -> String {
     format!(
         "enum Error:\n    Bad()\n\ncontract C:\n    const u256 a\n\n    fn new(u256 x, bool c):\n{}\n\n    \
@@ -1084,9 +1061,6 @@ fn a_const_field_assigned_on_every_path_is_accepted() {
 #[test]
 fn reading_a_const_field_inside_the_constructor_is_rejected() {
     // Its value is written into the code only once the constructor returns, so
-    // during it there is nothing to read. solc does catch this, but as
-    // Immutable ... used before initialization against generated Yul the
-    // author never wrote, so catch it here, against their source.
     let (ok, out) = run_gumc(&ctor_body("        C.a = x\n        var y = C.a + 1"));
     assert!(!ok, "expected a compile error, got success:\n{}", out);
     assert!(out.contains("reads const field 'a'"), "unexpected error:\n{}", out);
@@ -1121,7 +1095,7 @@ fn a_field_cannot_be_both_transient_and_const() {
     assert!(out.contains("cannot be both transient and const"), "unexpected error:\n{}", out);
 }
 
-/// Pulls the ABI JSON out of gumc's stdout.
+// Pulls the ABI JSON out of gumc's stdout.
 fn abi_of(out: &str) -> serde_json::Value {
     let start = out.find("ABI JSON Generated:").expect("no ABI in output");
     let open = out[start..].find('[').expect("no ABI array") + start;
@@ -1140,7 +1114,7 @@ fn keccak_hex(s: &str) -> String {
     format!("0x{}", out.iter().map(|b| format!("{:02x}", b)).collect::<String>())
 }
 
-/// The signature an event's published ABI entry describes.
+// The signature an event's published ABI entry describes.
 fn abi_event_signature(e: &serde_json::Value) -> String {
     let args: Vec<String> = e["inputs"]
         .as_array()
@@ -1155,7 +1129,7 @@ fn abi_event_signature(e: &serde_json::Value) -> String {
 fn event_abi_reconciles_with_the_topic0_actually_emitted() {
     // The point of the event ABI is that an indexer can decode the logs this
     // contract really produces. That holds only if keccak256 of the signature
-    // the ABI describes *is* the topic0 in the bytecode. Anything less, an ABI
+    // the ABI describes is the topic0 in the bytecode. Anything less, an ABI
     // that merely looks well-formed, silently mis-decodes every log.
     //
     // Checked against token.gum rather than a snippet so it covers the shape
@@ -1311,8 +1285,8 @@ fn a_contract_that_logs_nothing_has_no_event_entries() {
     );
 }
 
-/// Which storage opcodes a bytecode actually contains. PUSH immediates are
-/// skipped so their data bytes aren't misread as opcodes.
+// Which storage opcodes a bytecode actually contains. PUSH immediates are
+// skipped so their data bytes aren't misread as opcodes.
 fn storage_opcodes(code: &[u8]) -> Vec<&'static str> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1358,7 +1332,6 @@ fn eip7702_delegation_decode_has_the_right_shape() {
     // Pins the emitted Yul against the EIP-7702 spec: a delegated account's
     // code is exactly 23 bytes of 0xef0100 ++ <20-byte target>. The behavior
     // itself is execution-verified against a real revm 7702 account -- see
-    // eip7702_delegated_to_reads_the_delegation_indicator.
     let src = "use gum.defaults.Account\n\ncontract App:\n    export fn d(Account a) -> Account:\n        return a.delegated_to()\n";
     assert_output_contains(src, "eq(extcodesize(a), 23)");     // indicator length
     assert_output_contains(src, "extcodecopy(a, p, 0, 23)");
@@ -1533,7 +1506,6 @@ fn imports_are_transitive() {
     // An imported module's own use lines must be followed. std depends on
     // this: account.gum is class Account [Serializable] and imports
     // Serializable itself, so importing Account without following that import
-    // leaves Serializable undefined.
     assert_compiles("use gum.defaults.Account\n\ncontract App:\n    export fn go(Account a) -> u256:\n        return a.balance()\n");
 }
 
@@ -1583,9 +1555,6 @@ fn every_broken_function_in_a_contract_is_reported_not_just_the_first() {
     // pest has no error recovery: the retrn on line 5 would abort the whole
     // parse and hide the broken expression on line 11 entirely.
     //
-    // Entry points live inside the contract, so the contract is a single
-    // top-level declaration and splitting the file at that level alone would
-    // still report only one error. Recovery has to reach per-member.
     let src = "contract C:\n    u256 x\n\n    export fn one() -> u256:\n        retrn C.x\n\n    export fn two() -> u256:\n        return C.x\n\n    export fn three(u256 a) -> u256:\n        return a +\n\n    export fn four() -> u256:\n        return 4\n";
     let (ok, output) = run_gumc(src);
     assert!(!ok, "expected failure, got:\n{}", output);
@@ -1611,10 +1580,9 @@ fn a_broken_declaration_does_not_hide_a_later_one_of_a_different_kind() {
 
 #[test]
 fn an_indentation_error_still_stops_at_the_first_one() {
-    // Recovery is per *top-level declaration*, and the split into declarations
+    // Recovery is per top-level declaration, and the split into declarations
     // is what the indent preprocessor produces, so a bad indent is reported
     // alone, before there is any structure to recover within. Documenting the
-    // boundary, not asserting it is ideal.
     let src = "contract C\n    u256 x\n\n    export fn a() -> u256:\n        return 1\n";
     let (ok, output) = run_gumc(src);
     assert!(!ok, "expected failure, got:\n{}", output);
@@ -1649,7 +1617,7 @@ fn an_unsafe_block_s_nested_braces_do_not_split_a_declaration() {
 
 #[test]
 fn trailing_garbage_after_a_declaration_is_not_silently_dropped() {
-    // A declaration rule will happily match a valid *prefix*; decl_unit's EOI
+    // A declaration rule will happily match a valid prefix; decl_unit's EOI
     // is what makes the leftovers an error instead of invisible.
     assert_compile_fails("use gum.defaults.Account extra\n");
 }
@@ -1783,14 +1751,9 @@ fn new_on_a_contract_emits_create_not_an_allocation() {
 
 #[test]
 fn a_deployed_child_is_nested_inside_its_deployer_s_runtime() {
-    // Child's object must appear *inside* Factory_runtime: only
+    // Child's object must appear inside Factory_runtime: only
     // datasize(<runtime>) is copied out at deploy time, so a copy nested beside
     // the runtime rather than within it would not exist in the deployed code,
-    // and dataoffset("Child") would point past the end at runtime.
-    //
-    // There is deliberately a second copy in the outer object too, the deploy
-    // block gets the same shared functions, including the __deploy_Child thunk,
-    // and solc rejects an unknown data object whether or not it is reachable.
     let src = "contract Child:\n    u256 v\n\ncontract Factory:\n    u256 n\n\n    export fn make() -> Account:\n        return new Child()\n";
     let (ok, output) = run_gumc(src);
     assert!(ok, "expected success, got:\n{}", output);
@@ -1809,7 +1772,6 @@ fn a_deployed_child_is_nested_inside_its_deployer_s_runtime() {
 #[test]
 fn a_contract_object_excludes_its_siblings_methods() {
     // Another contract's methods were never callable from here, and a sibling
-    // body may reference a sub-object only its own object nests.
     let src = "contract Child:\n    u256 v\n\ncontract Factory:\n    u256 n\n\n    export fn make() -> Account:\n        return new Child()\n";
     let (ok, output) = run_gumc(src);
     assert!(ok, "expected success, got:\n{}", output);
@@ -1828,7 +1790,6 @@ fn a_contract_object_excludes_its_siblings_methods() {
 #[test]
 fn each_contract_gets_its_own_storage_slots_from_zero() {
     // Two contracts in a file are two deployments. Stacking the second after
-    // the first would push its fields off slot 0 and strand the slots below.
     let src = "contract A:\n    u256 x\n    u256 y\n\n    export fn set():\n        A.x = 1\n        A.y = 2\n\ncontract B:\n    u256 p\n\n    export fn set():\n        B.p = 3\n";
     let (ok, output) = run_gumc(src);
     assert!(ok, "expected success, got:\n{}", output);
@@ -1839,7 +1800,6 @@ fn each_contract_gets_its_own_storage_slots_from_zero() {
 #[test]
 fn deploying_a_contract_with_a_string_constructor_arg_encodes_head_and_tail() {
     // The child's constructor decoder reads a dynamic arg's head slot as an
-    // offset to a length word plus data, so the deployer has to encode one.
     let src = "contract Child:\n    String name\n    u256 n\n\n    fn new(String s, u256 v):\n        self.name = s\n        self.n = v\n\ncontract Factory:\n    u256 c\n\n    export fn make(String s, u256 v) -> Account:\n        return new Child(s, v)\n";
     // head: 2 words. a0 is dynamic -> its head slot holds the tail offset.
     assert_output_contains(src, "let tail := 64");
@@ -1871,7 +1831,6 @@ fn deploying_a_contract_with_a_fixed_array_constructor_arg_encodes_it_inline() {
     assert_output_contains(src, "pop(gum_abi_farr3_u8_put(add(blob, 0), a0))");
     assert_output_contains(src, "gum_abi_farr_put(dst, ptr, 3, 1)");
     // The array takes three head words, so the next argument starts at 96 ,
-    // not 32.
     assert_output_contains(src, "mstore(add(blob, 96), a1)");
     assert_output_contains(src, "let param_xs := gum_abi_farr3_u8_mem(args_mem, 0, _args_len)");
     assert_assembles(src);
@@ -1940,7 +1899,7 @@ fn writing_a_memory_array_element_is_bounds_checked_once() {
 
 #[test]
 fn memory_array_length_is_an_element_count_not_a_byte_count() {
-    // Word 0 of a memory array holds its length in *bytes*. .length must
+    // Word 0 of a memory array holds its length in bytes. .length must
     // divide by the stride, reading the word raw is right only for [u8].
     assert_output_contains(
         "contract C:\n    export fn n([u256] xs) -> u256:\n        return xs.length\n",
@@ -2185,7 +2144,7 @@ fn a_persistent_only_contract_emits_no_transient_helper() {
 
 #[test]
 fn transient_fields_are_absent_from_the_storage_lock() {
-    // The lock keeps a proxy's *existing* storage readable across an upgrade.
+    // The lock keeps a proxy's existing storage readable across an upgrade.
     // A transient field holds nothing across a transaction, so there is never
     // any storage for a moved slot to corrupt.
     let dir = std::env::temp_dir().join(format!("gum_tlock_{}", std::process::id()));

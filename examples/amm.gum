@@ -11,8 +11,8 @@ extern class IERC20:
     fn transfer_from(Account from, Account to, u256 amount) -> bool
 
 contract AMMState:
-    // Ordinary storage fields rather than `const`: `initialize` sets them
-    // after deploy (the upgradeable-proxy pattern), and a `const` field is
+    // Ordinary storage fields rather than const: initialize sets them
+    // after deploy (the upgradeable-proxy pattern), and a const field is
     // fixed at construction. A proxy never runs a constructor against its
     // own storage, so these addresses cannot be known at deploy time.
     Account token_a

@@ -1,10 +1,3 @@
-// The gum standard library: module `gum.defaults`.
-//
-// Everything here is imported by naming the symbol you want out of the module,
-// e.g. `use gum.defaults.Account`. The module is compiled into gumc, so this
-// resolves from any directory with no search path.
-
-// Abstract parent class for polymorphic testing
 class Serializable:
     // Marker: gives a shape for the synthesized serialize()
 
@@ -14,17 +7,17 @@ class Hashable:
 
 // An EVM address.
 //
-// Account's interesting methods are *intrinsics*, not declared here: they
+// Account's interesting methods are intrinsics, not declared here: they
 // compile straight to EVM opcodes and precompiles rather than to calls on this
 // class, so they read live chain state instead of a field. This class exists to
 // give the type a name and a serializable shape.
 //
-//   a.balance()        -> u256     the account's wei balance (BALANCE)
-//   a.code.len()       -> u256     the account's bytecode size in bytes (EXTCODESIZE)
-//   a.pay(amount)      -> bool     send ETH; hands you the success flag to check
-//   a.transfer(amount)             send ETH; reverts on failure
-//   a.delegated_to()   -> Account  EIP-7702 delegate, or 0 if none
-//   a.is_delegated()   -> bool
+// a.balance()        -> u256     the account's wei balance (BALANCE)
+// a.code.len()       -> u256     the account's bytecode size in bytes (EXTCODESIZE)
+// a.pay(amount)      -> bool     send ETH; hands you the success flag to check
+// a.transfer(amount)             send ETH; reverts on failure
+// a.delegated_to()   -> Account  EIP-7702 delegate, or 0 if none
+// a.is_delegated()   -> bool
 [Serializable]
 class Account:
     u256 address
@@ -35,19 +28,15 @@ class String:
     u64 length
     // The actual bytes follow the length in memory, managed via Yul by the compiler.
 
-// A dynamically-sized byte string, ABI-encoded as Solidity `bytes`. Same
-// in-memory shape as String: a `u64 length` (high 8 bytes of word 0), then the
+// A dynamically-sized byte string, ABI-encoded as Solidity bytes. Same
+// in-memory shape as String: a u64 length (high 8 bytes of word 0), then the
 // raw bytes at +32. Codegen decodes/encodes it on the dynamic ABI path.
 class Bytes:
     u64 length
 
 // The message this call received: who sent it, what they attached, and who is
-// running. All three are properties of *this execution frame*, not of the
+// running. All three are properties of this execution frame, not of the
 // transaction: every CALL makes a new one, and a DELEGATECALL inherits the
-// caller's.
-//
-// sender() is the immediate caller, not whoever signed the transaction. If a
-// contract calls you, sender() is that contract. gum has no tx.origin.
 class Message:
     Account sender
     u256 value
@@ -65,7 +54,7 @@ class Message:
         // never executed; the return is a placeholder so it still type-checks.
         //
         // Frame-scoped like sender() and value(), which is why it lives here:
-        // under DELEGATECALL this is the *calling* contract's address.
+        // under DELEGATECALL this is the calling contract's address.
         return 0
 
 // The block this transaction is in. Unlike Message, these are identical in
@@ -88,22 +77,13 @@ fn keccak256([u8] data) -> u256:
 
 fn ecrecover(u256 hash, u8 v, u256 r, u256 s) -> Account:
     // Intercepted by codegen. The stub must still type-check: Account's
-    // constructor takes a starting balance, so `new Account()` (as this
+    // constructor takes a starting balance, so new Account() (as this
     // previously read) made the whole module fail to import.
     return new Account(0)
 
-// Precompile-backed primitives, called as `Crypto.<method>(...)`.
+// Precompile-backed primitives, called as Crypto.<method>(...).
 //
 // verify_p256 verifies an ECDSA signature over the secp256r1 (P-256) curve,
-// the curve behind Apple Secure Enclave, Android Keystore and FIDO2/WebAuthn
-// passkeys, which secp256k1 (ecrecover) cannot check. It calls the precompile
-// at address 0x100: EIP-7951 on L1, and RIP-7212 (same address, same
-// interface) already live on the major L2s, so one bytecode serves both.
-//
-// Returns true only for a valid signature; an invalid signature or malformed
-// input returns false rather than reverting.
-//
-// Bodies are supplied by codegen, see translator.rs.
 class Crypto:
     fn verify_p256(u256 hash, u256 r, u256 s, u256 qx, u256 qy) -> bool
 
@@ -126,18 +106,9 @@ class HashMap(Hashable <K>, All <V>):
             val := sload(slot)
         return val
 
-// A real growable array: [length: 32][capacity: 32][data: capacity*32...],
+// A real growable array: [length: 32][capacity: 32][data: capacity32...],
 // all elements stored as plain 32-byte words (same simplification the rest
 // of this compiler makes for arrays generally).
-//
-// push() reallocates (doubling capacity) whenever the vector is full, and
-// returns the resulting pointer, which may or may not be a new one. gum has
-// no reference/mutable-borrow semantics, so a push that outgrows its current
-// buffer can't mutate the caller's variable in place. Callers must reassign:
-//
-//     mut Vec(u256) v = new Vec(u256)()
-//     v = v.push(10)
-//     v = v.push(20)
 class Vec(All <T>):
     u256 length
     u256 capacity

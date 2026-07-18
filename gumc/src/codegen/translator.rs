@@ -9,8 +9,6 @@ use tiny_keccak::{Hasher, Keccak};
 // The Yul local holding an immutable's value while fn new runs. The
 // constructor returns these, and the deploy block feeds them to setimmutable
 // once the runtime code is in memory. Prefixed to keep it out of the way of
-// a constructor parameter that happens to share the field's name (fn
-// new(Account token_a) assigning to token_a is the ordinary case).
 pub fn immutable_local(field: &str) -> String {
     format!("_imm_{}", field)
 }
@@ -18,15 +16,11 @@ pub fn immutable_local(field: &str) -> String {
 // The deploy block's own binding for an immutable, distinct from
 // immutable_local. Yul permits no shadowing whatsoever, not even a
 // function's return variable over an outer let, and the constructor's
-// definition sits in the same block as the call that binds its results.
-// Reusing one name makes solc reject the whole object.
 pub fn immutable_deploy_local(field: &str) -> String {
     format!("_immv_{}", field)
 }
 
 // All-1s bitmask covering exactly size bytes, right-justified, used to
-// isolate one packed field's bits out of the 32-byte word its slot/address
-// read returns.
 fn mask_hex(size: usize) -> String {
     format!("0x{}", "f".repeat(size * 2))
 }
@@ -34,9 +28,6 @@ fn mask_hex(size: usize) -> String {
 // Copies len bytes from src to dst in 32-byte strides. May overwrite up
 // to 31 bytes past len at the tail end, harmless here since every caller
 // either immediately overwrites that tail with the next chunk, or it spills
-// into never-yet-claimed scratch space past the free-memory pointer.
-// Reads the length of a String/Bytes value: a u64 length field packed
-// big-endian sits in the high 8 bytes of word 0.
 fn gum_str_len_helper_src() -> String {
     "function gum_str_len(p) -> n {\n    n := and(shr(192, mload(p)), 0xffffffffffffffff)\n}\n"
         .to_string()
@@ -45,7 +36,6 @@ fn gum_str_len_helper_src() -> String {
 // Decimal itoa: an unsigned value to a gum String (header word holding the
 // length in its top 8 bytes, ASCII digits from p+32). Digits are written from
 // the least-significant end backwards, the same shape as OpenZeppelin's
-// Strings.toString. Zero is spelled "0" rather than the empty string.
 fn gum_uint_to_str_helper_src() -> String {
     "function gum_uint_to_str(value) -> ptr {\n\
      \x20   let len := 1\n\
@@ -72,15 +62,6 @@ fn gum_uint_to_str_helper_src() -> String {
 // String and Bytes share one in-memory shape, so every operation below works
 // on either.
 // Whether t is a user struct for storage-addressing purposes: an aggregate
-// whose fields live at slots, as opposed to a value that occupies one.
-//
-// The exclusions are not arbitrary. Account is declared as a class
-// (class Account: u256 address) but the whole compiler treats it as the EVM
-// address scalar, that is what is_address_type exists for, so [Account]
-// is an array of values and must keep the packed scalar path. String/Bytes
-// are Primitive-named classes with their own storage encoding entirely.
-// Treating any of the three as a field-addressable struct would silently
-// change how existing arrays of them are read and written.
 pub fn is_struct_type(tc: &TypeChecker, t: &Type) -> bool {
     match t {
         Type::Primitive(name) => {
@@ -95,23 +76,13 @@ pub fn is_str_type(t: &Type) -> bool {
 }
 
 // Whether t is an enum that crosses the ABI: payload-free, so it is a plain u8 tag.
-// A payload-carrying enum is memory-only and rejected before it reaches any boundary, so it is deliberately not one of these.
 pub fn is_enum_type(tc: &TypeChecker, t: &Type) -> bool {
     tc.is_scalar_enum(t)
 }
 
 // Materializes a compile-time-known string into ptr as a String value.
 //
-// The content is written a **word at a time** (one mstore per 32 chars),
-// not a byte at a time. A per-byte mstore8 loop costs ~7 bytes of *bytecode*
-// per character, a 26-char revert reason alone ran ~180 bytes, whereas a
-// packed word is one PUSH32 + MSTORE for every 32 chars. Same memory image,
-// a fraction of the code size.
-//
-// The buffer is padded up to a word boundary so the final (partial) mstore
-// can't scribble past the allocation into whatever is allocated next; the
-// String's length field still reports the true length, so the padding is
-// invisible to every reader.
+// The content is written a word at a time (one mstore per 32 chars),
 fn str_literal_body_src(ptr: &str, s: &str) -> String {
     let bytes = s.as_bytes();
     let padded = (bytes.len() + 31) / 32 * 32;
@@ -139,7 +110,6 @@ fn str_literal_body_src(ptr: &str, s: &str) -> String {
 // Content equality for String/Bytes. Compares length first, then whole 32-byte
 // words, then the trailing partial word with the bytes past the length shifted
 // off, so leftover allocator garbage after the last byte can never make two
-// equal strings compare unequal (or vice versa).
 fn gum_str_eq_helper_src() -> String {
     "function gum_str_eq(a, b) -> r {\n\
      \x20   r := 0\n\
@@ -164,12 +134,6 @@ fn gum_str_eq_helper_src() -> String {
 // Reverts with Selector(string), one 4-byte selector, a head holding the
 // single tail offset (always 0x20), then the string's length word and its
 // zero-padded bytes.
-//
-// This is by far the most common revert shape (every assert(cond, "msg")
-// lowers to Error(string)), so it lives in one shared function instead of being
-// inlined at each site: the encoder is ~90 bytes of bytecode, and amm alone has
-// six of them. sel arrives pre-shifted (shl(224, ...)) so the caller can pass
-// a plain constant.
 fn gum_revert_str_helper_src() -> String {
     "function gum_revert_str(sel, s) {\n\
      \x20   let p := mload(0x40)\n\
@@ -188,14 +152,6 @@ fn gum_revert_str_helper_src() -> String {
 // --- Solidity-compatible storage strings ---
 //
 // A String/Bytes contract field occupies exactly one slot, encoded the way
-// Solidity does so the layouts (and therefore the storage diffs, and anything
-// reading this contract's slots) match byte for byte:
-//
-//   short (len <= 31): slot = <data, left-aligned in the high bytes> | len*2
-//   long  (len >= 32): slot = len*2 + 1, data in consecutive slots from
-//                      keccak256(slot)
-//
-// The low bit is the discriminator: even = short, odd = long.
 
 fn gum_sstr_base_helper_src() -> String {
     "function gum_sstr_base(slot) -> b {\n\
@@ -206,7 +162,6 @@ fn gum_sstr_base_helper_src() -> String {
 }
 
 // Substitutes the storage kind into a helper template. format! would need
-// every Yul brace in these bodies doubled, which makes them unreadable.
 fn with_kind(template: &str, tr: bool) -> String {
     template
         .replace("{K}", kind_suffix(tr))
@@ -243,8 +198,6 @@ fn gum_sstr_load_helper_src(tr: bool) -> String {
 }
 
 // delete on a storage string: release the long form's data slots (leaving
-// them behind would both diverge from Solidity's layout and overcharge the
-// next writer), then zero the header.
 fn gum_sstr_clear_helper_src(tr: bool) -> String {
     with_kind(
         "function gum_sstr_clear{K}(slot) {\n\
@@ -263,13 +216,6 @@ fn gum_sstr_clear_helper_src(tr: bool) -> String {
 // Stores a memory String into a storage string slot.
 //
 // Old long-form data slots are zeroed first: Solidity releases them on
-// overwrite, and since the differential tests diff raw storage, leaving stale
-// words behind would show up immediately (as well as overcharging real users
-// who shrink a string).
-//
-// Both the short in-slot word and the final partial long slot are masked to the
-// string's true length, because the source buffer's bytes past len are
-// allocator leftovers, not content.
 fn gum_sstr_store_helper_src(tr: bool) -> String {
     with_kind(
         "function gum_sstr_store{K}(slot, ptr) {\n\
@@ -306,14 +252,9 @@ fn gum_sstr_store_helper_src(tr: bool) -> String {
     )
 }
 
-// keccak256 over a dynamic byte value's *contents*.
+// keccak256 over a dynamic byte value's contents.
 //
 // Yul's keccak256 takes (offset, length); gum's takes one value, so the length
-// has to come from the value's header. The two variants exist because gum has
-// two dynamic shapes: [u8]/array buffers keep their length in the full first
-// word, String/Bytes keep it in the high 8 bytes (a u64 length field).
-// Hashing the header along with the data, or worse, hashing a pointer, would
-// silently produce a hash that matches nothing else on chain.
 fn gum_keccak_arr_helper_src() -> String {
     "function gum_keccak_arr(p) -> h {\n    h := keccak256(add(p, 32), mload(p))\n}\n".to_string()
 }
@@ -326,10 +267,6 @@ fn gum_keccak_str_helper_src() -> String {
 // secp256k1 public-key recovery via the precompile at address 1.
 //
 // Returns the zero address when recovery fails. The returndatasize check is
-// required for the same reason as P256VERIFY's: on failure the precompile
-// returns *empty* data while the staticcall still reports success, so without
-// it we'd hand back whatever happened to be in memory as an "authenticated"
-// address, the worst possible failure mode for a signature check.
 fn gum_ecrecover_helper_src() -> String {
     "function gum_ecrecover(h, v, r, s) -> a {\n\
      \x20   let p := mload(0x40)\n\
@@ -348,17 +285,6 @@ fn gum_ecrecover_helper_src() -> String {
 // to.pay(amount), send ETH.
 //
 // EIP-5920's PAY opcode would do this without handing control to the recipient
-// at all, but it failed to reach consensus for Glamsterdam and has no ship
-// date. So this lowers to a plain CALL with empty calldata, which *does* run
-// the recipient's receive/fallback. That's the important caveat: unlike a real
-// PAY, this yields control, which is exactly why it also marks the contract as
-// yielding, so the reentrancy guard covers it.
-//
-// All remaining gas is forwarded rather than a 2300 stipend: the stipend is the
-// old transfer() footgun that bricks recipients with a non-trivial receive(),
-// and gum's default reentrancy guard is what makes forwarding safe.
-//
-// When PAY ships, only this helper changes, call sites don't.
 fn gum_pay_helper_src() -> String {
     "function gum_pay(to, amount) -> ok {\n\
      \x20   ok := call(gas(), to, amount, 0, 0, 0, 0)\n\
@@ -369,19 +295,6 @@ fn gum_pay_helper_src() -> String {
 // --- Storage kind ---
 //
 // A field is either persistent (SLOAD/SSTORE) or transient (TLOAD/TSTORE,
-// EIP-1153). The two are separate 256-bit keyspaces with identical addressing,
-// so every layout rule, slot packing, keccak256(slot) for a mapping or an
-// array's data region, the storage-string encoding, carries over unchanged.
-// Only the opcode differs.
-//
-// The kind is known in Rust at every site, so the opcode is chosen *here* and
-// each storage helper is emitted once per kind it is actually used with, named
-// with the suffix below. A gum_ld(slot, tr)-style runtime selector was the
-// obvious alternative and measurably worse: solc kept it as a real function
-// rather than specializing it per call site, costing a jump per access (~13
-// bytes on erc20, ~61 on amm). Emitting the opcode directly means a contract
-// with no transient fields is byte-for-byte what it was before this existed,
-// and one that uses both pays only for the helpers it names.
 fn kind_suffix(tr: bool) -> &'static str {
     if tr { "_t" } else { "" }
 }
@@ -396,14 +309,7 @@ fn st_op(tr: bool) -> &'static str {
 
 // Bounds-checked element address for a dynamic memory array.
 //
-// Word 0 holds the length in **bytes**, not elements, the convention the
-// memory for-loop and as_bytes() already use (it steps a byte offset and
-// compares it against this word). So the element count is that divided by the
-// stride.
-//
-// The check divides rather than multiplying i up: mul(i, esz) wraps for a
-// large enough index, and a wrapped product can compare below the length and
-// wave an out-of-range index through.
+// Word 0 holds the length in bytes, not elements, the convention the
 fn gum_marr_addr_helper_src(rich: bool) -> String {
     format!(
         "function gum_marr_addr(ptr, i, esz) -> a {{\n\
@@ -415,7 +321,6 @@ fn gum_marr_addr_helper_src(rich: bool) -> String {
 }
 
 // Same for a fixed memory array, whose length is static and which has no length
-// header, the elements start at the pointer itself.
 fn gum_farr_addr_helper_src(rich: bool) -> String {
     format!(
         "function gum_farr_addr(ptr, i, n, esz) -> a {{\n\
@@ -429,24 +334,6 @@ fn gum_farr_addr_helper_src(rich: bool) -> String {
 // --- Dynamic-array ABI ---
 //
 // The wire format and gum's memory format are not the same shape, which is why
-// a [T] argument cannot be moved with a flat copy the way a String can:
-//
-//   ABI:    [count][elem][elem]…   every element in its own 32-byte word,
-//                                  however narrow it is, a uint8[] carries one
-//                                  byte of payload per 32 on the wire.
-//   memory: [count][elems…]        elements packed at size_of(T) stride, each
-//                                  left-aligned at its own byte address.
-//
-// So each element is converted individually. esz is size_of(T) and is a
-// literal at every call site, so solc folds the shift/mask arithmetic away.
-//
-// The or(and(mload(a), not(m)), …) read-modify-write is deliberate for narrow
-// elements: mstore always writes a whole word, and a plain store of the last
-// element would run past the array into memory the allocator has not handed out
-// yet, which the deploy-arg encoder relies on being zero.
-//
-// esz == 32 collapses correctly rather than needing a case of its own: sh is 0
-// and m is all-ones, so the RMW degenerates to a plain store of v.
 fn gum_abi_arr_cd_helper_src() -> String {
     "function gum_abi_arr_cd(off, esz) -> ptr {\n\
      \x20   if lt(calldatasize(), add(off, 32)) { revert(0, 0) }\n\
@@ -466,7 +353,6 @@ fn gum_abi_arr_cd_helper_src() -> String {
 }
 
 // Same, reading from an ABI blob already in memory (the constructor's args,
-// which arrive appended to the creation code and are codecopy'd in).
 fn gum_abi_arr_mem_helper_src() -> String {
     "function gum_abi_arr_mem(base, off, limit, esz) -> ptr {\n\
      \x20   if lt(limit, add(off, 32)) { revert(0, 0) }\n\
@@ -486,12 +372,9 @@ fn gum_abi_arr_mem_helper_src() -> String {
     .to_string()
 }
 
-// A fixed array is *not* a dynamic one on the wire: T[N] is N inline words in
+// A fixed array is not a dynamic one on the wire: T[N] is N inline words in
 // the head, with no offset and no count. It still needs converting rather than
 // copying, for the same reason, memory packs at esz, the wire doesn't.
-//
-// ([u256; N] is the one case a flat calldatacopy got right, because its stride
-// happens to equal the ABI's word. [u8; N] did not.)
 fn gum_abi_farr_cd_helper_src() -> String {
     "function gum_abi_farr_cd(off, n, esz) -> ptr {\n\
      \x20   if lt(calldatasize(), add(off, mul(n, 32))) { revert(0, 0) }\n\
@@ -534,7 +417,6 @@ fn gum_abi_farr_put_helper_src() -> String {
 }
 
 // Memory array -> ABI, written at dst. Returns the bytes written, so a caller
-// laying out several tails can advance.
 fn gum_abi_arr_put_helper_src() -> String {
     "function gum_abi_arr_put(dst, ptr, esz) -> written {\n\
      \x20   let n := div(mload(ptr), esz)\n\
@@ -550,8 +432,6 @@ fn gum_abi_arr_put_helper_src() -> String {
 }
 
 // The ABI size of a memory array: a count word plus one word per element,
-// regardless of how tightly memory packs them. Word 0 is a byte length, so the
-// count is that over the stride.
 fn gum_abi_arr_size_helper_src() -> String {
     "function gum_abi_arr_size(ptr, esz) -> sz {\n\
      \x20   sz := add(32, mul(div(mload(ptr), esz), 32))\n\
@@ -560,8 +440,6 @@ fn gum_abi_arr_size_helper_src() -> String {
 }
 
 // A dynamic element carries an offset rather than its bytes, so the wire grows a level: [count][off_0..off_n-1][tail_0][tail_1]...
-// The offsets are relative to the start of the offset table, not to the array or to calldata, which is the one detail that makes a nested decode look unlike a flat one.
-// Memory mirrors that with a pointer per element, so the outer stride is 32 regardless of what the element costs.
 fn abi_dynarr_cd_helper_src(fname: &str, inner_cd: &str) -> String {
     format!(
         "function {fname}(off) -> ptr {{\n\
@@ -583,7 +461,6 @@ fn abi_dynarr_cd_helper_src(fname: &str, inner_cd: &str) -> String {
 }
 
 // Same shape from an ABI blob already in memory, which is how constructor args arrive.
-// limit is the blob's real end and is threaded into the element codec unchanged, since an element's offset is attacker-chosen and its own bounds check is the only thing standing behind it.
 fn abi_dynarr_mem_helper_src(fname: &str, inner_mem: &str) -> String {
     format!(
         "function {fname}(base, off, limit) -> ptr {{\n\
@@ -605,7 +482,6 @@ fn abi_dynarr_mem_helper_src(fname: &str, inner_mem: &str) -> String {
 }
 
 // Memory -> ABI. The offset table is laid out first at a known width, then each tail is appended and its offset backfilled, so the cursor runs ahead of the loop rather than being computable up front.
-// Element sizes vary, so cur has to come from what the element codec actually wrote rather than from a stride.
 fn abi_dynarr_put_helper_src(fname: &str, inner_put: &str) -> String {
     format!(
         "function {fname}(dst, ptr) -> written {{\n\
@@ -641,7 +517,6 @@ fn abi_dynarr_size_helper_src(fname: &str, inner_size: &str) -> String {
 }
 
 // A fixed array of dynamic elements is itself dynamic, so it sits behind an offset like a dynamic array, but with no count word: the length is in the type.
-// Its offset table is therefore the first thing at off, and the offsets are relative to off itself.
 fn abi_dynfarr_cd_helper_src(fname: &str, inner_cd: &str, n: usize) -> String {
     format!(
         "function {fname}(off) -> ptr {{\n\
@@ -711,7 +586,6 @@ fn abi_dynfarr_size_helper_src(fname: &str, inner_size: &str, n: usize) -> Strin
 }
 
 // The put half of a dynamic array of static elements, for an element codec that reports what it wrote.
-// abi_starr_put_helper_src covers the same shape for a bare struct, whose codec returns nothing; the widths here are compile-time constants either way, so the returned count is discarded.
 fn abi_statarr_put_helper_src(fname: &str, inner_put: &str, wire: usize, packed: usize) -> String {
     format!(
         "function {fname}(dst, ptr) -> written {{\n\
@@ -788,7 +662,6 @@ fn abi_statfarr_put_helper_src(fname: &str, inner_put: &str, n: usize, wire: usi
 }
 
 // One field of a struct as it crosses the ABI: where it sits in the packed memory form, and how wide it is there.
-// is_addr is carried separately because an Account field is a whole 32-byte word in memory, so the packing never narrows it to its real 160 bits the way a u128 field's width does.
 #[derive(Clone, Copy)]
 pub struct AbiStructField {
     mem_offset: usize,
@@ -797,7 +670,6 @@ pub struct AbiStructField {
 }
 
 // A stable, unique suffix naming one type's codecs, so two functions taking the same type share a decoder and two different types never collide on one.
-// The recursion has to mirror the type exactly: [[u256]] and [[u256]; 2] differ only in a count, and a name that dropped it would hand the second the first's codec.
 fn abi_mangle(t: &Type) -> String {
     match t {
         Type::Primitive(n) => n.clone(),
@@ -811,7 +683,6 @@ fn abi_mangle(t: &Type) -> String {
 }
 
 // Whether a type is a scalar the ABI can put in exactly one word.
-// A struct of only these is static, so it rides inline in the head with no offset and no length.
 pub fn is_abi_scalar(t: &Type) -> bool {
     matches!(t, Type::Primitive(n) if matches!(n.as_str(),
         "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
@@ -820,7 +691,6 @@ pub fn is_abi_scalar(t: &Type) -> bool {
 }
 
 // Moves one wire word into its packed memory field. Split out because the calldata and memory decoders differ only in how they fetch the word.
-// The read-modify-write is what keeps a narrow field from clobbering its neighbours, since fields share a word and mstore always writes all 32 bytes.
 fn abi_st_field_store(raw: &str, f: &AbiStructField) -> String {
     let v = if f.is_addr {
         format!("and({}, 0xffffffffffffffffffffffffffffffffffffffff)", raw)
@@ -837,8 +707,6 @@ fn abi_st_field_store(raw: &str, f: &AbiStructField) -> String {
 }
 
 // Calldata -> packed memory struct: one wire word per field in declaration order, scattered into a layout that is widest-first and tightly packed.
-// Neither the order nor the stride matches the wire, so every field moves on its own; a calldatacopy would transpose them and silently return the wrong numbers.
-// The whole tuple is bounds-checked up front, since a static struct is inline in the head and its size is known at compile time.
 fn abi_st_cd_helper_src(fname: &str, fields: &[AbiStructField], packed: usize) -> String {
     let mut body = format!("function {}(off) -> ptr {{\n", fname);
     body.push_str(&format!(
@@ -872,7 +740,6 @@ fn abi_st_mem_helper_src(fname: &str, fields: &[AbiStructField], packed: usize) 
 }
 
 // Packed memory struct -> ABI, written at dst. No size is returned because a static struct's width is a compile-time constant the caller already has.
-// Account is masked again on the way out: memory holds it in a full word, and a caller decoding an address from a dirty upper 96 bits would read a different account.
 fn abi_st_put_helper_src(fname: &str, fields: &[AbiStructField]) -> String {
     let mut body = format!("function {}(dst, ptr) {{\n", fname);
     for (i, f) in fields.iter().enumerate() {
@@ -889,8 +756,6 @@ fn abi_st_put_helper_src(fname: &str, fields: &[AbiStructField]) -> String {
 }
 
 // An ABI string or bytes in memory -> gum's own shape, where the length lives in the top 8 bytes of the header word rather than in a word of its own.
-// off is the position of the length word, so a caller behind an offset passes mload(base) rather than its own cursor.
-// Both bounds checks are against the blob's real end, since off arrives from the data and a caller could point it anywhere.
 fn gum_abi_str_mem_helper_src() -> String {
     "function gum_abi_str_mem(base, off, limit) -> ptr {\n\
      \x20   if gt(add(off, 32), limit) { revert(0, 0) }\n\
@@ -904,8 +769,6 @@ fn gum_abi_str_mem_helper_src() -> String {
 }
 
 // An array of static structs: [count][elem0 words][elem1 words]... with the elements inline, since a static tuple carries no offset of its own.
-// Memory holds the structs inline and packed at `packed`, so this walks both cursors at once, the wire at `wire` bytes per element and memory at `packed`.
-// The per-element move is the struct codec itself, called with a base and an offset, which is why the memory decoder shape is reused rather than the calldata one.
 fn abi_starr_cd_helper_src(fname: &str, st_cd: &str, wire: usize, packed: usize) -> String {
     format!(
         "function {fname}(off) -> ptr {{\n\
@@ -980,13 +843,6 @@ fn abi_starr_size_helper_src(fname: &str, wire: usize, packed: usize) -> String 
 // Re-revert with the callee's own revert data, verbatim.
 //
 // A sub-call that fails has a reason, "ERC20: transfer amount exceeds
-// balance", a custom error, a Panic code, sitting in the return data buffer.
-// Replacing it with a blank revert(0, 0) destroys the only information anyone
-// debugging a failed transaction has to go on. Solidity bubbles it; so does
-// this. Shared rather than inlined at each call site, since a contract with
-// several interface methods would otherwise pay for these bytes repeatedly.
-//
-// Scratch memory at 0 is free to clobber here, nothing runs after a revert.
 fn gum_bubble_revert_helper_src() -> String {
     "function gum_bubble_revert() {\n\
      \x20   returndatacopy(0, 0, returndatasize())\n\
@@ -998,15 +854,6 @@ fn gum_bubble_revert_helper_src() -> String {
 // Account.create(code, value) / Account.create2(code, value, salt), deploy
 // a contract from creation bytecode held in memory.
 //
-// code is a Bytes: an 8-byte length in the high bytes of word 0, payload from
-// +32, so the CREATE input is (ptr+32, len), skipping the header.
-//
-// A failed deployment yields address 0 rather than a revert, so it has to be
-// checked or the caller would go on to CALL the zero address. The constructor's
-// own revert data is in the return buffer, so bubble it, a factory that says
-// only "failed" when the child's constructor said why is useless to debug.
-// (When there is no data, a collision, or out-of-gas, bubbling degenerates to
-// a blank revert, which is the truth in those cases.)
 fn gum_create_helper_src() -> String {
     "function gum_create(codeptr, value) -> addr {\n\
      \x20   addr := create(value, add(codeptr, 32), gum_str_len(codeptr))\n\
@@ -1016,8 +863,6 @@ fn gum_create_helper_src() -> String {
 }
 
 // CREATE2 (EIP-1014): the address is keccak256(0xff ++ this ++ salt ++
-// keccak256(code))[12:], knowable before deploying, and independent of the
-// factory's nonce, which is what makes counterfactual addresses work.
 fn gum_create2_helper_src() -> String {
     "function gum_create2(codeptr, value, salt) -> addr {\n\
      \x20   addr := create2(value, add(codeptr, 32), gum_str_len(codeptr), salt)\n\
@@ -1026,8 +871,7 @@ fn gum_create2_helper_src() -> String {
     .to_string()
 }
 
-// The address create2 *would* produce, without deploying. Lets a factory hand
-// out an address before the contract exists at it.
+// The address create2 would produce, without deploying. Lets a factory hand
 fn gum_create2_address_helper_src() -> String {
     "function gum_create2_address(codeptr, salt) -> addr {\n\
      \x20   let h := keccak256(add(codeptr, 32), gum_str_len(codeptr))\n\
@@ -1044,17 +888,6 @@ fn gum_create2_address_helper_src() -> String {
 // to.transfer(amount), send ETH, revert if it fails.
 //
 // The checked companion to pay: same CALL, but an unsuccessful send aborts
-// the transaction instead of returning a bool the caller can forget to test.
-// The two cover the two things a sender can want, and neither can be silently
-// misused: pay hands you the verdict, transfer acts on it.
-//
-// The recipient's revert data is bubbled up verbatim, so a failing receive()
-// surfaces its own reason rather than an anonymous revert. Note this differs
-// from Solidity's transfer, which caps the callee at a 2300-gas stipend;
-// that cap is a known footgun (it bricks recipients whose receive() does any
-// real work, and it silently changes meaning whenever gas is repriced), so
-// gum forwards all gas here exactly as pay does. The reentrancy guard, not
-// a gas stipend, is what makes that safe.
 fn gum_transfer_helper_src() -> String {
     "function gum_transfer(to, amount) {\n\
      \x20   if iszero(call(gas(), to, amount, 0, 0, 0, 0)) {\n\
@@ -1068,12 +901,6 @@ fn gum_transfer_helper_src() -> String {
 // secp256r1 (P-256) signature verification via the precompile at 0x100
 // EIP-7951 on L1, interface-identical to RIP-7212 already live on L2s, so the
 // same bytecode works on both. Enables Apple Secure Enclave / Android Keystore
-// / WebAuthn-passkey signatures without an in-contract curve implementation.
-//
-// The returndatasize check is load-bearing: on an *invalid* signature the
-// precompile returns empty data while the staticcall itself still reports
-// success. Since the output buffer overlaps nothing we wrote, skipping that
-// check would leave stale memory to be misread as a verdict.
 fn gum_p256_verify_helper_src() -> String {
     "function gum_p256_verify(h, r, s, qx, qy) -> ok {\n\
      \x20   let p := mload(0x40)\n\
@@ -1093,10 +920,6 @@ fn gum_p256_verify_helper_src() -> String {
 // EIP-7702 delegation target, or 0 if the account isn't delegated.
 //
 // A 7702-delegated EOA's code is exactly 23 bytes: the 0xef0100 marker followed
-// by the 20-byte address it delegates to. This is the only sound way to reason
-// about such accounts, note that since Pectra an address having code no longer
-// implies it is a contract, so the old extcodesize > 0 "is this an EOA?" test
-// is simply wrong and gum deliberately doesn't offer it.
 fn gum_delegate_of_helper_src() -> String {
     "function gum_delegate_of(a) -> target {\n\
      \x20   target := 0\n\
@@ -1138,7 +961,6 @@ fn gum_str_at_helper_src(rich: bool) -> String {
 }
 
 // Half-open slice [s, e). Reverts (Panic 0x32) if e is past the end or the
-// range is inverted, matching how every other out-of-range access behaves.
 fn gum_str_slice_helper_src(rich: bool) -> String {
     format!(
         "function gum_str_slice(p, s, e) -> ptr {{\n\
@@ -1165,21 +987,6 @@ fn bytes_copy_helper_src() -> String {
 // Reads a packed field: shift the containing word right so the field's
 // bytes land at the bottom, then mask off anything to their left that
 // belongs to a neighboring field. When a field fills its whole 32-byte
-// container (the common, unpacked case) this degenerates to the word
-// itself with no shift/mask needed. Fields wider than 32 bytes (currently
-// only possible for enum-typed or nested-class-typed fields wider than one
-// word, e.g. Account = address+balance = 64 bytes) don't have real
-// multi-word read/write support yet, packing still correctly reserves
-// enough slots so they don't collide with neighbors, but for now this just
-// reads/writes their first word, same as before packing existed.
-// Storage-slot packing follows Solidity's convention: a field at byte offset
-// offset occupies bits [offset*8, (offset+size)*8) counting from the LOW end
-// of the slot (so the first-placed field lives in the least-significant bytes).
-// This is deliberately the opposite end from read_packed/write_packed below,
-// which pack memory/array elements big-endian (byte at the lower *address* is
-// most significant). Keeping storage on Solidity's convention makes gum's
-// packed storage byte-compatible with solc, important for upgrades and any
-// off-chain tooling that reads slots by the standard layout.
 fn read_slot_packed(container_expr: &str, offset: usize, size: usize) -> String {
     if size >= 32 && offset == 0 {
         return container_expr.to_string();
@@ -1225,7 +1032,6 @@ fn read_packed(container_expr: &str, offset_in_container: usize, size: usize) ->
 // Read-modify-write for a packed field: preserve every byte in the
 // container except this field's own range, then OR in the new value shifted
 // into position. Degenerates to a plain overwrite when the field fills its
-// whole container (see read_packed's comment re: fields wider than 32 bytes).
 fn write_packed(
     container_expr: &str,
     offset_in_container: usize,
@@ -1246,10 +1052,6 @@ fn write_packed(
 // Bit width and signedness of a scalar integer type, or None for anything
 // else (bool, classes, arrays, ...). Used to pick the right overflow bound
 // and signed/unsigned opcode variant for a binary operation.
-// Parses a bare non-negative integer literal into u128 for constant folding.
-// Only plain decimal Number nodes qualify, anything else (identifiers,
-// nested expressions, values wider than u128) returns None so the caller
-// keeps the safe runtime path.
 fn literal_u128(expr: &Expr) -> Option<u128> {
     if let Expr::Number(n) = expr {
         n.parse::<u128>().ok()
@@ -1261,8 +1063,6 @@ fn literal_u128(expr: &Expr) -> Option<u128> {
 // Solidity/ABI type name for a gum type, used to build canonical event
 // signatures for topic0 hashing. Account is the EVM address type; the uN/iN
 // families map straight to uintN/intN. Anything unrecognized falls back to
-// uint256, a full 32-byte word, which is the safe default for a topic/data
-// slot even if it makes the signature slightly less precise.
 
 fn numeric_meta(name: &str) -> Option<(usize, bool)> {
     match name {
@@ -1279,13 +1079,12 @@ fn numeric_meta(name: &str) -> Option<(usize, bool)> {
         "u256" => Some((256, false)),
         "i256" => Some((256, true)),
         // A fixed-point value is a signed full-width word carrying a WAD scale, so it is signed for every purpose the scale does not touch: + and - are ordinary signed ops, and comparison and % follow the signed opcodes.
-        // Only * and / move the scale, and translate_binary_op intercepts those before this is consulted.
         "f32" | "f64" => Some((256, true)),
         _ => None,
     }
 }
 
-// Whether a type is WAD-scaled fixed point, whose * and / must correct the scale.
+// Whether a type is WAD-scaled fixed point, whose  and / must correct the scale.
 fn is_fixed_point(t: &Type) -> bool {
     matches!(t, Type::Primitive(p) if p == "f32" || p == "f64")
 }
@@ -1293,9 +1092,6 @@ fn is_fixed_point(t: &Type) -> bool {
 // Truncates a value down to a narrower integer width. Unsigned types just
 // mask off the high bits; signed types must use SIGNEXTEND instead of a
 // plain AND-mask, or a negative value (all-1s in its upper bits under two's
-// complement) would have those bits zeroed and come back out as a large
-// positive number instead of staying negative. No-op for u256/i256, which
-// are already full width.
 fn mask_to_width(val_expr: &str, bits: usize, signed: bool) -> String {
     if bits >= 256 {
         return val_expr.to_string();
@@ -1308,18 +1104,12 @@ fn mask_to_width(val_expr: &str, bits: usize, signed: bool) -> String {
 }
 
 // Like mask_to_width, but takes the gum Type directly and is a no-op for
-// anything that isn't a scalar integer (bool, f32/f64, classes, ..., see
-// numeric_meta).
 fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
     if let Type::Primitive(name) = type_def {
         if let Some((bits, signed)) = numeric_meta(name) {
             return mask_to_width(val_expr, bits, signed);
         }
         // A bytes4 rides the wire left-aligned (its 4 bytes in the high end of
-        // the word, like Solidity). We shift it down to a clean right-aligned
-        // value so it compares against a plain literal such as 0x01ffc9a7. This
-        // is a calldata-scalar representation, enough for interfaceId checks;
-        // it is not laid back out left-aligned for a bytes4 return or field.
         if name == "bytes4" {
             return format!("shr(224, {})", val_expr);
         }
@@ -1330,9 +1120,6 @@ fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
 // The revert body used inside the checked helpers. With rich reverts off it's
 // a bare revert(0, 0) (smallest possible, zero return data). With it on it
 // encodes Solidity's Panic(uint256): selector 0x4e487b71 followed by a code
-// (0x11 arithmetic over/underflow, 0x12 division by zero), so explorers,
-// try/catch, and tooling can decode *why* the revert happened. The extra
-// bytes are exactly what that observability costs, per distinct panic site.
 fn panic_revert(rich: bool, code: &str) -> String {
     if rich {
         format!(
@@ -1350,7 +1137,6 @@ const PANIC_OOB: &str = "0x32";
 const PANIC_EMPTY_POP: &str = "0x31";
 
 // (elements per slot, slots per group) for an element of esz bytes, see
-// pk_read_helper_src for what the pair means.
 fn pack_params(esz: usize) -> (usize, usize) {
     let esz = esz.max(1);
     if esz >= 32 {
@@ -1361,7 +1147,6 @@ fn pack_params(esz: usize) -> (usize, usize) {
 }
 
 // The data region of a dynamic storage array: Solidity stores the length at
-// the field's slot and the elements starting at keccak256(slot).
 fn arr_data_base_helper_src() -> String {
     "function arr_data_base(len_slot) -> b {\n\
      \x20   mstore(0, len_slot)\n\
@@ -1373,19 +1158,6 @@ fn arr_data_base_helper_src() -> String {
 // Element addressing for a storage array, packed exactly as Solidity packs it.
 //
 // Every element width is handled by one scheme, parameterized by:
-//   esz, the element's byte width
-//   per, how many elements share a slot   (floor(32/esz), or 1 when esz >= 32)
-//   es , how many slots a group occupies  (1, or ceil(esz/32) when esz >= 32)
-//
-// so element i lives at slot base + (i/per)*es, occupying esz bytes at bit
-// offset (i%per)*esz*8, counting from the *least* significant end, like
-// Solidity. Narrow elements (u8: 32 per slot, u96: 2 per slot) collapse to the
-// first case; word-or-wider elements collapse to the second, where per=1 makes
-// the shift 0 and the mask all-ones, degenerating to a plain sload/sstore.
-//
-// per/es/esz are literal constants at every call site, so solc folds the
-// arithmetic away; passing them as arguments keeps this to one helper for all
-// element widths instead of one per width.
 fn pk_read_helper_src(tr: bool) -> String {
     format!(
         "function pk_read{k}(base, i, per, es, esz) -> v {{\n\
@@ -1398,7 +1170,6 @@ fn pk_read_helper_src(tr: bool) -> String {
 }
 
 // Read-modify-write: the neighbours sharing this slot are live elements, so
-// every write has to preserve them.
 fn pk_write_helper_src(tr: bool) -> String {
     format!(
         "function pk_write{k}(base, i, per, es, esz, v) {{\n\
@@ -1414,8 +1185,6 @@ fn pk_write_helper_src(tr: bool) -> String {
 }
 
 // Copies a whole dynamic storage array out into a fresh memory array.
-// Storage packs elements per Solidity's rules while memory lays them out big endian at i*esz behind a byte length header, so this reads element by element rather than copying words.
-// esz, per and es are baked in rather than passed, because the narrow element write needs write_packed at compile time.
 fn sarr_to_mem_helper_src(name: &str, esz: usize, per: usize, es: usize, tr: bool) -> String {
     let write = if esz >= 32 {
         "v".to_string()
@@ -1447,22 +1216,13 @@ fn sarr_to_mem_helper_src(name: &str, esz: usize, per: usize, es: usize, tr: boo
 // How many whole slots one struct element of an array occupies.
 //
 // Unlike a scalar element, a struct element is never packed with its
-// neighbours, each one starts a new slot, exactly as Solidity specifies
-// ("array elements of struct type always occupy whole slots"). For a
-// word-or-narrower struct this is 1, which is the same stride the scalar path
-// uses for a 32-byte element, so the two agree where they overlap.
 fn struct_elem_slots(size: usize) -> usize {
     size.div_ceil(32).max(1)
 }
 
 // The base slot of struct element i, bounds-checked.
 //
-// The check runs *before* the multiply: mul(i, es) on a huge index wraps, and
-// checking the wrapped product would wave it straight through into some
-// unrelated slot. Comparing the raw index against the length cannot wrap.
-//
-// No _t variant: this is pure arithmetic over a base and a length its caller
-// already loaded, so it is the same code for either storage kind.
+// The check runs before the multiply: mul(i, es) on a huge index wraps, and
 fn sarr_base_helper_src(rich: bool) -> String {
     format!(
         "function sarr_base(base, i, len, es) -> b {{\n\
@@ -1476,7 +1236,6 @@ fn sarr_base_helper_src(rich: bool) -> String {
 // arr.pop() for a struct array: zero every slot of the removed element (as
 // Solidity does, for the refund) then shrink. Struct elements own their slots
 // outright, so unlike the packed scalar pop there are no neighbours to preserve
-// but there are es of them to clear, not one.
 fn dsarr_pop_helper_src(rich: bool, tr: bool) -> String {
     format!(
         "function dsarr_pop{k}(len_slot, es) {{\n\
@@ -1495,8 +1254,6 @@ fn dsarr_pop_helper_src(rich: bool, tr: bool) -> String {
 }
 
 // Bounds-checked read/write. Reverts (Panic 0x32 under --rich-reverts, blank
-// otherwise) if the index is past the length. Used for reads as well as writes
-// so the check still applies where the access is an expression, not a statement.
 fn pk_get_helper_src(rich: bool, tr: bool) -> String {
     format!(
         "function pk_get{k}(base, i, len, per, es, esz) -> v {{\n\
@@ -1533,7 +1290,6 @@ fn dpk_push_helper_src(tr: bool) -> String {
 }
 
 // pop zeroes the removed element (Solidity does, for the gas refund) without
-// disturbing the neighbours that share its slot, then shrinks.
 fn dpk_pop_helper_src(rich: bool, tr: bool) -> String {
     format!(
         "function dpk_pop{k}(len_slot, per, es, esz) {{\n\
@@ -1555,7 +1311,6 @@ fn dpk_pop_helper_src(rich: bool, tr: bool) -> String {
 }
 
 // delete arr on a dynamic storage array: zero every occupied slot, then the
-// length, the same slots Solidity clears, so the refund matches too.
 fn dpk_clear_helper_src(tr: bool) -> String {
     format!(
         "function dpk_clear{k}(len_slot, per, es) {{\n\
@@ -1604,8 +1359,6 @@ fn checked_mul_helper_src(rich: bool) -> String {
 }
 
 // Signed add. checked_add guards with lt and a max, both unsigned, so on a signed type it read a negative operand as a huge number and reverted: 5 + (-3) never got a chance to be 2.
-// The overflow test is the classic sign trick, two operands of the same sign whose result differs in sign, which is exact at 256 bits where a range check alone cannot be.
-// The range check after it is what narrows the result to i8..i128; for i256 the bounds are the word's own and it always passes.
 fn checked_sadd_helper_src(rich: bool) -> String {
     format!(
         "function checked_sadd(a, b, minv, maxv) -> r {{\n\
@@ -1641,7 +1394,6 @@ fn checked_ssub_n_helper_src(rich: bool) -> String {
 }
 
 // Signed multiply. sdiv(r, a) == b is the same inverse test checked_mul uses, in its signed form.
-// The a == -1 and b == min case is special because its true result is one past max, and sdiv would hand back min again and call it agreement.
 fn checked_smul_helper_src(rich: bool) -> String {
     format!(
         "function checked_smul(a, b, minv, maxv) -> r {{\n\
@@ -1661,9 +1413,7 @@ fn checked_smul_helper_src(rich: bool) -> String {
 // One WAD, the scale of every f32 and f64 value: 1.0 is 10^18.
 const WAD: &str = "1000000000000000000";
 
-// Full-precision unsigned floor((x*y)/d), the Remco Bloemen / OpenZeppelin Math.mulDiv.
-// The product x*y is held as a 512-bit number in two words, so an intermediate that overflows a single word is not lost the way a bare mul loses it; only a final result that does not fit 256 bits reverts.
-// The tail is the standard trick: strip the common power of two, then multiply by the modular inverse of d, which Newton-Raphson doubles to 256 bits in six steps.
+// Full-precision unsigned floor((xy)/d), the Remco Bloemen / OpenZeppelin Math.mulDiv.
 fn gum_muldiv_helper_src(rich: bool) -> String {
     format!(
         "function gum_muldiv(x, y, d) -> r {{\n\
@@ -1699,8 +1449,6 @@ fn gum_muldiv_helper_src(rich: bool) -> String {
 }
 
 // A signed WAD op reduces to an unsigned mulDiv on the magnitudes, with the sign reapplied at the end.
-// Absolute value in unsigned space: sub(0, int256_min) is 2^255, the correct magnitude, so even the extreme operand is handled.
-// The range check is the last step: a positive result may reach maxv, a negative one may reach 2^255 (which is minv's bit pattern read unsigned), so the guard is asymmetric.
 fn gum_wad_signed(fname: &str, num: &str, den: &str, rich: bool) -> String {
     format!(
         "function {fname}(a, b, minv, maxv) -> r {{\n\
@@ -1721,14 +1469,13 @@ fn gum_wad_signed(fname: &str, num: &str, den: &str, rich: bool) -> String {
     )
 }
 
-// Multiplying two WAD values gives a WAD-squared product, so it comes back down by one WAD: floor(|a|*|b| / 10^18) on the magnitudes.
-// Full-precision, so an operand large enough that a*b overflows int256 no longer reverts as long as the scaled result fits, which is the whole point of a WAD mul.
+// Multiplying two WAD values gives a WAD-squared product, so it comes back down by one WAD: floor(|a||b| / 10^18) on the magnitudes.
 fn gum_wad_mul_helper_src(rich: bool) -> String {
     let den = WAD.to_string();
     gum_wad_signed("gum_wad_mul", "x, y", &den, rich)
 }
 
-// Dividing two WAD values cancels the scale, so the numerator goes up by one WAD first: floor(|a|*10^18 / |b|).
+// Dividing two WAD values cancels the scale, so the numerator goes up by one WAD first: floor(|a|10^18 / |b|).
 fn gum_wad_div_helper_src(rich: bool) -> String {
     let num = format!("x, {}", WAD);
     // b == 0 surfaces inside gum_muldiv as a divide-by-zero once the magnitude denominator is zero.
@@ -1776,8 +1523,6 @@ fn checked_smod_helper_src(rich: bool) -> String {
 }
 
 // Runtime shape of every enum value in this compiler: a pointer to
-// [tag: 32 bytes][payload: 32 bytes]. tag is the variant's 0-based
-// declaration-order index, the same index Statement::Match switches on.
 fn make_enum_helper_src() -> String {
     "function make_enum(tag, payload) -> ptr {\n\
      \x20   ptr := allocate_memory(64)\n\
@@ -1800,41 +1545,24 @@ fn keccak256_hex(data: &str) -> String {
 }
 
 // Identifies which class a method body's implicit self belongs to, and
-// whether that class is a storage-backed singleton ("global") or an
-// ordinary memory-backed value passed around by pointer.
 pub struct SelfCtx {
     pub class_name: String,
     pub is_global: bool,
 }
 
-// Threaded through every translate_* call so a single Translator can compile
-// both dispatcher entry points and internal helpers (class methods, other
-// gum functions) correctly.
+// Threaded through every translate_ call so a single Translator can compile
 pub struct Ctx<'c> {
     pub self_ctx: Option<&'c SelfCtx>,
     // Entry points (the _impl functions the dispatcher calls) end with the
-    // real EVM return opcode, which halts the whole call. Internal
-    // functions must instead assign a named return variable and leave,
-    // or they'd halt execution the moment anything called them mid-body.
     pub is_entry: bool,
     pub try_ok_var: Option<String>,
     // Declared types of parameters and locals for the function/method
-    // currently being translated. Codegen runs after the semantic pass has
-    // already finished (and popped all its scopes), so we can't reuse
-    // TypeChecker's symbol table here, it tracks its own copy, seeded from
-    // parameters and grown as VarDecl statements are translated.
     locals: RefCell<HashMap<String, Type>>,
     // The enclosing function/method's declared return type, if any, used
-    // to mask a narrow-int return value down to its true width (see
-    // mask_for_type's doc comment for why that's needed at all).
     pub return_type: Option<Type>,
     // The designated reentrancy lock slot if this context requires guarding.
-    // When returning, if this is set and we're emitting an explicit return
-    // opcode, we must clear the lock before the VM halts.
     pub lock_slot: Option<String>,
     // True while translating fn new. An immutable field is a plain Yul local
-    // there (the constructor computes it, and the deploy block bakes it into
-    // the runtime code afterwards) but a loadimmutable everywhere else.
     pub in_constructor: bool,
 }
 
@@ -1871,7 +1599,6 @@ impl<'c> Ctx<'c> {
     // Binds the class an entry point belongs to. Entry points are declared
     // inside a contract, so their bodies can say self.field, without a
     // self context that resolves as a memory field on an unbound self
-    // variable, and solc rejects the Yul (or worse, wouldn't).
     pub fn with_self(mut self, self_ctx: Option<&'c SelfCtx>) -> Self {
         self.self_ctx = self_ctx;
         self
@@ -1938,7 +1665,7 @@ pub struct Translator<'a> {
     //
     // BTreeMap, not HashMap: ABI JSON order must be deterministic across runs.
     events: RefCell<BTreeMap<String, EventSchema>>,
-    // Errors raised during translation. translate_* return plain Strings of
+    // Errors raised during translation. translate_ return plain Strings of
     // Yul with nowhere to put a failure, so they are collected here and
     // drained by codegen once the walk is done.
     errors: RefCell<Vec<String>>,
@@ -1983,13 +1710,11 @@ impl<'a> Translator<'a> {
     }
 
     // Errors raised while translating. Non-empty means the emitted Yul must
-    // not be used.
     pub fn take_errors(&self) -> Vec<String> {
         std::mem::take(&mut *self.errors.borrow_mut())
     }
 
     // Event schemas gathered from every log() translated so far, name-sorted.
-    // Read after translation completes, see codegen/mod.rs.
     pub fn recorded_events(&self) -> Vec<(String, EventSchema)> {
         self.events
             .borrow()
@@ -2001,10 +1726,6 @@ impl<'a> Translator<'a> {
     // Files one log() site's schema, or reports the name as ambiguous.
     //
     // Two sites may legitimately log the same event repeatedly, but they must
-    // agree: an event name maps to exactly one ABI entry, so disagreeing sites
-    // would silently publish one of them and mis-decode the other. Types
-    // disagreeing also means the two produce *different* topic0s under one
-    // name, which no ABI can express.
     fn record_event(&self, name: &str, schema: EventSchema) -> Result<(), String> {
         let mut events = self.events.borrow_mut();
         match events.get(name) {
@@ -2036,7 +1757,6 @@ impl<'a> Translator<'a> {
     }
 
     // The array ABI decoders, for the dispatcher and constructor arg decoding
-    // that codegen/mod.rs emits directly rather than through translate_expr.
     pub fn ensure_abi_arr_cd(&self) {
         self.ensure_helper("gum_abi_arr_cd", gum_abi_arr_cd_helper_src);
     }
@@ -2051,7 +1771,6 @@ impl<'a> Translator<'a> {
     }
 
     // A struct's fields in declaration order, which is ABI order. Memory order is widest-first, so this deliberately does not follow the memory layout.
-    // None means the struct has no static wire form, either it is empty or some field is not a single-word scalar, and the caller must reject rather than emit a codec that drops the field.
     pub fn abi_struct_layout(&self, name: &str) -> Option<Vec<AbiStructField>> {
         let class = self.type_checker().loaded_classes.get(name)?;
         let mut out = Vec::new();
@@ -2109,7 +1828,6 @@ impl<'a> Translator<'a> {
     }
 
     // The struct-array codecs, each built on the single-struct codec above so the two can never disagree about a field's place.
-    // Returns the helper name; the caller still passes an offset, since [P] is dynamic and lives behind an offset word like any other dynamic array.
     pub fn ensure_abi_struct_arr_cd(&self, name: &str) -> Option<String> {
         let (st, wire) = self.ensure_abi_struct_cd(name)?;
         let packed = self.abi_struct_packed(name);
@@ -2167,7 +1885,6 @@ impl<'a> Translator<'a> {
     }
 
     // Whether the ABI keeps this type behind an offset word instead of inline in the head.
-    // A fixed array inherits it from its element: [u256; 3] is three inline words, but [[u256]; 3] is three offsets and therefore dynamic itself.
     pub fn abi_is_dynamic(&self, t: &Type) -> bool {
         match t {
             Type::Array(_) => true,
@@ -2187,9 +1904,7 @@ impl<'a> Translator<'a> {
         }
     }
 
-    // The four ensure_abi_* below give every ABI type the same four codec signatures: cd(off), mem(base, off, limit), put(dst, ptr) -> written, size(ptr).
-    // That uniformity is the whole trick behind nesting: an outer array calls its element's codec by name without knowing whether the element is a scalar array, a struct array, or another nesting level.
-    // None means the type has no ABI form and the caller must reject it rather than emit a codec that silently drops data.
+    // The four ensure_abi_ below give every ABI type the same four codec signatures: cd(off), mem(base, off, limit), put(dst, ptr) -> written, size(ptr).
     pub fn ensure_abi_cd(&self, t: &Type) -> Option<String> {
         if let Some(sn) = self.abi_struct_elem(t) {
             return self.ensure_abi_struct_arr_cd(&sn);
@@ -2371,12 +2086,9 @@ impl<'a> Translator<'a> {
         Some((fname, sname))
     }
 
-    // How many bytes this type occupies in an ABI **head**: one word for a
+    // How many bytes this type occupies in an ABI head: one word for a
     // scalar or a dynamic type's offset, N words inline for a fixed array.
     // Shared so the calldata-length guard, the head layout, and the decoders
-    // cannot drift from one another.
-    // How many bytes a parameter occupies in the ABI head, which is what the dispatcher's calldatasize guard is built from.
-    // A static struct is inline, so it is as wide as its field count; everything dynamic is a single offset word and is length-checked by its own decoder.
     pub fn abi_head_bytes(&self, t: &Type) -> usize {
         if self.abi_is_dynamic(t) {
             return 32;
@@ -2392,14 +2104,11 @@ impl<'a> Translator<'a> {
     }
 
     // For codegen/mod.rs's synthesized serialize() functions, which need
-    // bytes_copy but aren't produced via translate_expr/translate_statement.
     pub fn require_bytes_copy(&self) {
         self.ensure_helper("bytes_copy", bytes_copy_helper_src);
     }
 
     // Exposed for codegen/mod.rs's dispatcher parameter-loading loop, which
-    // masks each incoming narrow-int argument down to its declared width in
-    // case a non-conforming caller sent dirty high bits (see mask_for_type).
     pub fn mask_for_type(&self, val_expr: &str, type_def: &Type) -> String {
         mask_for_type(val_expr, type_def)
     }
@@ -2411,8 +2120,6 @@ impl<'a> Translator<'a> {
     // Resolves an expression's static type without relying on the semantic
     // checker's symbol table, which is already stale by codegen time (its
     // per-function scopes were pushed and popped during the earlier
-    // semantic pass). Uses ctx.locals (parameters + declared vars) plus
-    // class/enum field & method metadata instead.
     fn static_type(&self, expr: &Expr, ctx: &Ctx) -> Type {
         match expr {
             Expr::Number(_) => Type::Primitive("u256".to_string()),
@@ -2667,7 +2374,6 @@ impl<'a> Translator<'a> {
                 }
                 if ctx.is_entry {
                     // tstore, not sstore: the lock lives in transient storage.
-                    // tstore, not sstore: the lock lives in transient storage.
                     let lock_clear = match &ctx.lock_slot {
                         Some(lock) => format!("tstore({}, 0)\n", lock),
                         None => String::new(),
@@ -2712,8 +2418,7 @@ impl<'a> Translator<'a> {
                             lock_clear = lock_clear
                         )
                     } else if is_dynamic {
-                        // Bound to a local first, like every other branch here: the expression was substituted twice, once for the length and once for the copy, so `return I(t).name()` made the external call twice.
-                        // Two calls is not just double gas. A callee free to answer differently would have the length come from one call and the bytes from the other.
+                        // Bound to a local first, like every other branch here: the expression was substituted twice, once for the length and once for the copy, so return I(t).name() made the external call twice.
                         format!(
                             "let _p := {val}\n\
                              let _len := and(shr(192, mload(_p)), 0xffffffffffffffff)\n\
@@ -2854,7 +2559,7 @@ impl<'a> Translator<'a> {
                 let match_expr = self.translate_expr(expr, ctx);
                 let mv = format!("__match_{}", self.next_literal_id());
                 let mut out = format!("let {} := {}\n", mv, match_expr);
-                // A payload-free enum *is* the tag; a payload-carrying one is a pointer to [tag][payload], so only that one dereferences.
+                // A payload-free enum is the tag; a payload-carrying one is a pointer to [tag][payload], so only that one dereferences.
                 let scalar_enum = self.type_checker().is_scalar_enum(&self.static_type(expr, ctx));
                 if scalar_enum {
                     out.push_str(&format!("switch {}\n", mv));
@@ -2890,9 +2595,6 @@ impl<'a> Translator<'a> {
                 }
                 let code = self.translate_expr(expr, ctx);
                 // A call used as a statement discards its result. Yul rejects a
-                // top-level expression that returns a value, so pop it. A void
-                // call (a method with no return type) types as "unknown" here
-                // and is left as a bare statement.
                 let discards_value = matches!(expr, Expr::MethodCall { .. } | Expr::FnCall { .. })
                     && !matches!(self.static_type(expr, ctx), Type::Primitive(ref n) if n == "unknown");
                 if discards_value {
@@ -2980,7 +2682,6 @@ impl<'a> Translator<'a> {
         }
 
         // The event data is an ABI argument list like any other, so it goes through the encoder the CREATE and interface-call paths use rather than one word per field.
-        // One word per field was right only for scalars: for a string, an array or a struct it wrote the memory pointer, and the ABI JSON told decoders to read it as the real type.
         let types: Vec<Type> = data.iter().map(|(_, t)| t.clone()).collect();
         let (size_src, write_src) = self.abi_arg_blob_src(&types);
         // A block, so the a0..aN the encoder emits are scoped to this log and a second log in the same function does not redeclare them.
@@ -3293,7 +2994,6 @@ impl<'a> Translator<'a> {
                             enum_decl.variants.iter().position(|v| &v.name == property)
                         {
                             // A payload-free enum is its tag, full stop: no allocation, no pointer, and it stores, logs and encodes as the u8 it is.
-                            // Only a payload-carrying one needs the [tag][payload] pair, and that lives in memory alone.
                             if !self.type_checker().enum_has_payload(base_name) {
                                 return idx.to_string();
                             }
@@ -3409,8 +3109,6 @@ impl<'a> Translator<'a> {
     }
 
     // Lays out an ABI argument list for a helper whose parameters are a0..aN-1, shared by the CREATE encoder and the interface-call encoder because the wire format does not care which one is writing.
-    // Returns (size_src, write_src): the first computes `alen`, the second fills the blob at `blob`, so a caller can allocate between them and choose its own prefix, a 4-byte selector or the child's creation code.
-    // Every codec is registered here rather than inside the caller's builder closure, since ensure_helper holds the thunk map borrowed while it runs and a nested registration would panic.
     fn abi_arg_blob_src(&self, types: &[Type]) -> (String, String) {
         let head_bytes: usize = types.iter().map(|t| self.abi_head_bytes(t)).sum();
         let head_at: Vec<usize> = types
@@ -3671,7 +3369,6 @@ impl<'a> Translator<'a> {
     }
 
     // The smallest value of a signed type, as its two's complement in a full word: 0x80..00 for i256, 0xff..ff80 for i8.
-    // Sign-extended like every other negative, so slt compares it correctly against a result of the same width.
     fn min_signed_hex(bits: usize) -> String {
         let n = bits / 8;
         format!("0x{}{}{}", "ff".repeat(32 - n), "80", "00".repeat(n - 1))
@@ -3739,8 +3436,7 @@ impl<'a> Translator<'a> {
 
         let rich = self.rich_reverts;
 
-        // Only * and / move a WAD scale, and only when both sides carry one: two WAD values multiplied are WAD-squared, and divided they are unscaled.
-        // A bare literal on one side is a plain count rather than a fixed-point value, which is exactly the case the scale check lets through, so x * 2 stays an ordinary scalar multiply and doubles x.
+        // Only  and / move a WAD scale, and only when both sides carry one: two WAD values multiplied are WAD-squared, and divided they are unscaled.
         if matches!(operator, "*" | "/")
             && is_fixed_point(&self.static_type(left, ctx))
             && is_fixed_point(&self.static_type(right, ctx))
@@ -3969,7 +3665,6 @@ impl<'a> Translator<'a> {
     }
 
     // A dynamic storage array read as a value copies out to memory, since a storage array cannot be held outside storage.
-    // Only reached when the whole field is the expression: indexing, length, push, pop and for loops all resolve earlier and never copy.
     fn storage_array_to_memory(&self, e: &Expr, ctx: &Ctx) -> Option<String> {
         let (slot, esz, tr) = self.dyn_storage_array(e, ctx)?;
         if self.storage_struct_array(e, ctx).is_some() {
@@ -4183,7 +3878,6 @@ impl<'a> Translator<'a> {
 
     fn struct_storage_base(&self, base: &Expr, ctx: &Ctx) -> Option<(String, String)> {
         // A struct held directly as a contract field, C.p, so C.p.b resolves to p's base slot plus b's offset within the struct.
-        // Without this the field fell through to load_storage_field, which materializes a memory copy of the struct: reads reloaded it every time and worked by accident, and a write landed in the copy and was discarded.
         if let Expr::PropertyAccess { base: owner, property } = base {
             let sf = self
                 .field_owner(owner, ctx)
@@ -4259,8 +3953,6 @@ impl<'a> Translator<'a> {
     }
 
     // The revert data of a custom error is an ABI argument list like any other, so it shares the CREATE and interface-call encoder rather than laying out its own head and tail.
-    // Hand-rolled, it handled scalars and strings and wrote the memory pointer for an array or a struct, while the selector was hashed from the real type, so a decoder read the pointer as a plausible value.
-    // types comes from the error declaration, not the argument expressions, because only the declaration says what the wire form is.
     fn emit_revert_data(
         &self,
         label: &str,
@@ -4633,7 +4325,7 @@ impl<'a> Translator<'a> {
         if let Expr::Identifier(enum_name) = base {
             if let Some(enum_decl) = self.type_checker().loaded_enums.get(enum_name) {
                 if let Some(idx) = enum_decl.variants.iter().position(|v| v.name == method) {
-                    // Same rule as the bare `S.A` form above: a payload-free enum is its tag, so it needs no allocation and no pointer.
+                    // Same rule as the bare S.A form above: a payload-free enum is its tag, so it needs no allocation and no pointer.
                     if !self.type_checker().enum_has_payload(enum_name) {
                         return idx.to_string();
                     }
@@ -4654,8 +4346,6 @@ impl<'a> Translator<'a> {
         {
             if self.type_checker().loaded_interfaces.contains(iface_name) && cast_args.len() == 1 {
                 // The interface target (cast_args[0]) must lead the arg list:
-                // extcall_wrapper_src reads arg_exprs[0] as the call target and
-                // treats the rest as the method's ABI args, in order.
                 return self.extcall_wrapper_src(iface_name, method, &std::iter::once(cast_args[0].clone()).chain(args.iter().cloned()).collect::<Vec<_>>(), ctx);
             }
         }
@@ -4681,7 +4371,6 @@ impl<'a> Translator<'a> {
                     return format!("{}_{}({})", class_name, method, arg_strs.join(", "));
                 }
                 // Any other bare class name is not an instance, so its method has no self to run on. This used to emit a call with the self argument dropped, which solc rejected.
-                // Reaching a parent's version is spelled Child.Parent.method(); a class's own method needs an instance.
                 if bare_class {
                     self.errors.borrow_mut().push(format!(
                         "'{}.{}()' has no receiver. Call a parent's version as Child.{}.{}(), or call the method on an instance.",
@@ -4706,8 +4395,6 @@ impl<'a> Translator<'a> {
     }
 
     // How many bytes a fresh local of this type needs, or None for a scalar, which is just a value.
-    // Anything memory-backed has to own a block from the start: a declaration with no initializer used to bind 0, so p.x on a `mut P p` read scratch memory at address 0 and returned whatever happened to be there.
-    // Fresh memory is already zero, since allocate_memory only ever bumps the free pointer, so the block needs no explicit clearing; a dynamic array's or a string's header word is a zero length for free.
     fn fresh_local_bytes(&self, t: &Type) -> Option<usize> {
         match t {
             Type::FixedArray(..) | Type::Array(_) => Some(self.layout_engine.size_of(t)),
@@ -4723,8 +4410,6 @@ impl<'a> Translator<'a> {
     }
 
     // Whether a value of this type sits inline where it is stored rather than being a pointer to somewhere else.
-    // An inline element is addressed, never loaded: its address already is the value, and mload would hand back only its first word.
-    // A struct and a fixed array are inline; a dynamic array is a stored pointer, so it is loaded like a scalar.
     fn elem_is_inline(&self, t: &Type) -> bool {
         matches!(t, Type::FixedArray(..)) || is_struct_type(self.type_checker(), t)
     }
@@ -4947,7 +4632,6 @@ impl<'a> Translator<'a> {
         }
 
         // A memory-backed local is a pointer to a block, so deleting it clears the block. Assigning 0 nulled the pointer instead, and every later read of it went to scratch memory at address 0.
-        // A dynamic array's and a string's block is just the header, so zeroing it is exactly a length of 0.
         if let Expr::Identifier(_) = target {
             let t = self.static_type(target, ctx);
             if let Some(bytes) = self.fresh_local_bytes(&t) {
@@ -5239,9 +4923,6 @@ impl<'a> Translator<'a> {
     // An interface call is the same ABI layout problem as a CREATE, only the prefix differs: a 4-byte selector instead of the child's creation code, so it shares abi_arg_blob_src.
     // The parameter types come from the interface declaration rather than the argument expressions, because only the declaration says whether a value is a tuple, a string, or a scalar.
     // Output is taken via returndatacopy rather than a call-supplied buffer, since with dynamic args the arg blob is no longer conveniently at least a word wide.
-    // How an interface call reads its result back out of returndata, assigning `result`.
-    // A scalar stays on the cheap path, one word through scratch memory, so the common call pays nothing for the rest of this.
-    // Everything else is an ABI value that has to be decoded into gum's memory shape exactly as a constructor argument is: static shapes (a struct, a fixed array) sit inline at offset 0, dynamic ones sit behind an offset word, which is why those read mload(rd) first.
     fn extcall_return_src(&self, ret_ty: &Option<Type>) -> String {
         let t = match ret_ty {
             Some(t) => t,
@@ -5267,7 +4948,6 @@ impl<'a> Translator<'a> {
             );
         }
         // An array of any shape decodes through its own codec, reading returndata as the memory blob it already is.
-        // A dynamic result starts with an offset word, hence mload(rd); a static one begins at 0.
         if matches!(t, Type::Array(_) | Type::FixedArray(..)) {
             if let Some(h) = self.ensure_abi_mem(t) {
                 return if self.abi_is_dynamic(t) {

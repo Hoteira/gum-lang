@@ -14,10 +14,6 @@ use std::path::Path;
 // Assembles a Yul object into deployable EVM bytecode by driving solc
 // --strict-assembly. gumc's own backend stops at Yul (the standard portable
 // EVM IR); solc's battle-tested Yul->EVM pipeline (optimizer + assembler) is
-// what every young EVM language uses for this last mile, so we shell out to
-// it rather than reimplement stack layout, jump resolution, and the Yul
-// optimizer from scratch. A native assembler can replace this later without
-// touching anything upstream of the Yul text.
 fn assemble_yul(yul: &str, solc_path: &str) -> Result<String, String> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("gumc_{}.yul", std::process::id()));
@@ -89,7 +85,7 @@ fn main() {
         .get_matches();
 
     let file_path = matches.get_one::<String>("file").unwrap();
-    // Only local imports need a root, and the source file's own directory is the only sensible one. The standard library is compiled in, so nothing has to be found on disk for `use gum.*` to work.
+    // Only local imports need a root, and the source file's own directory is the only sensible one. The standard library is compiled in, so nothing has to be found on disk for use gum. to work.
     let base_dir = Path::new(file_path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())

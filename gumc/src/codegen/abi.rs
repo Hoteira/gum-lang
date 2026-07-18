@@ -30,7 +30,6 @@ pub struct AbiEntry {
     pub name: String,
     pub inputs: Vec<AbiInput>,
     // Option rather than always emitted, so an event or error omits these keys entirely.
-    // Serializing an empty outputs or a meaningless stateMutability would make the entry invalid to a strict decoder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<AbiInput>>,
     #[serde(rename = "stateMutability", skip_serializing_if = "Option::is_none")]
@@ -134,8 +133,6 @@ impl<'a> AbiGenerator<'a> {
     }
 
     // The ABI JSON for one contract: constructor, exported functions and errors, with events appended by the caller from the translator's registry.
-    // Non-export fns are skipped to match the dispatcher, which gives them no selector.
-    // receive and fallback get their own entry types, never a function entry, or a caller would compute a selector that dispatches nowhere.
     pub fn generate_abi(&self, program: &Program, class: &ClassDecl) -> Vec<AbiEntry> {
         let mut entries = Vec::new();
         let muts = analyze_class(self.type_checker, class);
@@ -243,8 +240,7 @@ impl<'a> AbiGenerator<'a> {
 
     // Builds the ABI entry for one event, from the schema the translator
     // recorded at its log() site. Kept here so every ABI shape decision
-    // lives in one file, but the *contents* come from codegen, see
-    // Translator::record_event.
+    // lives in one file, but the contents come from codegen, see
     pub fn event_entry(name: &str, inputs: Vec<AbiInput>) -> AbiEntry {
         AbiEntry {
             entry_type: "event".to_string(),

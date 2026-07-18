@@ -80,7 +80,7 @@ pub struct LayoutEngine<'a> {
     // Total packed size of each class's own memory representation, keyed by
     // class name. Used by size_of instead of a naive "32 bytes per field".
     packed_class_size: HashMap<String, usize>,
-    // Per-class *relative* storage layout (slots numbered from 0), keyed
+    // Per-class relative storage layout (slots numbered from 0), keyed
     // "Class.field". Used for structs living in storage, e.g. a struct value
     // inside a mapping, where each field sits at base_slot + this slot, with
     // this offset/size within that slot. Distinct from storage_fields, which
@@ -130,8 +130,6 @@ impl<'a> LayoutEngine<'a> {
     // Real byte width of a scalar integer/bool type. Everything else (u256,
     // i256, f32/f64, these represent full-width fixed-point values, not
     // native 32/64-bit floats, classes, enums, arrays, generics) keeps
-    // going through size_of, which now consults packed_class_size for
-    // classes instead of assuming 32 bytes per field.
     fn scalar_byte_width(type_def: &Type) -> Option<usize> {
         if let Type::Primitive(name) = type_def {
             return match name.as_str() {
@@ -172,14 +170,7 @@ impl<'a> LayoutEngine<'a> {
 
     // Packs a class's fields into 32-byte storage slots, largest fields
     // first, filling in smaller ones wherever they still fit, this is the
-    // manual optimization Solidity asks the *author* to do by hand; here the
-    // compiler does it automatically. Fields wider than one slot (currently
-    // only possible for enum-typed fields, tag+payload = 64 bytes) always
-    // start a fresh slot and reserve as many as they need.
-    //
-    // Takes the first slot available to this class (so multiple global
-    // classes stack after one another instead of each starting over at slot
-    // 0 and colliding) and returns the next free slot after it.
+    // manual optimization Solidity asks the author to do by hand; here the
     fn pack_storage_fields(
         &self,
         fields: &[ClassField],
@@ -226,11 +217,6 @@ impl<'a> LayoutEngine<'a> {
     // Both passes below walk class_order, the order classes were first
     // registered in (declaration order locally, then import order), rather
     // than loaded_classes directly. loaded_classes is a HashMap, and Rust
-    // deliberately randomizes HashMap iteration order per process; iterating
-    // it here would mean the same source could get different storage slot
-    // assignments on different compiler runs. That's silently corruptive for
-    // anything relying on a stable layout across recompiles (upgradeable
-    // proxies, reproducible-build verification).
     fn ordered_classes(&self) -> Vec<(String, ClassDecl)> {
         self.type_checker.class_order.iter()
             .filter_map(|name| self.type_checker.loaded_classes.get(name).map(|c| (name.clone(), c.clone())))
@@ -301,9 +287,6 @@ impl<'a> LayoutEngine<'a> {
     // Packs a class under an existing storage lock: every committed field keeps
     // its exact slot/offset; new fields are placed into leftover space (a tail
     // gap in a committed slot, or a fresh slot beyond all committed storage).
-    // Any change that would move or reinterpret a committed field, a removed
-    // field, or a field whose byte width changed, is a hard error, because it
-    // would silently corrupt the storage an upgraded contract inherits.
     fn pack_storage_fields_locked(
         &self,
         class_name: &str,
@@ -418,9 +401,6 @@ impl<'a> LayoutEngine<'a> {
     // The type of class_name.property if it is an immutable field.
     //
     // Immutables own no slot, so storage_field returns None for them, the
-    // same answer it gives for a name that doesn't exist. Every caller that
-    // branches on storage_field must consult this *first*, or an immutable
-    // read/write silently falls through to whatever the not-a-field path does.
     pub fn immutable_field(&self, class_name: &str, property: &str) -> Option<Type> {
         let class = self.type_checker.loaded_classes.get(class_name)?;
         class
@@ -440,12 +420,8 @@ impl<'a> LayoutEngine<'a> {
     }
 
     // The const fields that still need a deploy-time patch, i.e. those the
-    // compiler could *not* fold to a compile-time value.
+    // compiler could not fold to a compile-time value.
     //
-    // The single source of truth for that set. It decides the constructor's
-    // extra return values, the deploy block's binding of them, and which
-    // setimmutable calls are emitted; those three must agree exactly or the
-    // emitted Yul does not even have consistent arity.
     pub fn patched_immutables(&self, class_name: &str) -> Vec<String> {
         self.immutable_fields(class_name)
             .iter()
@@ -457,26 +433,6 @@ impl<'a> LayoutEngine<'a> {
     // The compile-time value of a const field, when the constructor gives it
     // one the compiler can already work out.
     //
-    // This is the whole point of spelling the feature const rather than
-    // making the author choose a mechanism: they promise the value never
-    // changes after deploy, and the compiler decides how to keep that promise.
-    // A value it knows now is inlined at every use and costs nothing at all 
-    // no deploy-time patch, no constructor argument, no bytes of creation
-    // code. A value that only exists at deploy gets setimmutable.
-    //
-    // Deliberately narrow, because a wrong answer here is a wrong value baked
-    // into a contract forever. It folds only when:
-    //
-    //   * there is exactly **one** assignment to the field in fn new, and
-    //   * that assignment sits at the top level of the body (so it is
-    //     unconditional, no branch, no loop), and
-    //   * its right-hand side is a plain numeric literal, and
-    //   * the field is an integer type wide enough to hold it, so the folded
-    //     literal is bit-for-bit what a masked load would have produced.
-    //
-    // Anything else, a constructor argument, a computed expression, a
-    // conditional assignment, a value needing truncation, returns None and
-    // keeps the deploy-time path, which is always correct if larger.
     pub fn const_field_value(&self, class_name: &str, field: &str) -> Option<String> {
         let class = self.type_checker.loaded_classes.get(class_name)?;
         let f = class.fields.iter().find(|f| f.is_const && f.name == field)?;

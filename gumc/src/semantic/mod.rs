@@ -113,23 +113,6 @@ impl TypeChecker {
     // --- Inheritance ---
     //
     // class Child [Parent] gives Child a copy of Parent's fields and methods.
-    // Resolution is a flattening pass, run once after every class is
-    // registered: each class's fields/methods are rewritten in place to
-    // include what it inherits, so nothing downstream needs an inheritance
-    // concept, the layout engine packs the merged field list, and codegen
-    // emits the merged method list.
-    //
-    // The rules:
-    //   * A parent's fields come first, then the child's own, so a child that
-    //     appends a field cannot move an inherited one to a different slot.
-    //   * A method the child declares itself overrides the parent's.
-    //   * new is inherited like any other method; declare one to override it.
-    //   * Re-declaring an inherited *field* is an error, not shadowing.
-    //   * An interface parent means "implements": it contributes nothing, but
-    //     the child must define every method it declares, with a matching
-    //     signature.
-    //   * Ambiguity (two parents supplying the same method, child silent) and
-    //     cycles are errors.
     fn flatten_inheritance(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
         let mut done: HashSet<String> = HashSet::new();
@@ -379,11 +362,6 @@ impl TypeChecker {
     // Whether an enum has any variant carrying a payload.
     //
     // This is the whole distinction that matters for an enum's size. A
-    // payload-free enum is just a tag, so it is a u8 exactly like Solidity's,
-    // and every place that stores or encodes one can treat it as a scalar. A
-    // payload-carrying one needs the [tag][payload] pair in memory, which has
-    // no ABI form and no Solidity storage equivalent, so it is memory-only and
-    // rejected anywhere a size would be needed.
     pub fn enum_has_payload(&self, name: &str) -> bool {
         self.loaded_enums
             .get(name)
@@ -458,11 +436,6 @@ impl TypeChecker {
     // Reports as many independent semantic errors as it safely can in one
     // pass, rather than making you fix-recompile-fix to see the next one.
     // Scoped at the top-level-declaration granularity: two unrelated
-    // functions (or methods) with bugs both get reported, but a second bug
-    // *within the same function*, after an earlier statement in it already
-    // failed, still won't surface until the first is fixed, that would
-    // need verify_statement itself restructured to not bail out internally,
-    // which is a bigger change than this pass makes.
     pub fn check(&mut self, mut program: Program, base_dir: &str) -> Result<(), Vec<String>> {
         println!("--> [Semantic Analyzer] Resolving Modules & Building Global Symbol Table...");
 
@@ -470,14 +443,14 @@ impl TypeChecker {
         let mut new_declarations = Vec::new();
 
         let mut pending: Vec<String> = Vec::new();
-        // Every `use x.y.Sym` seen, checked against its module once everything is loaded, since a module is only parsed the first time it is pulled in.
+        // Every use x.y.Sym seen, checked against its module once everything is loaded, since a module is only parsed the first time it is pulled in.
         let mut requested: Vec<(String, String, String)> = Vec::new();
         let mut module_symbols: HashMap<String, HashSet<String>> = HashMap::new();
         let mut module_asts: HashMap<String, Program> = HashMap::new();
         // Keyed "module::Decl", so a symbol reached from two different imports still merges once.
         let mut merged: HashSet<String> = HashSet::new();
 
-        // A local import resolves against the source file's own directory; a gum.* import resolves against the table compiled into this binary and touches no filesystem at all.
+        // A local import resolves against the source file's own directory; a gum. import resolves against the table compiled into this binary and touches no filesystem at all.
         // The grammar's path rule is idents joined by dots, so a dot is always a directory separator here and there is no leading "./" form to strip.
         let local_path = |path: &str| -> String {
             format!("{}/{}.gum", base_dir, path.replace('.', "/"))
@@ -541,7 +514,7 @@ impl TypeChecker {
             if let Some(sym) = &symbol {
                 requested.push((use_path.clone(), mod_key.clone(), sym.clone()));
             }
-            // The module is parsed once and cached; what gets merged is decided per symbol below, so two `use`s of different symbols out of one module each pull only their own.
+            // The module is parsed once and cached; what gets merged is decided per symbol below, so two uses of different symbols out of one module each pull only their own.
             let ast = match module_asts.entry(mod_key.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -564,7 +537,7 @@ impl TypeChecker {
             }
 
             // Importing a symbol pulls that declaration and whatever its signature reaches, not the whole module.
-            // Merging everything would drag every std class into every contract, and since an `unsafe` body anywhere marks the program as making external calls, that alone put a reentrancy guard on entry points that need none.
+            // Merging everything would drag every std class into every contract, and since an unsafe body anywhere marks the program as making external calls, that alone put a reentrancy guard on entry points that need none.
             let wanted: Vec<usize> = match &symbol {
                 Some(sym) => symbol_closure(&ast.declarations, sym),
                 None => (0..ast.declarations.len()).collect(),
@@ -596,7 +569,7 @@ impl TypeChecker {
             pending.extend(nested);
         }
 
-        // Checked here rather than at the import, because a module is parsed only the first time it is pulled in and a later `use` of a different symbol out of it would otherwise go unchecked.
+        // Checked here rather than at the import, because a module is parsed only the first time it is pulled in and a later use of a different symbol out of it would otherwise go unchecked.
         for (use_path, mod_key, sym) in &requested {
             if let Some(syms) = module_symbols.get(mod_key) {
                 if !syms.contains(&sym.to_ascii_lowercase()) {
@@ -1006,7 +979,7 @@ impl TypeChecker {
                     return Ok(true);
                 }
                 // A revert ends the frame, so the path never reaches the missing return: it owes one no more than a return does.
-                // The const-assignment checker already gives this credit through `diverges`; this checker did not, so a function whose last statement was a revert was rejected for not returning.
+                // The const-assignment checker already gives this credit through diverges; this checker did not, so a function whose last statement was a revert was rejected for not returning.
                 Statement::Revert { .. } => return Ok(true),
                 Statement::IfElse { if_body, else_body, .. } => {
                     let if_returns = self.check_returns(if_body, expected)?;
@@ -1183,7 +1156,7 @@ impl TypeChecker {
         Ok(())
     }
 
-    // A fixed-point value is a WAD-scaled integer: 1.0 is 10^18, not 1. So mixing one with a plain integer is almost always a bug, `price * 2` means "times 0.000000000000000002", and the result carries the fixed-point type as if it were fine.
+    // A fixed-point value is a WAD-scaled integer: 1.0 is 10^18, not 1. So mixing one with a plain integer is almost always a bug, price  2 means "times 0.000000000000000002", and the result carries the fixed-point type as if it were fine.
     // The right operand's type was evaluated here and dropped, so nothing rejected the mix. Nothing else checks binary operand compatibility either, so this is the only place it can be caught.
     fn check_fixed_point_math(&self, expr: &Expr) -> Result<(), String> {
         if let Expr::BinaryOp { left, operator, right } = expr {
@@ -1193,7 +1166,7 @@ impl TypeChecker {
             let lf = fixed(&left_type);
             let rf = fixed(&right_type);
             if lf != rf {
-                // A literal is typed u256 until it is coerced, so `x * 2` on a fixed-point x would trip this. Comparisons are fine either way, only arithmetic carries the scale.
+                // A literal is typed u256 until it is coerced, so x  2 on a fixed-point x would trip this. Comparisons are fine either way, only arithmetic carries the scale.
                 let arith = matches!(operator.as_str(), "+" | "-" | "*" | "/" | "%" | "**");
                 if arith && !matches!(if lf { right } else { left }.as_ref(), Expr::Number(_)) {
                     return Err(format!(
@@ -1944,8 +1917,6 @@ impl TypeChecker {
 // A type as it is spelled in gum source. Structural, so it doubles as a
 // comparison key for types (which have no PartialEq), while staying readable
 // enough to print straight back at the user.
-// Whether this expression names Class.field (or, inside a method, the
-// equivalent self.field).
 fn targets_field(e: &Expr, class_name: &str, field: &str) -> bool {
     match e {
         Expr::PropertyAccess { base, property } => {
@@ -1956,10 +1927,9 @@ fn targets_field(e: &Expr, class_name: &str, field: &str) -> bool {
     }
 }
 
-// Whether body assigns Class.field *anywhere*, reachable or not.
+// Whether body assigns Class.field anywhere, reachable or not.
 //
 // Only used to tell two errors apart: a field nobody ever mentions gets a
-// different message from one assigned on some paths but not all.
 fn assigns_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bool {
     body.iter().any(|s| match &s.node {
         Statement::Assignment { target, .. } => targets_field(target, class_name, field),
@@ -2004,13 +1974,9 @@ fn expr_reads_field(e: &Expr, class_name: &str, field: &str) -> bool {
     }
 }
 
-// Whether body *reads* Class.field, anywhere a value is consumed, as
+// Whether body reads Class.field, anywhere a value is consumed, as
 // opposed to an assignment's target.
 //
-// Inside fn new this is what an immutable cannot survive: its value is not
-// in the code yet, so the read has nothing to find. Left unchecked it reaches
-// solc as Immutable "C_a" used before initialization against generated Yul
-// the author never wrote.
 fn reads_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bool {
     let re = |e: &Expr| expr_reads_field(e, class_name, field);
     body.iter().any(|s| match &s.node {
@@ -2040,9 +2006,6 @@ fn reads_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bo
 // Whether body cannot complete normally, every path through it ends in a
 // return or a revert.
 //
-// A branch that diverges never reaches the code after it, so it imposes no
-// obligation to assign: if c: C.x = 1 else: revert(E) does define C.x on
-// every path that survives.
 fn diverges(body: &[Spanned<Statement>]) -> bool {
     body.iter().any(|s| match &s.node {
         Statement::Return { .. } | Statement::Revert { .. } => true,
@@ -2060,13 +2023,6 @@ fn diverges(body: &[Spanned<Statement>]) -> bool {
 // Whether every path through body that completes normally has assigned
 // Class.field, real definite-assignment analysis, not "is it mentioned".
 //
-// This is what makes an immutable trustworthy. A field assigned on only some
-// paths is baked into the deployed code as zero on the others, permanently and
-// silently, so "assigned somewhere" is not a strong enough question to ask.
-//
-// A branch either assigns or diverges. A loop never counts: while c: C.x = 1
-// may run zero times. A match counts only if every arm does, which is sound
-// because a non-exhaustive match is already rejected elsewhere.
 fn definitely_assigns(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bool {
     body.iter().any(|s| match &s.node {
         Statement::Assignment { target, .. } => targets_field(target, class_name, field),
@@ -2084,7 +2040,6 @@ fn definitely_assigns(body: &[Spanned<Statement>], class_name: &str, field: &str
 // The name an overridden parent method is kept under so super.foo() can
 // reach it. Not spellable in source: super_ is a legal identifier prefix, but
 // a class declaring its own super_foo alongside an override of foo is
-// rejected by the duplicate-method check.
 pub fn super_name(method: &str) -> String {
     format!("{}{}", SUPER_PREFIX, method)
 }
@@ -2175,7 +2130,7 @@ fn decl_name(d: &Declaration) -> Option<String> {
     }
 }
 
-// The declarations a `use module.Symbol` merges: the symbol itself plus everything its signature reaches inside the same module.
+// The declarations a use module.Symbol merges: the symbol itself plus everything its signature reaches inside the same module.
 // Returns indices so the caller keeps the module AST cached and clones only what it takes. An unknown symbol yields nothing, and the caller reports that separately.
 fn symbol_closure(decls: &[Declaration], symbol: &str) -> Vec<usize> {
     let index: HashMap<String, usize> = decls

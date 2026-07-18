@@ -9,10 +9,6 @@ pub struct GumParser;
 // Byte spans of the top-level declarations in preprocessed (brace-delimited)
 // source. A declaration ends at the } that returns brace depth to 0, or at a
 // ; at depth 0 (use, error, a bodyless class C;).
-//
-// This only has to be good enough to find *boundaries*; the real parser still
-// validates whatever each span contains. Its one job is to not be fooled by a
-// brace or semicolon inside a string literal or a comment.
 fn top_level_spans(src: &str) -> Vec<(usize, usize)> {
     let b = src.as_bytes();
     let mut spans = Vec::new();
@@ -68,17 +64,9 @@ fn padded(src: &str, start: usize, end: usize) -> String {
     text
 }
 
-// When a class/contract fails to parse, locate the failure per *member*.
+// When a class/contract fails to parse, locate the failure per member.
 //
 // Entry points live inside a contract, so a whole contract, usually the
-// whole program, is one top-level declaration. Recovering only between
-// top-level declarations would then report exactly one error per file, which
-// is barely recovery at all. Splitting the body and parsing each member
-// separately restores per-function reporting.
-//
-// Returns None when the members all parse (the failure was in the header, or
-// in the body's overall shape), so the caller falls back to pest's own error
-// for the whole declaration rather than swallowing it.
 fn member_errors(src: &str, span: (usize, usize)) -> Option<Vec<String>> {
     let (start, end) = span;
     let chunk = &src[start..end];
@@ -121,17 +109,9 @@ fn parse_one_declaration(src: &str, span: (usize, usize), program: &mut Program)
     }
 }
 
-// Parses a whole program, reporting **every** malformed top-level declaration
+// Parses a whole program, reporting every malformed top-level declaration
 // rather than only the first.
 //
-// pest is a PEG parser: it has no error recovery, so one bad token aborts the
-// entire parse and hides everything after it. Recovery here is structural
-// instead, the source is split into top-level declarations, and a failing
-// class/contract is split again into its members, so a broken function only
-// costs you that function. This is the same granularity the semantic pass
-// reports at, so both halves of the compiler behave the same way: errors in
-// unrelated functions all surface together, a second error inside one waits
-// for the first to be fixed.
 pub fn parse_program(source: &str) -> Result<Program, Vec<String>> {
     let preprocessed = crate::indent::preprocess(source).map_err(|e| vec![e])?;
     if std::env::var("GUMC_DEBUG").is_ok() {
@@ -487,7 +467,6 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Spanned<Statement> {
 // Splits an f-string's inner text (between the quotes) into literal and
 // {expr} segments, re-invoking the expr grammar rule on each
 // interpolation span. gum's expr grammar never produces literal {/}
-// itself, so a naive depth counter is enough to find each span's end.
 fn parse_fstring_segments(s: &str) -> Vec<FStringSegment> {
     let mut segments = Vec::new();
     let mut literal = String::new();

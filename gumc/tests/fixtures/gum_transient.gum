@@ -48,7 +48,7 @@ contract T:
         return T.pstr
 
     // Everything the transient half holds, summed, so one call can observe it
-    // all *within* the transaction that wrote it.
+    // all within the transaction that wrote it.
     export fn write_then_read(Account who, String s) -> u256:
         T.t = 22
         T.tstr = s
