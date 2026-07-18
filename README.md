@@ -6,10 +6,10 @@
 
 [![CI](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml)
 
-**Smart contracts that read like Python.**
+**A clear, secure smart-contract language — built by web2 devs, for web2 devs.**
 
-Write Ethereum contracts in a language you already know how to read.
-Get bytecode that behaves like Solidity's, and is usually smaller.
+Write Ethereum contracts without the footguns. gum compiles to ordinary EVM
+bytecode that behaves like Solidity's, and is usually smaller.
 
 </div>
 
@@ -35,8 +35,9 @@ semicolons.
 
 ## Why you might want this
 
-**You already know how to read it.** Colon and indentation, like Python. Types
-come first, like C. `HashMap`, `Vec`, `String` mean what you would guess.
+**Low ceremony.** Colon-and-indent blocks, types first, no braces or
+semicolons. `HashMap`, `Vec`, `String` mean what you would guess. The syntax
+stays out of the way, so what you read is the logic, not the plumbing.
 
 **Safe by default, not by discipline.** Overflow checks, array bounds checks,
 address masking, and reentrancy guards are on automatically. Reentrancy is the
@@ -214,8 +215,8 @@ against, so they are verified against the EVM's own behaviour instead.
 
 | area | supported |
 |---|---|
-| Integers | `u8`-`u256`, `i8`-`i256`, checked `+ - * / % **`, signed ops, `.saturate()` |
-| Other scalars | `bool`, `Account` (EVM address, masked to 160 bits at boundaries) |
+| Integers | `u8`-`u256`, `i8`-`i256`, checked `+ - * / % **`, signed ops, `.saturate()`, and `.to_string()` on unsigned ints (decimal itoa to a `String`) |
+| Other scalars | `bool`, `Account` (EVM address, masked to 160 bits at boundaries), fixed bytes `b1`-`b32` (ABI `bytes1`-`bytes32`; `b32` is a full word, sub-word values ride the wire left-aligned like Solidity) |
 | Mappings | `HashMap(K, V)`, scalar-valued, nested (`HashMap(K, HashMap(K, V))`), struct-valued. A dynamic value (an array, a `String`) is a compile error: it would need a slot region of its own per key, which is not implemented |
 | Structs | user `class`, in memory and in storage, as a mapping value or as an array element. `arr[i].field` and `m[k].field` compile to the same slot arithmetic; a struct array element occupies whole slots and never packs with its neighbours, exactly as Solidity lays it out |
 | Inheritance | an `[Parent]` attribute above a class inherits its fields (ancestors first, as Solidity orders them) and methods, transitively; a child method overrides, and `super.method()` calls the parent's. An `interface` parent means *implements*, checked signature by signature |
@@ -225,7 +226,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | `delete` | resets a scalar, packed field, mapping entry, array element, whole array, storage string, or struct, releasing the slots Solidity releases |
 | Control flow | `if/else`, `while`, `for ... in <array>` (memory or storage), `match` over enums |
 | Events | `log(Event, indexed(x), ...)` becomes a real `LOG1`-`LOG4` with canonical topic hashes, plus matching `"type": "event"` entries in the ABI JSON, so wallets, ethers/viem and Etherscan decode the logs. The schema is recorded at the `log()` site from the same values `topic0` is hashed from, so the ABI cannot describe an event the bytecode does not emit. The data area shares the ABI encoder the `interface` and `new Child(...)` paths use, so a string, an array or a tuple field is encoded head/tail rather than as a pointer. An indexed field must be one word, since a topic is 32 bytes |
-| External calls | `interface` types (compiled to `CALL`), low-level `call target(payload)`, `to.pay(amount)` (returns success) and `to.transfer(amount)` (reverts on failure) to send ETH. A failing call bubbles the callee's own revert reason, byte for byte as Solidity does |
+| External calls | `interface` types (compiled to `CALL`), low-level `call target(payload)`, `to.pay(amount)` (returns success) and `to.transfer(amount)` (reverts on failure) to send ETH. A failing call bubbles the callee's own revert reason, byte for byte as Solidity does. A `try:` / `catch:` block wraps an external call to recover from a revert instead of bubbling it, and `addr.code.len()` gives the callee's code size (`EXTCODESIZE`), e.g. to skip the `onERC721Received` hook for a plain wallet |
 | Deploying contracts | `new SomeContract(args)` becomes `CREATE`, with the child's creation code embedded in the deployer; or `Account.create`/`create2`/`create2_address` from raw bytecode, for proxies and EIP-1167 clones |
 | Bare ETH | `export payable fn receive():` for a plain send, `export fn fallback():` for an unmatched selector |
 | Const fields | `const` `contract` fields, assigned once in `fn new`, never storage. One keyword, and the compiler picks the mechanism: a value it can evaluate is inlined (byte for byte the same code as writing the literal); a value that only exists at deploy, like a constructor argument, is written into the runtime bytecode there (Yul `setimmutable`). Either way a read is ~3 gas, not a cold `SLOAD`: measured 21,160 vs 23,246, and ~15.8k cheaper to deploy. Assignment is checked on every path through the constructor. Not usable behind a proxy, see [STORAGE.md](STORAGE.md) |
@@ -234,7 +235,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | Safety | checked arithmetic, reentrancy guards on by default (transient storage; `unsafe fn` opts out), nonpayable guard, calldata-length validation, address masking, returndata checks, array-bounds `Panic(0x32)` in memory and storage |
 | Upgrades | storage-layout lockfile (`--lock`) pins committed fields and errors on unsafe changes |
 | Reproducible builds | the same source always compiles to byte-identical bytecode, which is what lets a deployed contract be verified against its source. Emission order is stable everywhere (slots, helpers, class methods), never a randomized hash-map walk. Asserted by a test that compiles a reference contract in separate processes and diffs the output |
-| ABI | standard 4-byte selectors; `address`/`uintN`/`bool`, `string`/`bytes`, `T[]`, `T[N]`, an `enum` as `uint8`, a `class` of scalar fields as a `tuple`, and arrays of any of those nested to any depth (`T[][]`, `T[][2]`, `T[3][]`, `tuple[2]`, `tuple[][]`). Each works in every direction: arguments, returns, constructor arguments, `new Child(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied. `stateMutability` is inferred: a function that writes nothing is `view`, one that touches no chain state at all is `pure`, so wallets and explorers render getters as reads rather than as write buttons. The inference is a whitelist, so anything it cannot prove read-only stays `nonpayable` |
+| ABI | standard 4-byte selectors; `address`/`uintN`/`bytesN`/`bool`, `string`/`bytes`, `T[]`, `T[N]`, an `enum` as `uint8`, a `class` of scalar fields as a `tuple`, and arrays of any of those nested to any depth (`T[][]`, `T[][2]`, `T[3][]`, `tuple[2]`, `tuple[][]`). Each works in every direction: arguments, returns, constructor arguments, `new Child(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied. `stateMutability` is inferred: a function that writes nothing is `view`, one that touches no chain state at all is `pure`, so wallets and explorers render getters as reads rather than as write buttons. The inference is a whitelist, so anything it cannot prove read-only stays `nonpayable` |
 
 Reference contracts live in [`examples/`](examples/): [`token`](examples/token.gum),
 [`amm`](examples/amm.gum), [`erc20`](examples/erc20.gum),
@@ -245,17 +246,18 @@ Their Solidity twins are in [`examples/solidity/`](examples/solidity/).
 
 ## Measured against Solidity
 
-Same solc, same optimizer settings.
+Same solc, same optimizer settings. Every number comes from a test
+(`size_report`, `gas_report`), not hand measurement, and `size_report` asserts
+the size band so the docs cannot silently drift from the compiler.
 
 | | runtime bytecode | deploy gas | runtime gas |
 |---|--:|--:|--:|
-| gum vs Solidity | 62-95% | 69-96% | 99-101% |
+| gum vs Solidity | 80-94% | 83-96% | ~100% |
 
-gum is cheaper to deploy, because the bytecode is smaller, and at parity on
-runtime gas, which is dominated by storage, keccak and log operations that are
-identical on both sides. Both rows come from tests rather than hand measurement
-(`size_report` and `gas_report`), and `size_report` asserts the size band, so it
-fails if the docs and the compiler ever drift apart.
+gum is smaller and cheaper to deploy, and at parity on runtime gas, which is
+dominated by storage, keccak and log operations that are identical on both
+sides. gum's side does strictly more: every entry point carries a reentrancy
+guard the twins do not have.
 
 Sizes are measured against `solc --no-cbor-metadata`. Solidity appends ~54 bytes
 of CBOR metadata by default and gum emits none; counting that would credit gum
@@ -263,22 +265,20 @@ for bytes it never writes, which is not a codegen win.
 
 | | gum | Solidity | |
 |---|--:|--:|--:|
-| `erc721` | 842 | 1337 | 62% |
-| `erc20` | 900 | 1234 | 72% |
+| `amm` | 1617 | 1999 | 80% |
 | `vault` | 487 | 602 | 80% |
-| `amm` | 1646 | 1907 | 86% |
-| `token` | 1100 | 1150 | 95% |
+| `token` | 1018 | 1244 | 81% |
+| `erc721` | 3338 | 3853 | 86% |
+| `erc20` | 1732 | 1834 | 94% |
 
-The size difference is codegen density, not omitted safety. gum's side does
-strictly more than the Solidity twins: every entry point carries a reentrancy
-guard the twins do not have, and `once` functions carry a replay guard. The
-tighter the contract, the better gum does. `token` is closest because it is the
-most revert-string-heavy, and a revert string is the same bytes in any language.
-
-The one place gum is dearer at runtime is a `once` function, at ~125-134% of its
-twin. The replay guard is a cold `SSTORE`, and ~22k gas is what that costs. It
-buys a guarantee the twin does not have, and it is paid once. The 99-101% band
-covers every function without a `once`.
+The size difference is codegen density, not omitted safety, and the leaner
+contracts (`amm`, `vault`, `token`) show it best. `erc20` and `erc721` are full,
+faithful ports of OpenZeppelin's audited contracts, differential-tested against
+the real OpenZeppelin v5.1 source, so they carry the same custom errors, events,
+and (for `erc721`) the ERC165 / `tokenURI` / receiver-callback surface, and land
+closer to parity. The tighter the contract, the further gum pulls ahead. On
+runtime gas the small overhead is where gum does strictly more work, e.g.
+`erc721`'s `approve` reads the token owner to match OpenZeppelin exactly.
 
 ---
 

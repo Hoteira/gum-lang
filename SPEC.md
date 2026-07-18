@@ -92,6 +92,7 @@ A program is a sequence of top-level declarations:
 | unsigned int | `u8 u16 u32 u64 u128 u256` |
 | signed int | `i8 i16 i32 i64 i128 i256` |
 | fixed-point | `f32 f64` (signed full-width WAD values where `1.0` is `10^18`, **not** IEEE floats) |
+| fixed bytes | `b1`-`b32` (ABI `bytes1`-`bytes32`; opaque byte words, not arithmetic) |
 | boolean | `bool` |
 | address | `Account` (an EVM 160-bit address) |
 | array | `[T]` (dynamic), `[T; N]` (fixed) |
@@ -115,6 +116,20 @@ narrower type, and on return.
 `Account` is masked to its low 160 bits when it enters from calldata, so
 equality tests, storage keys, and external-call targets all see a canonical
 value.
+
+### Fixed bytes (`b1`-`b32`)
+
+A `bN` is a fixed run of N bytes, spelled `bytesN` in the ABI (so a selector for
+`f(b4)` hashes `"bytes4"` and matches what every wallet and Solidity contract
+computes). It is opaque: you compare, hash, and pass it, but you do not do
+arithmetic on it.
+
+`b32` fills a whole word, so it is carried as-is. A sub-word `bN` rides the wire
+**left-aligned** (its bytes in the high end of the word, the rest zero, exactly
+as Solidity encodes `bytesN`); gum shifts it down to a clean right-aligned value
+internally so `interfaceId == 0x01ffc9a7` compares against a plain literal, and
+re-aligns it on the way back out. A hex literal is written in its natural
+right-aligned form (`0x01ffc9a7`, not a 64-digit padded constant).
 
 ---
 
@@ -247,6 +262,32 @@ scalar return stays on a one-word fast path and costs nothing extra.
 
 Methods (`fn` inside a class) take an implicit `self`. A `fn new(...)` is a
 constructor invoked by `new ClassName(args)`.
+
+### Recovering from a failed call (`try` / `catch`)
+
+By default a failing external call bubbles the callee's own revert data, byte
+for byte. To handle a failure instead, wrap the call in `try:` / `catch:`:
+
+```python
+try:
+    var ok = IReceiver(to).onReceived(from, id, data)
+    if ok != EXPECTED:
+        revert BadReceiver(to)
+catch:
+    revert BadReceiver(to)
+```
+
+The `try` body runs the call; if it reverts, control transfers to `catch`
+rather than propagating. `addr.code.len()` returns the callee's deployed code
+size (`EXTCODESIZE`), which is how you tell a contract from a plain wallet, e.g.
+to skip a receiver-acknowledgement hook when sending to an externally-owned
+account:
+
+```python
+if to.code.len() > 0:
+    # to is a contract; ask it whether it accepts this
+    ...
+```
 
 ### Inheritance (`[Parent]`)
 
@@ -496,6 +537,18 @@ Only `*` and `/` touch the scale:
 That last row is the one to watch: `a * 2` doubles `a`, it does not scale it by
 `2e-18`. Mixing a fixed value with a non-literal integer is a compile error,
 since the integer would otherwise be read as a fraction.
+
+#### Built-in numeric methods
+
+| method | on | result |
+|---|---|---|
+| `x.saturate()` | any int | clamps to the type's max instead of reverting on overflow |
+| `x.as_bytes()` / `x.as_bits()` | any int | the value as a `[u8]` |
+| `x.to_string()` | unsigned int | the value as its decimal `String` (itoa; `0` renders as `"0"`) |
+
+`.to_string()` is unsigned-only: a signed or fixed-point `.to_string()` is a
+compile error rather than silently printing the raw two's-complement or scaled
+word. This is what a `tokenURI` uses, e.g. `base.concat(tokenId.to_string())`.
 
 Rounding truncates toward zero, as `sdiv` does. `*` and `/` compute at full
 512-bit precision (the Remco Bloemen / OpenZeppelin `mulDiv`), so the raw product
