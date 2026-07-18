@@ -96,7 +96,7 @@ contract ERC721:
     export fn isApprovedForAll(Account owner, Account operator) -> bool:
         return ERC721._operatorApprovals[owner][operator]
 
-    export fn supportsInterface(bytes4 interfaceId) -> bool:
+    export fn supportsInterface(b4 interfaceId) -> bool:
         if interfaceId == 0x01ffc9a7:
             return true
         if interfaceId == 0x80ac58cd:

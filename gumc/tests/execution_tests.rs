@@ -1385,6 +1385,40 @@ fn word_bytes4(id: u32) -> [u8; 32] {
 }
 
 #[test]
+fn fixed_bytes_round_trip() {
+    // The bN family: b32 fills the word (identity in and out); a sub-word b4
+    // rides the wire left-aligned, is carried right-aligned internally, and is
+    // laid back out left-aligned. Also checks a b4 compares against a plain
+    // literal, the interface-id use.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let src = "use gum.defaults.hashable\n\ncontract Bt:\n    export fn echo32(b32 x) -> b32:\n        return x\n    export fn echo4(b4 x) -> b4:\n        return x\n    export fn is165(b4 x) -> bool:\n        return x == 0x01ffc9a7\n";
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let a = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    // b32: a full 32-byte word round-trips byte-identically.
+    let w = [0xABu8; 32];
+    let out = call(&mut db, a, encode_words("echo32(bytes32)", &[w])).output;
+    assert_eq!(&out[..32], &w, "b32 round-trips");
+
+    // b4: left-aligned on the wire both directions.
+    let b4 = word_bytes4(0x01ffc9a7);
+    let out = call(&mut db, a, encode_words("echo4(bytes4)", &[b4])).output;
+    assert_eq!(&out[..32], &b4, "b4 round-trips left-aligned");
+
+    // b4 vs literal.
+    let t = call(&mut db, a, encode_words("is165(bytes4)", &[word_bytes4(0x01ffc9a7)])).output;
+    assert_eq!(U256::from_be_slice(&t), U256::from(1u8), "is165 true for 0x01ffc9a7");
+    let f = call(&mut db, a, encode_words("is165(bytes4)", &[word_bytes4(0xdeadbeef)])).output;
+    assert_eq!(U256::from_be_slice(&f), U256::from(0u8), "is165 false otherwise");
+}
+
+#[test]
 fn erc721_supports_interface_matches_solidity() {
     // ERC165: gum's supportsInterface(bytes4) must answer identically to the
     // verbatim OZ ERC721 for the three interface ids it claims (ERC165,

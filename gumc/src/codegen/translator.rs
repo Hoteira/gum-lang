@@ -687,7 +687,7 @@ pub fn is_abi_scalar(t: &Type) -> bool {
     matches!(t, Type::Primitive(n) if matches!(n.as_str(),
         "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
         "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
-        "bool" | "Account" | "bytes4"))
+        "bool" | "Account") || byte_width(n).is_some())
 }
 
 // Moves one wire word into its packed memory field. Split out because the calldata and memory decoders differ only in how they fetch the word.
@@ -1104,14 +1104,29 @@ fn mask_to_width(val_expr: &str, bits: usize, signed: bool) -> String {
 }
 
 // Like mask_to_width, but takes the gum Type directly and is a no-op for
+// The byte count of a fixed-bytes type: byte_width("b4") == Some(4). Valid
+// b1..b32; anything else (bool, u256, a class name) is None.
+pub fn byte_width(name: &str) -> Option<usize> {
+    let n = name.strip_prefix('b')?.parse::<usize>().ok()?;
+    (1..=32).contains(&n).then_some(n)
+}
+
 fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
     if let Type::Primitive(name) = type_def {
         if let Some((bits, signed)) = numeric_meta(name) {
             return mask_to_width(val_expr, bits, signed);
         }
-        // A bytes4 rides the wire left-aligned (its 4 bytes in the high end of
-        if name == "bytes4" {
-            return format!("shr(224, {})", val_expr);
+        // A fixed-bytes value rides the wire left-aligned (its bytes in the high
+        // end of the word, like Solidity). For a sub-word width we shift it down
+        // to a clean right-aligned value so it compares against a plain literal
+        // like 0x01ffc9a7; a full b32 already fills the word, so it is left as
+        // is. Sub-word values are re-aligned on the way out (see Return).
+        if let Some(w) = byte_width(name) {
+            return if w == 32 {
+                val_expr.to_string()
+            } else {
+                format!("shr({}, {})", (32 - w) * 8, val_expr)
+            };
         }
     }
     val_expr.to_string()
@@ -2352,7 +2367,12 @@ impl<'a> Translator<'a> {
                 // The put and size helpers for an array return of any shape, plus whether the ABI puts it behind an offset word.
                 let mut arr_ret: Option<(String, String, bool, usize)> = None;
                 if let Some(ret_ty) = &ctx.return_type {
-                    val_expr = mask_for_type(&val_expr, ret_ty);
+                    // A fixed-bytes value keeps its internal (right-aligned) form
+                    // for gum-to-gum returns; the entry return below re-aligns it
+                    // to the wire. mask_for_type here would shr it (decode direction).
+                    if !matches!(ret_ty, Type::Primitive(n) if byte_width(n).is_some()) {
+                        val_expr = mask_for_type(&val_expr, ret_ty);
+                    }
                     if let Type::Primitive(name) = ret_ty {
                         if name == "String" || name == "Bytes" {
                             is_dynamic = true;
@@ -2433,7 +2453,16 @@ impl<'a> Translator<'a> {
                             lock_clear = lock_clear
                         )
                     } else {
-                        format!("mstore(0, {})\n{}return(0, 32)\n", val_expr, lock_clear)
+                        // A sub-word fixed-bytes return is laid out left-aligned
+                        // on the wire; b32 (and non-byte scalars) go out as is.
+                        let enc = match &ctx.return_type {
+                            Some(Type::Primitive(rn)) => match byte_width(rn) {
+                                Some(w) if w < 32 => format!("shl({}, {})", (32 - w) * 8, val_expr),
+                                _ => val_expr.clone(),
+                            },
+                            _ => val_expr.clone(),
+                        };
+                        format!("mstore(0, {})\n{}return(0, 32)\n", enc, lock_clear)
                     }
                 } else {
                     format!("ret := {}\nleave\n", val_expr)

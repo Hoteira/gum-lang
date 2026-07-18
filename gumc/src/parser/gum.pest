@@ -33,8 +33,11 @@ fstring_literal = @{ "f\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 primitive_type = {
     "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
     "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
-    "f32" | "f64" | "bool" | "Account" | "bytes4"
+    "f32" | "f64" | "bool" | "Account" | byte_type
 }
+// Fixed-size byte types b1..b32 (ABI bytes1..bytes32). The digit count is
+// validated in the semantic pass; the grammar just captures `b` + digits.
+byte_type = @{ "b" ~ ASCII_DIGIT+ }
 
 // e.g. Vec(u256) or HashMap(Account, Vec(u256))
 generic_type = { type_ident ~ "(" ~ type_keyword ~ ("," ~ type_keyword)* ~ ")" }

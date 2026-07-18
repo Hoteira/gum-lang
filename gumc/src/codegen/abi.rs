@@ -56,12 +56,14 @@ impl<'a> AbiGenerator<'a> {
                 match name.as_str() {
                     "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => format!("uint{}", name[1..].to_string()),
                     "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => format!("int{}", name[1..].to_string()),
-                    "bytes4" => "bytes4".to_string(),
                     "Address" | "Account" => "address".to_string(),
                     "bool" => "bool".to_string(),
                     "f32" | "f64" => "int256".to_string(), // Default mapped to fixed math sizes
                     "Message" => "Message".to_string(), // Handled by ABI filtering
                     "Block" => "Block".to_string(), // Handled by ABI filtering
+                    _ if crate::codegen::translator::byte_width(name).is_some() => {
+                        format!("bytes{}", crate::codegen::translator::byte_width(name).unwrap())
+                    }
                     _ => {
                         if name == "String" {
                             "string".to_string()
