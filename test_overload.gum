@@ -1,0 +1,5 @@
+contract Test:
+    fn foo():
+        pass
+    fn foo(u256 x):
+        pass

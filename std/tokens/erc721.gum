@@ -1,0 +1,127 @@
+use gum.defaults.Account
+use gum.defaults.HashMap
+use gum.defaults.String
+use gum.defaults.Message
+
+enum ERC721Events:
+    Transfer
+    Approval
+    ApprovalForAll
+
+enum ERC721Errors:
+    ERC721InvalidOwner(Account owner)
+    ERC721NonexistentToken(u256 token_id)
+    ERC721IncorrectOwner(Account sender, u256 token_id, Account owner)
+    ERC721InvalidSender(Account sender)
+    ERC721InvalidReceiver(Account receiver)
+    ERC721InsufficientApproval(Account operator, u256 token_id)
+    ERC721InvalidOperator(Account operator)
+
+contract ERC721:
+    String name
+    String symbol
+    HashMap(u256, Account) owners
+    HashMap(Account, u256) balances
+    HashMap(u256, Account) token_approvals
+    HashMap(Account, HashMap(Account, bool)) operator_approvals
+
+    fn new(String name_, String symbol_):
+        self.name = name_
+        self.symbol = symbol_
+
+    export fn name() -> String:
+        return self.name
+
+    export fn symbol() -> String:
+        return self.symbol
+
+    export fn balanceOf(Account owner) -> u256:
+        if owner == Account(0):
+            revert ERC721Errors.ERC721InvalidOwner(owner)
+        return self.balances[owner]
+
+    export fn ownerOf(u256 id) -> Account:
+        Account owner = self.owners[id]
+        if owner == Account(0):
+            revert ERC721Errors.ERC721NonexistentToken(id)
+        return owner
+
+    export fn getApproved(u256 id) -> Account:
+        if self.owners[id] == Account(0):
+            revert ERC721Errors.ERC721NonexistentToken(id)
+        return self.token_approvals[id]
+
+    export fn isApprovedForAll(Account owner, Account operator) -> bool:
+        return self.operator_approvals[owner][operator]
+
+    export fn approve(Account to, u256 id):
+        Account owner = self.owners[id]
+        if owner == Account(0):
+            revert ERC721Errors.ERC721NonexistentToken(id)
+            
+        Account sender = Message.sender()
+        if sender != owner:
+            if !self.operator_approvals[owner][sender]:
+                revert ERC721Errors.ERC721InvalidSender(sender)
+                
+        self.token_approvals[id] = to
+        log(ERC721Events.Approval, indexed(owner), indexed(to), indexed(id))
+
+    export fn setApprovalForAll(Account operator, bool approved):
+        Account sender = Message.sender()
+        if operator == Account(0):
+            revert ERC721Errors.ERC721InvalidOperator(operator)
+            
+        self.operator_approvals[sender][operator] = approved
+        log(ERC721Events.ApprovalForAll, indexed(sender), indexed(operator), approved)
+
+    export fn transferFrom(Account from, Account to, u256 token_id):
+        Account sender = Message.sender()
+        Account owner = self.owners[token_id]
+        if owner == Account(0):
+            revert ERC721Errors.ERC721NonexistentToken(token_id)
+            
+        if owner != from:
+            revert ERC721Errors.ERC721IncorrectOwner(from, token_id, owner)
+            
+        if to == Account(0):
+            revert ERC721Errors.ERC721InvalidReceiver(to)
+            
+        if sender != owner:
+            if sender != self.token_approvals[token_id]:
+                if !self.operator_approvals[owner][sender]:
+                    revert ERC721Errors.ERC721InsufficientApproval(sender, token_id)
+                    
+        // Clear approval
+        self.token_approvals[token_id] = Account(0)
+        
+        self.balances[from] = self.balances[from] - 1
+        self.balances[to] = self.balances[to] + 1
+        self.owners[token_id] = to
+        
+        log(ERC721Events.Transfer, indexed(from), indexed(to), indexed(token_id))
+
+    export fn _mint(Account to, u256 token_id):
+        if to == Account(0):
+            revert ERC721Errors.ERC721InvalidReceiver(to)
+            
+        Account existing_owner = self.owners[token_id]
+        if existing_owner != Account(0):
+            revert ERC721Errors.ERC721InvalidSender(Account(0)) // already minted
+            
+        self.balances[to] = self.balances[to] + 1
+        self.owners[token_id] = to
+        
+        log(ERC721Events.Transfer, indexed(Account(0)), indexed(to), indexed(token_id))
+
+    export fn _burn(u256 token_id):
+        Account owner = self.owners[token_id]
+        if owner == Account(0):
+            revert ERC721Errors.ERC721NonexistentToken(token_id)
+            
+        self.token_approvals[token_id] = Account(0)
+        
+        self.balances[owner] = self.balances[owner] - 1
+        self.owners[token_id] = Account(0)
+        
+        log(ERC721Events.Transfer, indexed(owner), indexed(Account(0)), indexed(token_id))

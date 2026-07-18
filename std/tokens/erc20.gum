@@ -1,0 +1,119 @@
+use gum.defaults.Account
+use gum.defaults.HashMap
+use gum.defaults.String
+use gum.defaults.Message
+
+enum ERC20Events:
+    Transfer
+    Approval
+
+enum ERC20Errors:
+    ERC20InsufficientBalance(Account sender, u256 available, u256 required)
+    ERC20InsufficientAllowance(Account spender, u256 available, u256 required)
+    ERC20InvalidSender(Account sender)
+    ERC20InvalidReceiver(Account receiver)
+    ERC20InvalidApprover(Account approver)
+    ERC20InvalidSpender(Account spender)
+
+contract ERC20:
+    String name
+    String symbol
+    u256 total_supply
+    HashMap(Account, u256) balances
+    HashMap(Account, HashMap(Account, u256)) allowances
+
+    fn zeroAccount() -> Account:
+        return 0
+        
+            
+        
+
+    fn new(String name_, String symbol_):
+        self.name = name_
+        self.symbol = symbol_
+        self.total_supply = 0
+
+    export fn name() -> String:
+        return self.name
+
+    export fn symbol() -> String:
+        return self.symbol
+
+    export fn decimals() -> u8:
+        return 18
+
+    export fn totalSupply() -> u256:
+        return self.total_supply
+
+    export fn balanceOf(Account owner) -> u256:
+        return self.balances[owner]
+
+    export fn allowance(Account owner, Account spender) -> u256:
+        return self.allowances[owner][spender]
+
+    export fn transfer(Account to, u256 value) -> bool:
+        Account sender = Message.sender()
+        if to == Account(0):
+            revert ERC20Errors.ERC20InvalidReceiver(to)
+        
+        u256 from_balance = self.balances[sender]
+        if from_balance < value:
+            revert ERC20Errors.ERC20InsufficientBalance(sender, from_balance, value)
+            
+        self.balances[sender] = from_balance - value
+        self.balances[to] = self.balances[to] + value
+        
+        log(ERC20Events.Transfer, indexed(sender), indexed(to), value)
+        return true
+
+    export fn approve(Account spender, u256 value) -> bool:
+        Account owner = Message.sender()
+        if spender == Account(0):
+            revert ERC20Errors.ERC20InvalidSpender(spender)
+            
+        self.allowances[owner][spender] = value
+        log(ERC20Events.Approval, indexed(owner), indexed(spender), value)
+        return true
+
+    export fn transferFrom(Account from, Account to, u256 value) -> bool:
+        Account spender = Message.sender()
+        u256 current_allowance = self.allowances[from][spender]
+        
+        // 115792089237316195423570985008687907853269984665640564039457584007913129639935 is used for infinite allowance
+        if current_allowance != 115792089237316195423570985008687907853269984665640564039457584007913129639935:
+            if current_allowance < value:
+                revert ERC20Errors.ERC20InsufficientAllowance(spender, current_allowance, value)
+            self.allowances[from][spender] = current_allowance - value
+            
+        if to == Account(0):
+            revert ERC20Errors.ERC20InvalidReceiver(to)
+            
+        u256 from_balance = self.balances[from]
+        if from_balance < value:
+            revert ERC20InsufficientBalance(from, from_balance, value)
+            
+        self.balances[from] = from_balance - value
+        self.balances[to] = self.balances[to] + value
+        
+        log(ERC20Events.Transfer, indexed(from), indexed(to), value)
+        return true
+
+    export fn _mint(Account account, u256 value):
+        if account == Account(0):
+            revert ERC20InvalidReceiver(account)
+            
+        self.total_supply = self.total_supply + value
+        self.balances[account] = self.balances[account] + value
+        log(ERC20Events.Transfer, indexed(Account(0)), indexed(account), value)
+
+    export fn _burn(Account account, u256 value):
+        if account == Account(0):
+            revert ERC20InvalidSender(account)
+            
+        u256 account_balance = self.balances[account]
+        if account_balance < value:
+            revert ERC20InsufficientBalance(account, account_balance, value)
+            
+        self.balances[account] = account_balance - value
+        self.total_supply = self.total_supply - value
+        log(ERC20Events.Transfer, indexed(account), indexed(Account(0)), value)
