@@ -374,6 +374,38 @@ impl TypeChecker {
         matches!(t, Type::Primitive(n) if self.loaded_enums.contains_key(n) && !self.enum_has_payload(n))
     }
 
+    // Whether Abi.encode / Abi.encode_packed can take a value of this type.
+    // encode handles everything the head/tail encoder does (value types,
+    // String/Bytes, arrays, structs). encode_packed is value types and
+    // String/Bytes only, since a packed array/struct has extra layout rules.
+    fn is_abi_encodable(&self, t: &Type, packed: bool) -> bool {
+        match t {
+            Type::Primitive(n) => {
+                if matches!(n.as_str(),
+                    "String" | "Bytes" | "bool" | "Account" |
+                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" | "f32" | "f64")
+                {
+                    return true;
+                }
+                // A fixed-bytes bN.
+                if n.strip_prefix('b').and_then(|d| d.parse::<usize>().ok()).map_or(false, |k| (1..=32).contains(&k)) {
+                    return true;
+                }
+                if packed {
+                    return false;
+                }
+                if self.is_scalar_enum(t) {
+                    return true;
+                }
+                // A plain struct (not the contract singleton, not an interface).
+                self.loaded_classes.get(n).map_or(false, |c| !c.is_global && !c.is_extern)
+            }
+            Type::Array(_) | Type::FixedArray(..) => !packed,
+            _ => false,
+        }
+    }
+
     // Whether t is a payload-carrying enum: usable as a local, illegal anywhere that needs a size.
     pub fn is_payload_enum(&self, t: &Type) -> bool {
         matches!(t, Type::Primitive(n) if self.enum_has_payload(n))
@@ -1498,6 +1530,15 @@ impl TypeChecker {
                     Err(format!("Undefined identifier: {}", name))
                 }
             }
+            // Builtin hashing/recovery: keccak256 hands back a word, ecrecover
+            // an address. Their codegen lives in the translator; this is only
+            // their type, so `return keccak256(...)` and friends type-check.
+            Expr::FnCall { name, .. } if name == "keccak256" => {
+                Ok(Type::Primitive("u256".to_string()))
+            }
+            Expr::FnCall { name, .. } if name == "ecrecover" => {
+                Ok(Type::Primitive("Account".to_string()))
+            }
             Expr::FnCall { name, args } if args.len() == 1 && self.loaded_classes.contains_key(name) => {
                 Ok(Type::Primitive(name.clone()))
             }
@@ -1531,6 +1572,27 @@ impl TypeChecker {
             Expr::MethodCall { base, method, args } => {
                 if matches!(&**base, Expr::Identifier(b) if b == "super") {
                     return self.eval_super_call(method);
+                }
+                // Abi.encode(...) / Abi.encode_packed(...): a variadic builtin
+                // that hands back a Bytes, so it never resolves `Abi` as a value.
+                if let Expr::Identifier(ns) = &**base {
+                    if ns == "Abi" && matches!(method.as_str(), "encode" | "encode_packed") {
+                        let packed = method == "encode_packed";
+                        if args.is_empty() {
+                            return Err(format!("Abi.{}() needs at least one argument to encode", method));
+                        }
+                        for a in args {
+                            let t = self.eval_type(a)?;
+                            if !self.is_abi_encodable(&t, packed) {
+                                return Err(format!(
+                                    "Abi.{}() cannot encode a value of type {:?}{}",
+                                    method, t,
+                                    if packed { ". encode_packed takes value types, String or Bytes; use Abi.encode for arrays and structs" } else { "" }
+                                ));
+                            }
+                        }
+                        return Ok(Type::Primitive("Bytes".to_string()));
+                    }
                 }
                 let base_type = self.eval_type(base)?;
                 if let Type::Generic { name, args: type_args } = &base_type {

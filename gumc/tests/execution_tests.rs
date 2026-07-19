@@ -1385,6 +1385,44 @@ fn word_bytes4(id: u32) -> [u8; 32] {
 }
 
 #[test]
+fn abi_encode_matches_solidity() {
+    // Abi.encode / Abi.encode_packed hashed with keccak256 must be byte-for-byte
+    // Solidity's abi.encode / abi.encodePacked: static values (uint/address/
+    // bytes32), and the packed/standard forms over dynamic string content.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "use gum.defaults.hashable\nuse gum.defaults.String\n\ncontract H:\n    export fn e_static(u256 a, Account b, b32 c) -> u256:\n        return keccak256(Abi.encode(a, b, c))\n\n    export fn p_static(u256 a, Account b) -> u256:\n        return keccak256(Abi.encode_packed(a, b))\n\n    export fn e_str() -> u256:\n        return keccak256(Abi.encode(\"hello\", \"world\"))\n\n    export fn p_str() -> u256:\n        return keccak256(Abi.encode_packed(\"hello\", \"world\"))\n";
+    let sol_src = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\ncontract H {\n    function e_static(uint256 a, address b, bytes32 c) external pure returns (bytes32) { return keccak256(abi.encode(a,b,c)); }\n    function p_static(uint256 a, address b) external pure returns (bytes32) { return keccak256(abi.encodePacked(a,b)); }\n    function e_str() external pure returns (bytes32) { return keccak256(abi.encode(\"hello\",\"world\")); }\n    function p_str() external pure returns (bytes32) { return keccak256(abi.encodePacked(\"hello\",\"world\")); }\n}\n";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum_creation_bytecode(gum_src, &solc, false));
+    let sa = deploy(&mut sdb, sol_creation_bytecode(sol_src, &solc));
+
+    let addr = Address::from([0x42u8; 20]);
+    let mut c = [0u8; 32];
+    c[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let checks: Vec<(&str, Vec<[u8; 32]>)> = vec![
+        ("e_static(uint256,address,bytes32)", vec![word_u256(U256::from(123u64)), word_addr(addr), c]),
+        ("p_static(uint256,address)", vec![word_u256(U256::from(123u64)), word_addr(addr)]),
+        ("e_str()", vec![]),
+        ("p_str()", vec![]),
+    ];
+    for (sig, words) in &checks {
+        let data = encode_words(sig, words);
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert_eq!(g.success, s.success, "{}: success mismatch", sig);
+        assert!(g.success, "{}: gum reverted", sig);
+        assert_eq!(g.output, s.output, "{}: hash mismatch", sig);
+    }
+}
+
+#[test]
 fn fixed_bytes_round_trip() {
     // The bN family: b32 fills the word (identity in and out); a sub-word b4
     // rides the wire left-aligned, is carried right-aligned internally, and is

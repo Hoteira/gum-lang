@@ -1055,6 +1055,27 @@ pub fn byte_width(name: &str) -> Option<usize> {
     (1..=32).contains(&n).then_some(n)
 }
 
+// The packed byte width of a value type in Abi.encode_packed: a uintN/bytesN
+// occupies its own N bytes, an address 20, a bool 1. None means a dynamic value
+// (String/Bytes) whose byte length is only known at runtime.
+fn packed_width(t: &Type) -> Option<usize> {
+    if let Type::Primitive(n) = t {
+        if let Some((bits, _)) = numeric_meta(n) {
+            return Some(bits / 8);
+        }
+        if n == "bool" {
+            return Some(1);
+        }
+        if n == "Account" {
+            return Some(20);
+        }
+        if let Some(w) = byte_width(n) {
+            return Some(w);
+        }
+    }
+    None
+}
+
 fn mask_for_type(val_expr: &str, type_def: &Type) -> String {
     if let Type::Primitive(name) = type_def {
         if let Some((bits, signed)) = numeric_meta(name) {
@@ -2117,6 +2138,14 @@ impl<'a> Translator<'a> {
                 _ => self.static_type(left, ctx),
             },
             Expr::MethodCall { base, method, .. } => {
+                // Abi.encode / Abi.encode_packed yield a Bytes, so keccak256 of
+                // one takes the string-hash path and a `var b = Abi.encode(...)`
+                // local types as Bytes.
+                if let Expr::Identifier(ns) = &**base {
+                    if ns == "Abi" && matches!(method.as_str(), "encode" | "encode_packed") {
+                        return Type::Primitive("Bytes".to_string());
+                    }
+                }
                 let base_ty = self.static_type(base, ctx);
                 if let Type::Generic { name, args } = &base_ty {
                     if name == "HashMap" && args.len() == 2 && method == "get" {
@@ -4136,6 +4165,9 @@ impl<'a> Translator<'a> {
                 let a: Vec<String> = args.iter().map(|x| self.translate_expr(x, ctx)).collect();
                 return format!("gum_p256_verify({})", a.join(", "));
             }
+            if ns == "Abi" && matches!(method, "encode" | "encode_packed") {
+                return self.translate_abi_encode(method == "encode_packed", args, ctx);
+            }
         }
 
         if matches!(method, "len" | "get") {
@@ -4699,6 +4731,78 @@ impl<'a> Translator<'a> {
         let val = self.translate_expr(base, ctx);
         self.ensure_helper("gum_uint_to_str", gum_uint_to_str_helper_src);
         format!("gum_uint_to_str({})", val)
+    }
+
+    // Abi.encode(...) / Abi.encode_packed(...): build a Bytes value holding the
+    // ABI encoding of the arguments. encode reuses the head/tail encoder the
+    // interface-call and CREATE paths use (static + dynamic, byte-identical to
+    // Solidity's abi.encode); encode_packed writes each value in its own byte
+    // width with no padding, the tight form used for keccak hashing (merkle
+    // leaves, the EIP-712 "\x19\x01" prefix). The result is a Bytes, so
+    // keccak256(Abi.encode(...)) hashes exactly the encoding.
+    fn translate_abi_encode(&self, packed: bool, args: &[Expr], ctx: &Ctx) -> String {
+        let types: Vec<Type> = args.iter().map(|a| self.static_type(a, ctx)).collect();
+        let arg_strs: Vec<String> = args.iter().map(|a| self.translate_expr(a, ctx)).collect();
+        let params: Vec<String> = (0..args.len()).map(|i| format!("a{}", i)).collect();
+        let fn_name = format!(
+            "__abi_{}_{}",
+            if packed { "encode_packed" } else { "encode" },
+            self.next_literal_id()
+        );
+
+        if packed {
+            self.ensure_helper("gum_str_len", gum_str_len_helper_src);
+            let (types, params, name) = (types.clone(), params.clone(), fn_name.clone());
+            self.ensure_helper(&fn_name, move || {
+                let mut b = format!("function {}({}) -> ptr {{\n", name, params.join(", "));
+                b.push_str("    let plen := 0\n");
+                for (i, t) in types.iter().enumerate() {
+                    match packed_width(t) {
+                        Some(w) => b.push_str(&format!("    plen := add(plen, {})\n", w)),
+                        None => b.push_str(&format!("    plen := add(plen, gum_str_len(a{}))\n", i)),
+                    }
+                }
+                // 32 for the length header, plus a spare word so the final
+                // 32-byte mstore of a sub-word value never runs past the buffer.
+                b.push_str("    ptr := allocate_memory(add(64, plen))\n");
+                b.push_str("    mstore(ptr, shl(192, plen))\n");
+                b.push_str("    let cur := add(ptr, 32)\n");
+                for (i, t) in types.iter().enumerate() {
+                    match packed_width(t) {
+                        Some(w) => {
+                            let shift = (32 - w) * 8;
+                            if shift == 0 {
+                                b.push_str(&format!("    mstore(cur, a{})\n", i));
+                            } else {
+                                b.push_str(&format!("    mstore(cur, shl({}, a{}))\n", shift, i));
+                            }
+                            b.push_str(&format!("    cur := add(cur, {})\n", w));
+                        }
+                        None => {
+                            b.push_str(&format!("    let n{i} := gum_str_len(a{i})\n", i = i));
+                            b.push_str(&format!("    gum_memory_copy(add(a{i}, 32), cur, n{i})\n", i = i));
+                            b.push_str(&format!("    cur := add(cur, n{})\n", i));
+                        }
+                    }
+                }
+                b.push_str("}\n");
+                b
+            });
+        } else {
+            let (size_src, write_src) = self.abi_arg_blob_src(&types);
+            let (params, name) = (params.clone(), fn_name.clone());
+            self.ensure_helper(&fn_name, move || {
+                let mut b = format!("function {}({}) -> ptr {{\n", name, params.join(", "));
+                b.push_str(&size_src);
+                b.push_str("    ptr := allocate_memory(add(32, alen))\n");
+                b.push_str("    mstore(ptr, shl(192, alen))\n");
+                b.push_str("    let blob := add(ptr, 32)\n");
+                b.push_str(&write_src);
+                b.push_str("}\n");
+                b
+            });
+        }
+        format!("{}({})", fn_name, arg_strs.join(", "))
     }
 
     fn translate_string_literal(&self, s: &str) -> String {

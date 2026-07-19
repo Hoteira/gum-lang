@@ -852,8 +852,31 @@ binary. Each row is a symbol you import by name.
 | `HashMap` | `HashMap(K, V)` |
 | `Vec` | `Vec(T)` with `.push`/`.get`/`.len` (memory). As a `contract` field it is a **storage vector**, see STORAGE.md |
 | `Serializable`, `Hashable` | markers: `serialize()` synthesis, and mapping-key bounds |
-| `keccak256`, `ecrecover` | free functions, compiled to the opcode and the precompile |
+| `keccak256`, `ecrecover` | free functions, compiled to the opcode and the precompile. `keccak256(x)` hashes a `Bytes`/`String`/array's contents and returns a `u256`; `ecrecover(hash, v, r, s)` returns an `Account` |
+| `Abi` | `Abi.encode(...)` and `Abi.encode_packed(...)` (see below) |
 | `Crypto` | `Crypto.verify_p256(...)`, secp256r1 via the precompile at `0x100` |
+
+### `Abi.encode` and `Abi.encode_packed`
+
+Both are variadic and return a `Bytes`, so they compose with `keccak256`:
+
+```python
+# an EIP-712 struct hash
+var digest = keccak256(Abi.encode(TYPE_HASH, from, to, amount))
+# a merkle leaf
+var leaf = keccak256(Abi.encode_packed(account, amount))
+```
+
+- **`Abi.encode(...)`** is the ABI-standard head/tail encoding, byte-for-byte
+  Solidity's `abi.encode`: every argument is 32-byte aligned, and a dynamic one
+  (`String`, `Bytes`, an array) is placed behind an offset with its length. It
+  accepts value types, `String`/`Bytes`, arrays, and structs, the same argument
+  shapes an `interface` call encodes.
+- **`Abi.encode_packed(...)`** is the tight encoding, byte-for-byte Solidity's
+  `abi.encodePacked`: each value takes only its own width (a `u256` 32 bytes, a
+  `u8` 1, an `Account` 20, a `bN` its N, a `bool` 1), and a `String`/`Bytes`
+  contributes its raw bytes with no length prefix. It takes value types and
+  `String`/`Bytes` only; use `Abi.encode` for arrays and structs.
 
 Importing a symbol brings in what its signature depends on, so
 `use gum.defaults.Account` also brings `Serializable`. It does **not** bring the
