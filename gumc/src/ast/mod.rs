@@ -110,10 +110,13 @@ pub enum Statement {
     // `args` are the enclosing locals the body reads, marshalled in as the
     // thunk's parameters. `propagate_return` means the body can return, so on
     // success the thunk's returned value becomes the enclosing function's.
+    // `writeback` names a captured variable the body mutates: the thunk returns
+    // its new value and the site assigns it back on success.
     ScopedTryCall {
         thunk: String,
         args: Vec<(String, Type)>,
         propagate_return: bool,
+        writeback: Option<(String, Type)>,
         catch_body: Vec<Spanned<Statement>>,
     },
     Match { expr: Expr, arms: Vec<MatchArm> },

@@ -6130,6 +6130,44 @@ contract Caller:
 }
 
 #[test]
+fn test_try_catch_writes_mutation_back() {
+    // A try body that mutates a captured variable: on success the new value is
+    // written back and visible after the try; on a caught revert the mutation
+    // rolls back and catch's assignment stands. bump(n) does n = n + 1 inside
+    // the try, guarded by assert(n < 100).
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = r#"
+contract C:
+    export fn bump(mut u256 n) -> u256:
+        try:
+            n = n + 1
+            assert(n < 100, "cap")
+        catch:
+            n = 0
+        return n
+"#;
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    // n = 5: mutation to 6 sticks and is returned.
+    let mut d = selector("bump(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 5; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success);
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(6), "mutation must be written back");
+
+    // n = 200: n+1 trips the assert, the mutation rolls back, catch sets 0.
+    let mut d = selector("bump(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[30] = 0; w[31] = 200u8; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success, "the internal revert must be caught");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(0), "caught path returns catch's value");
+}
+
+#[test]
 fn test_try_catch_captures_param_and_catches_internal_revert() {
     // The new capability Solidity's try/catch lacks: catch an INTERNAL revert
     // (an assert here, not an external call) while capturing an enclosing

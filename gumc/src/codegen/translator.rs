@@ -2520,8 +2520,8 @@ impl<'a> Translator<'a> {
                 out.push_str("}\n");
                 out
             }
-            Statement::ScopedTryCall { thunk, args, propagate_return, catch_body } => {
-                self.translate_scoped_try(thunk, args, *propagate_return, catch_body, ctx)
+            Statement::ScopedTryCall { thunk, args, propagate_return, writeback, catch_body } => {
+                self.translate_scoped_try(thunk, args, *propagate_return, writeback, catch_body, ctx)
             }
             Statement::ForLoop {
                 iterator,
@@ -4756,6 +4756,7 @@ impl<'a> Translator<'a> {
         thunk: &str,
         args: &[(String, Type)],
         propagate_return: bool,
+        writeback: &Option<(String, Type)>,
         catch_body: &[Spanned<Statement>],
         ctx: &Ctx,
     ) -> String {
@@ -4820,6 +4821,18 @@ impl<'a> Translator<'a> {
             out.push_str("        returndatacopy(__rb, 0, returndatasize())\n");
             out.push_str("        return(__rb, returndatasize())\n");
             out.push_str("    }\n");
+            out.push_str("}\n");
+        }
+        // Write-back: on success the thunk returned the mutated variable's new
+        // value in returndata; assign it back to the enclosing local. (Only
+        // reached when the body does not return, so this is unambiguous.)
+        if let Some((name, ty)) = writeback {
+            let scratch = format!("__try_wb_{}", id);
+            out.push_str(&format!("if {} {{\n", ok));
+            out.push_str(&format!("    let {} := allocate_memory(32)\n", scratch));
+            out.push_str(&format!("    returndatacopy({}, 0, 32)\n", scratch));
+            let loaded = self.mask_for_type(&format!("mload({})", scratch), ty);
+            out.push_str(&format!("    {} := {}\n", name, loaded));
             out.push_str("}\n");
         }
         out.push_str(&format!("if iszero({}) {{\n", ok));

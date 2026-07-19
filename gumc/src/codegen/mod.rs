@@ -381,7 +381,7 @@ fn plan_capture<'a>(
     try_body: &[Spanned<Statement>],
     base_locals: &HashSet<String>,
     enclosing: &'a EnclosingFn,
-) -> Option<(Vec<&'a Parameter>, bool)> {
+) -> Option<Capture<'a>> {
     let mut inner: HashSet<String> = HashSet::new();
     collect_var_decls(try_body, &mut inner);
     let mut refs: HashSet<String> = HashSet::new();
@@ -399,17 +399,27 @@ fn plan_capture<'a>(
         return None;
     }
 
-    // Captured params are passed in by value; the frame can't yet write a
-    // mutation back out. If the body reassigns an outer name, keep it on the
-    // old inline path (which shares the frame, so the mutation is visible) until
-    // write-back marshalling lands.
+    // Params the body reassigns. Their new value has to travel back out of the
+    // frame (write-back), which is supported for exactly one simple value-typed
+    // variable; anything else stays on the old inline path for now.
     let mut assigned: HashSet<String> = HashSet::new();
     collect_assigned_idents(try_body, &mut assigned);
-    if captured.iter().any(|r| assigned.contains(*r)) {
-        return None;
-    }
-
+    let mutated: Vec<&Parameter> = enclosing
+        .params
+        .iter()
+        .filter(|p| assigned.contains(&p.name) && captured.contains(&&p.name))
+        .collect();
     let has_ret = body_has_return(try_body);
+    let writeback: Option<(String, Type)> = match mutated.as_slice() {
+        [] => None,
+        [p] if !has_ret && is_simple_value_type(&p.type_def) => {
+            Some((p.name.clone(), p.type_def.clone()))
+        }
+        // Multiple mutations, a reference-typed mutation, or a mutation combined
+        // with a return: not yet marshalled, so keep the old inline path.
+        _ => return None,
+    };
+
     // A return inside the try must become the enclosing function's return. That
     // reuses the entry return-encoding, so it is only supported when the
     // enclosing function is an entry with a declared return type.
@@ -425,7 +435,30 @@ fn plan_capture<'a>(
         .iter()
         .filter(|p| captured_set.contains(&&&p.name))
         .collect();
-    Some((params, has_ret))
+    Some(Capture { params, has_ret, writeback })
+}
+
+// The outcome of planning a try body's capture: which params to marshal in,
+// whether a return propagates out, and an optional single variable to write back.
+struct Capture<'a> {
+    params: Vec<&'a Parameter>,
+    has_ret: bool,
+    writeback: Option<(String, Type)>,
+}
+
+// A value type small enough to travel back out of a frame in one word: the
+// numeric widths, bool, an address, or fixed bytes. Excludes String/Bytes,
+// arrays, structs, and enums, whose write-back is not marshalled yet.
+fn is_simple_value_type(t: &Type) -> bool {
+    match t {
+        Type::Primitive(n) => {
+            n == "bool"
+                || n == "Account"
+                || (n.starts_with('b') && n[1..].parse::<usize>().is_ok())
+                || ((n.starts_with('u') || n.starts_with('i')) && n[1..].parse::<usize>().is_ok())
+        }
+        _ => false,
+    }
 }
 
 fn hoist_in_stmt(
@@ -454,10 +487,11 @@ fn hoist_in_stmt(
             // Hoist any nested trys in both branches first.
             hoist_in_body(try_body, base_locals, enclosing, thunks, counter);
             hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
-            let (params, has_ret) = match plan_capture(try_body, base_locals, enclosing) {
-                Some(p) => p,
-                None => return, // leave on the existing path
-            };
+            let Capture { params, has_ret, writeback } =
+                match plan_capture(try_body, base_locals, enclosing) {
+                    Some(p) => p,
+                    None => return, // leave on the existing path
+                };
             let id = *counter;
             *counter += 1;
             let thunk_name = format!("__try_thunk_{}", id);
@@ -469,8 +503,24 @@ fn hoist_in_stmt(
             let mut thunk_body: Vec<Spanned<Statement>> =
                 vec![Spanned { node: Statement::UnsafeBlock(guard), line: 0, col: 0 }];
             thunk_body.append(try_body);
+            // For write-back, the thunk returns the mutated variable so the site
+            // can assign it back; append that return after the (non-returning) body.
+            if let Some((name, _)) = &writeback {
+                thunk_body.push(Spanned {
+                    node: Statement::Return { value: Some(Expr::Identifier(name.clone())) },
+                    line: 0,
+                    col: 0,
+                });
+            }
             let args: Vec<(String, Type)> =
                 params.iter().map(|p| (p.name.clone(), p.type_def.clone())).collect();
+            // A returning body encodes through the enclosing return type; a
+            // write-back encodes through the mutated variable's type.
+            let thunk_ret = if has_ret {
+                enclosing.return_type.clone()
+            } else {
+                writeback.as_ref().map(|(_, t)| t.clone())
+            };
             thunks.push(FnDecl {
                 modifiers: vec!["export".to_string()],
                 attributes: vec!["TryThunk".to_string()],
@@ -479,8 +529,7 @@ fn hoist_in_stmt(
                     .iter()
                     .map(|p| Parameter { is_mut: false, type_def: p.type_def.clone(), name: p.name.clone() })
                     .collect(),
-                // A returning body encodes through the enclosing return type.
-                return_type: if has_ret { enclosing.return_type.clone() } else { None },
+                return_type: thunk_ret,
                 body: thunk_body,
             });
             let catch = std::mem::take(catch_body);
@@ -488,6 +537,7 @@ fn hoist_in_stmt(
                 thunk: thunk_name,
                 args,
                 propagate_return: has_ret,
+                writeback,
                 catch_body: catch,
             };
         }
