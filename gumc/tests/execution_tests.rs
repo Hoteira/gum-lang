@@ -6123,8 +6123,67 @@ contract Caller:
 
     let mut d = selector("test_succeed(address)").to_vec();
     d.extend_from_slice(&addr_bytes);
-    
+
     let r = call(&mut db, caller, d);
     assert!(r.success);
     assert_eq!(U256::from_be_slice(&r.output), U256::from(42));
+}
+
+#[test]
+fn test_try_catch_captures_param_and_catches_internal_revert() {
+    // The new capability Solidity's try/catch lacks: catch an INTERNAL revert
+    // (an assert here, not an external call) while capturing an enclosing
+    // parameter and propagating a return. classify(n) tries to require n < 10;
+    // for n >= 10 the assert reverts inside the try, is caught, and the function
+    // returns 99 from catch. A storage write made before the assert must roll
+    // back, which the second call checks.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = r#"
+contract C:
+    u256 mark
+
+    export fn classify(u256 n) -> u256:
+        C.mark = 1
+        try:
+            C.mark = 2
+            assert(n < 10, "too big")
+            return n
+        catch:
+            return 99
+
+    export fn getmark() -> u256:
+        return C.mark
+"#;
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    // n = 5: the try succeeds, returns n, and the write to 2 sticks.
+    let mut d = selector("classify(uint256)").to_vec();
+    d.extend_from_slice(&{
+        let mut w = [0u8; 32];
+        w[31] = 5;
+        w
+    });
+    let r = call(&mut db, c, d);
+    assert!(r.success);
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(5));
+    let r = call(&mut db, c, selector("getmark()").to_vec());
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "success keeps the write");
+
+    // n = 20: the assert reverts inside the try, is caught (returns 99), and the
+    // write to 2 rolls back to the pre-try 1.
+    let mut d = selector("classify(uint256)").to_vec();
+    d.extend_from_slice(&{
+        let mut w = [0u8; 32];
+        w[31] = 20;
+        w
+    });
+    let r = call(&mut db, c, d);
+    assert!(r.success, "internal revert must be caught, not bubble out");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(99));
+    let r = call(&mut db, c, selector("getmark()").to_vec());
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(1), "caught revert must roll back the write");
 }

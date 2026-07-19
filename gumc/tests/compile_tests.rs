@@ -310,6 +310,27 @@ fn cheatcode_sender_changes_msg_sender() {
 }
 
 #[test]
+fn scoped_try_catches_internal_revert_and_rolls_back() {
+    // A self-contained try body runs in its own call frame, so an internal
+    // revert (here assert(false)) is caught (Solidity's try/catch cannot) and
+    // the body's storage write rolls back before catch runs. Proof: x is set to
+    // 1, the try sets it to 2 then reverts, and after catch (which adds 10) x is
+    // 11 -- not 12, which is only possible if the write to 2 rolled back.
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping scoped-try check: no solc");
+            return;
+        }
+    };
+    let solc_arg = solc.to_string_lossy().into_owned();
+    let src = "contract C:\n    u256 x\n\n    [Test]\n    fn catches_and_rolls_back():\n        C.x = 1\n        try:\n            C.x = 2\n            assert(false, \"boom\")\n        catch:\n            C.x = C.x + 10\n        assert(C.x == 11, \"expected rollback then catch bump\")\n\n    [Test]\n    fn success_keeps_write():\n        C.x = 5\n        try:\n            C.x = 7\n        catch:\n            C.x = 99\n        assert(C.x == 7, \"success path must keep the write\")\n";
+    let (ok, output) = run_gumc_with_args(src, &["--test", "--solc", &solc_arg]);
+    assert!(ok, "scoped-try tests should pass:\n{}", output);
+    assert!(output.contains("2 tests, 2 passed"), "expected both to pass:\n{}", output);
+}
+
+#[test]
 fn test_runner_reports_pass_and_fail() {
     // gumc --test deploys the contract and runs every no-arg export test().
     // A passing test returns; a failing one reverts, and its reason is shown.

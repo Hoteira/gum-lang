@@ -2520,6 +2520,9 @@ impl<'a> Translator<'a> {
                 out.push_str("}\n");
                 out
             }
+            Statement::ScopedTryCall { thunk, args, propagate_return, catch_body } => {
+                self.translate_scoped_try(thunk, args, *propagate_return, catch_body, ctx)
+            }
             Statement::ForLoop {
                 iterator,
                 iterable,
@@ -4741,6 +4744,92 @@ impl<'a> Translator<'a> {
     // following call come from `addr`. Outside `--test` the call hits an address
     // with no code and is a harmless no-op, so leaving it in never affects
     // production behavior.
+    // Runs a hoisted try body in its own frame. Encodes the captured arguments
+    // as calldata, sets the capability flag the thunk's guard requires,
+    // self-calls, then clears the flag. A call frame is the only place the EVM
+    // lets a revert be caught, and it makes the scope transactional: on revert
+    // the frame's storage changes roll back and catch runs. If the body can
+    // return, a non-empty returndata carries the value and becomes the enclosing
+    // function's return (which is why this is only used from returning entries).
+    fn translate_scoped_try(
+        &self,
+        thunk: &str,
+        args: &[(String, Type)],
+        propagate_return: bool,
+        catch_body: &[Spanned<Statement>],
+        ctx: &Ctx,
+    ) -> String {
+        let slot = crate::codegen::TRY_CAPABILITY_SLOT;
+        // Must match the dispatcher case, whose selector AbiGenerator derives
+        // from the thunk's name and parameter types, so build it the same way.
+        let sig_decl = FnDecl {
+            modifiers: Vec::new(),
+            attributes: Vec::new(),
+            name: thunk.to_string(),
+            parameters: args
+                .iter()
+                .map(|(n, t)| Parameter { is_mut: false, type_def: t.clone(), name: n.clone() })
+                .collect(),
+            return_type: None,
+            body: Vec::new(),
+        };
+        let selector = self.abi_gen.calculate_selector(&sig_decl);
+        let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
+        let arg_vals: Vec<String> = args.iter().map(|(n, _)| n.clone()).collect();
+
+        // A per-thunk call helper: encode the captured args after the selector,
+        // raise the capability flag, self-call, lower the flag, return success.
+        let helper = format!("{}_call", thunk);
+        let (size_src, write_src) = self.abi_arg_blob_src(&types);
+        let (h, sel, sz, wr, slot_s) = (
+            helper.clone(),
+            selector.clone(),
+            size_src,
+            write_src,
+            slot.to_string(),
+        );
+        let n = args.len();
+        self.ensure_helper(&helper, move || {
+            let params: Vec<String> = (0..n).map(|i| format!("a{}", i)).collect();
+            let mut b = format!("function {}({}) -> ok {{\n", h, params.join(", "));
+            b.push_str(&sz);
+            b.push_str("    let ptr := allocate_memory(add(4, alen))\n");
+            b.push_str(&format!("    mstore(ptr, shl(224, {}))\n", sel));
+            b.push_str("    let blob := add(ptr, 4)\n");
+            b.push_str(&wr);
+            b.push_str(&format!("    tstore({}, 1)\n", slot_s));
+            b.push_str("    ok := call(gas(), address(), 0, ptr, add(4, alen), 0, 0)\n");
+            b.push_str(&format!("    tstore({}, 0)\n", slot_s));
+            b.push_str("}\n");
+            b
+        });
+
+        let id = self.next_literal_id();
+        let ok = format!("__try_ok_{}", id);
+        let mut out = format!("let {} := {}({})\n", ok, helper, arg_vals.join(", "));
+        if propagate_return {
+            // A returning body left its ABI-encoded value in returndata; forward
+            // it verbatim as this function's return (the types match), clearing
+            // the reentrancy lock first exactly as a normal entry return would.
+            out.push_str(&format!("if {} {{\n", ok));
+            out.push_str("    if gt(returndatasize(), 0) {\n");
+            if let Some(lock) = &ctx.lock_slot {
+                out.push_str(&format!("        tstore({}, 0)\n", lock));
+            }
+            out.push_str("        let __rb := allocate_memory(returndatasize())\n");
+            out.push_str("        returndatacopy(__rb, 0, returndatasize())\n");
+            out.push_str("        return(__rb, returndatasize())\n");
+            out.push_str("    }\n");
+            out.push_str("}\n");
+        }
+        out.push_str(&format!("if iszero({}) {{\n", ok));
+        for s in catch_body {
+            out.push_str(&self.translate_statement(&s.node, ctx));
+        }
+        out.push_str("}\n");
+        out
+    }
+
     fn translate_set_sender(&self, addr: &str) -> String {
         const VM: &str = "0x7109709ECfa91a80626fF3989D68f67F5b1DD12D";
         self.ensure_helper("__vm_set_sender", move || {

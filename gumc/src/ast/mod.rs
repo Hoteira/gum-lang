@@ -103,6 +103,19 @@ pub enum Statement {
     ForLoop { iterator: String, iterable: Expr, body: Vec<Spanned<Statement>> },
     WhileLoop { condition: Expr, body: Vec<Spanned<Statement>> },
     TryCatch { try_body: Vec<Spanned<Statement>>, catch_body: Vec<Spanned<Statement>> },
+    // Produced by the codegen try-hoisting pre-pass, never by the parser. The
+    // try body has been lifted into a synthesized entry fn named `thunk`; this
+    // runs it as a guarded self-call so any revert inside (internal or external)
+    // is caught and its state changes roll back, then runs catch_body on failure.
+    // `args` are the enclosing locals the body reads, marshalled in as the
+    // thunk's parameters. `propagate_return` means the body can return, so on
+    // success the thunk's returned value becomes the enclosing function's.
+    ScopedTryCall {
+        thunk: String,
+        args: Vec<(String, Type)>,
+        propagate_return: bool,
+        catch_body: Vec<Spanned<Statement>>,
+    },
     Match { expr: Expr, arms: Vec<MatchArm> },
     Expression(Expr),
     Call { target: String, args: Vec<Expr> }, // Low-level external contract call, e.g. call target(args)

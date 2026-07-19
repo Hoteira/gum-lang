@@ -261,6 +261,9 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
                 body(try_body, out);
                 body(catch_body, out);
             }
+            Statement::ScopedTryCall { catch_body, .. } => {
+                body(catch_body, out);
+            }
         }
     }
     for m in methods {
@@ -306,6 +309,385 @@ fn is_fallback(f: &FnDecl) -> bool {
 
 fn is_selector_entry(f: &FnDecl) -> bool {
     (is_exported(f) || is_test(f)) && !is_receive(f) && !is_fallback(f)
+}
+
+// A synthesized try-scope thunk (produced by hoist_try_blocks). It is a real
+// selector entry so a self-call can reach it, but it is not part of the public
+// ABI and its capability guard makes a forged self-call revert.
+fn is_try_thunk(f: &FnDecl) -> bool {
+    f.attributes.iter().any(|a| a == "TryThunk")
+}
+
+// Transient slot holding the try-scope capability. A try site sets it only
+// immediately around its self-call; the thunk requires it and clears it. A
+// forged self-call routed through some arbitrary-call sink never sets it, so it
+// cannot reach a thunk body. Distinct from the reentrancy lock and the old
+// exception slot.
+pub(crate) const TRY_CAPABILITY_SLOT: &str =
+    "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe";
+
+// Rewrites every try/catch in a contract into a guarded self-call. The try body
+// is lifted into a synthesized entry fn (__try_thunk_N); the site becomes a
+// ScopedTryCall that runs it in its own call frame. A call frame is the only
+// place the EVM lets a revert be caught, so this is what makes try catch every
+// revert (internal or external), and it makes the scope transactional: on revert
+// the frame's storage changes roll back before catch runs.
+fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
+    let mut thunks: Vec<FnDecl> = Vec::new();
+    let mut counter = 0usize;
+    for m in &mut class.methods {
+        // Names bound in the enclosing method (params + every local it declares).
+        // A try body only reads names in this set from the outer frame; those
+        // that are parameters are marshalled into the thunk as arguments.
+        let mut base_locals: HashSet<String> =
+            m.parameters.iter().map(|p| p.name.clone()).collect();
+        collect_var_decls(&m.body, &mut base_locals);
+        let enclosing = EnclosingFn {
+            params: m.parameters.clone(),
+            return_type: m.return_type.clone(),
+            is_entry: is_selector_entry(m),
+        };
+        hoist_in_body(&mut m.body, &base_locals, &enclosing, &mut thunks, &mut counter);
+    }
+    class.methods.extend(thunks);
+    class
+}
+
+// What the try-hoisting pass needs to know about the function a try sits in, to
+// marshal captured parameters and propagate a return out of the frame.
+struct EnclosingFn {
+    params: Vec<Parameter>,
+    return_type: Option<Type>,
+    is_entry: bool,
+}
+
+fn hoist_in_body(
+    body: &mut [Spanned<Statement>],
+    base_locals: &HashSet<String>,
+    enclosing: &EnclosingFn,
+    thunks: &mut Vec<FnDecl>,
+    counter: &mut usize,
+) {
+    for s in body.iter_mut() {
+        hoist_in_stmt(&mut s.node, base_locals, enclosing, thunks, counter);
+    }
+}
+
+// Decides whether a try body can be lifted into its own frame, and if so which
+// enclosing parameters it captures. A body that reads an outer local that is not
+// a parameter, or that returns from a function we can't propagate out of, stays
+// on the existing external-call path (returns None).
+fn plan_capture<'a>(
+    try_body: &[Spanned<Statement>],
+    base_locals: &HashSet<String>,
+    enclosing: &'a EnclosingFn,
+) -> Option<(Vec<&'a Parameter>, bool)> {
+    let mut inner: HashSet<String> = HashSet::new();
+    collect_var_decls(try_body, &mut inner);
+    let mut refs: HashSet<String> = HashSet::new();
+    body_idents(try_body, &mut refs);
+
+    let param_names: HashSet<&String> = enclosing.params.iter().map(|p| &p.name).collect();
+    // Outer names the body reads: base locals it references without re-binding.
+    let captured: Vec<&String> = refs
+        .iter()
+        .filter(|r| base_locals.contains(*r) && !inner.contains(*r))
+        .collect();
+    // Any captured name that is not a parameter is an outer local; marshalling
+    // those is not supported yet, so leave the try on the old path.
+    if captured.iter().any(|r| !param_names.contains(*r)) {
+        return None;
+    }
+
+    // Captured params are passed in by value; the frame can't yet write a
+    // mutation back out. If the body reassigns an outer name, keep it on the
+    // old inline path (which shares the frame, so the mutation is visible) until
+    // write-back marshalling lands.
+    let mut assigned: HashSet<String> = HashSet::new();
+    collect_assigned_idents(try_body, &mut assigned);
+    if captured.iter().any(|r| assigned.contains(*r)) {
+        return None;
+    }
+
+    let has_ret = body_has_return(try_body);
+    // A return inside the try must become the enclosing function's return. That
+    // reuses the entry return-encoding, so it is only supported when the
+    // enclosing function is an entry with a declared return type.
+    if has_ret && !(enclosing.is_entry && enclosing.return_type.is_some()) {
+        return None;
+    }
+
+    // Capture the parameters the body reads, in the enclosing signature's order
+    // so the site and the thunk agree on the ABI.
+    let captured_set: HashSet<&&String> = captured.iter().collect();
+    let params: Vec<&Parameter> = enclosing
+        .params
+        .iter()
+        .filter(|p| captured_set.contains(&&&p.name))
+        .collect();
+    Some((params, has_ret))
+}
+
+fn hoist_in_stmt(
+    stmt: &mut Statement,
+    base_locals: &HashSet<String>,
+    enclosing: &EnclosingFn,
+    thunks: &mut Vec<FnDecl>,
+    counter: &mut usize,
+) {
+    match stmt {
+        Statement::IfElse { if_body, else_body, .. } => {
+            hoist_in_body(if_body, base_locals, enclosing, thunks, counter);
+            if let Some(e) = else_body {
+                hoist_in_body(e, base_locals, enclosing, thunks, counter);
+            }
+        }
+        Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => {
+            hoist_in_body(body, base_locals, enclosing, thunks, counter);
+        }
+        Statement::Match { arms, .. } => {
+            for a in arms.iter_mut() {
+                hoist_in_body(&mut a.body, base_locals, enclosing, thunks, counter);
+            }
+        }
+        Statement::TryCatch { try_body, catch_body } => {
+            // Hoist any nested trys in both branches first.
+            hoist_in_body(try_body, base_locals, enclosing, thunks, counter);
+            hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
+            let (params, has_ret) = match plan_capture(try_body, base_locals, enclosing) {
+                Some(p) => p,
+                None => return, // leave on the existing path
+            };
+            let id = *counter;
+            *counter += 1;
+            let thunk_name = format!("__try_thunk_{}", id);
+            // The thunk body: capability guard, then the original try body.
+            let guard = format!(
+                "{{\nif iszero(tload({slot})) {{ revert(0, 0) }}\ntstore({slot}, 0)\n}}",
+                slot = TRY_CAPABILITY_SLOT
+            );
+            let mut thunk_body: Vec<Spanned<Statement>> =
+                vec![Spanned { node: Statement::UnsafeBlock(guard), line: 0, col: 0 }];
+            thunk_body.append(try_body);
+            let args: Vec<(String, Type)> =
+                params.iter().map(|p| (p.name.clone(), p.type_def.clone())).collect();
+            thunks.push(FnDecl {
+                modifiers: vec!["export".to_string()],
+                attributes: vec!["TryThunk".to_string()],
+                name: thunk_name.clone(),
+                parameters: params
+                    .iter()
+                    .map(|p| Parameter { is_mut: false, type_def: p.type_def.clone(), name: p.name.clone() })
+                    .collect(),
+                // A returning body encodes through the enclosing return type.
+                return_type: if has_ret { enclosing.return_type.clone() } else { None },
+                body: thunk_body,
+            });
+            let catch = std::mem::take(catch_body);
+            *stmt = Statement::ScopedTryCall {
+                thunk: thunk_name,
+                args,
+                propagate_return: has_ret,
+                catch_body: catch,
+            };
+        }
+        Statement::ScopedTryCall { catch_body, .. } => {
+            hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
+        }
+        _ => {}
+    }
+}
+
+// Names bound by a body: locals it declares, loop iterators, match payloads.
+fn collect_var_decls(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
+    for s in body {
+        match &s.node {
+            Statement::VarDecl { name, .. } => {
+                out.insert(name.clone());
+            }
+            Statement::ForLoop { iterator, body, .. } => {
+                out.insert(iterator.clone());
+                collect_var_decls(body, out);
+            }
+            Statement::WhileLoop { body, .. } => collect_var_decls(body, out),
+            Statement::IfElse { if_body, else_body, .. } => {
+                collect_var_decls(if_body, out);
+                if let Some(e) = else_body {
+                    collect_var_decls(e, out);
+                }
+            }
+            Statement::Match { arms, .. } => {
+                for a in arms {
+                    if let Some(p) = &a.payload_var {
+                        out.insert(p.clone());
+                    }
+                    collect_var_decls(&a.body, out);
+                }
+            }
+            Statement::TryCatch { try_body, catch_body } => {
+                collect_var_decls(try_body, out);
+                collect_var_decls(catch_body, out);
+            }
+            Statement::ScopedTryCall { catch_body, .. } => collect_var_decls(catch_body, out),
+            _ => {}
+        }
+    }
+}
+
+// Bare-identifier assignment targets in a body: locals it writes (x = ..,
+// x += .., or a bitwise-flip on x). Storage (C.x) and elements (a[i]) are not
+// bare identifiers, so they are not collected.
+fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
+    for s in body {
+        match &s.node {
+            Statement::Assignment { target: Expr::Identifier(n), .. } => {
+                out.insert(n.clone());
+            }
+            Statement::BitwiseFlip { name, .. } => {
+                out.insert(name.clone());
+            }
+            Statement::IfElse { if_body, else_body, .. } => {
+                collect_assigned_idents(if_body, out);
+                if let Some(e) = else_body {
+                    collect_assigned_idents(e, out);
+                }
+            }
+            Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => {
+                collect_assigned_idents(body, out)
+            }
+            Statement::Match { arms, .. } => {
+                for a in arms {
+                    collect_assigned_idents(&a.body, out);
+                }
+            }
+            Statement::TryCatch { try_body, catch_body } => {
+                collect_assigned_idents(try_body, out);
+                collect_assigned_idents(catch_body, out);
+            }
+            Statement::ScopedTryCall { catch_body, .. } => collect_assigned_idents(catch_body, out),
+            _ => {}
+        }
+    }
+}
+
+// Whether a body executes a return anywhere in its own control flow.
+fn body_has_return(body: &[Spanned<Statement>]) -> bool {
+    body.iter().any(|s| match &s.node {
+        Statement::Return { .. } => true,
+        Statement::IfElse { if_body, else_body, .. } => {
+            body_has_return(if_body) || else_body.as_ref().is_some_and(|e| body_has_return(e))
+        }
+        Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => body_has_return(body),
+        Statement::Match { arms, .. } => arms.iter().any(|a| body_has_return(&a.body)),
+        Statement::TryCatch { try_body, catch_body } => {
+            body_has_return(try_body) || body_has_return(catch_body)
+        }
+        _ => false,
+    })
+}
+
+// Every identifier name read anywhere in a body (including the bases of property
+// and method access, which is safe: contract/namespace bases are never local
+// names, so they can't cause a false capture match).
+fn body_idents(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
+    for s in body {
+        stmt_idents(&s.node, out);
+    }
+}
+
+fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
+    let e = |x: &Expr, out: &mut HashSet<String>| expr_idents(x, out);
+    match s {
+        Statement::VarDecl { value, .. } => {
+            if let Some(v) = value {
+                e(v, out)
+            }
+        }
+        Statement::Assignment { target, value } => {
+            e(target, out);
+            e(value, out);
+        }
+        Statement::BitwiseFlip { name, index, value } => {
+            out.insert(name.clone());
+            e(index, out);
+            e(value, out);
+        }
+        Statement::Assert { condition, message } => {
+            e(condition, out);
+            if let Some(m) = message {
+                e(m, out)
+            }
+        }
+        Statement::Revert { error } => e(error, out),
+        Statement::Delete { target } => e(target, out),
+        Statement::Return { value } => {
+            if let Some(v) = value {
+                e(v, out)
+            }
+        }
+        Statement::IfElse { condition, if_body, else_body } => {
+            e(condition, out);
+            body_idents(if_body, out);
+            if let Some(b) = else_body {
+                body_idents(b, out)
+            }
+        }
+        Statement::ForLoop { iterable, body, .. } => {
+            e(iterable, out);
+            body_idents(body, out);
+        }
+        Statement::WhileLoop { condition, body } => {
+            e(condition, out);
+            body_idents(body, out);
+        }
+        Statement::Match { expr, arms } => {
+            e(expr, out);
+            for a in arms {
+                body_idents(&a.body, out);
+            }
+        }
+        Statement::Expression(x) => e(x, out),
+        Statement::Call { args, .. } => args.iter().for_each(|a| e(a, out)),
+        Statement::TryCatch { try_body, catch_body } => {
+            body_idents(try_body, out);
+            body_idents(catch_body, out);
+        }
+        Statement::ScopedTryCall { catch_body, .. } => body_idents(catch_body, out),
+        Statement::UnsafeBlock(_) => {}
+    }
+}
+
+fn expr_idents(x: &Expr, out: &mut HashSet<String>) {
+    match x {
+        Expr::Identifier(n) => {
+            out.insert(n.clone());
+        }
+        Expr::FnCall { args, .. } => args.iter().for_each(|a| expr_idents(a, out)),
+        Expr::Instantiation { args, .. } => args.iter().for_each(|a| expr_idents(a, out)),
+        Expr::PropertyAccess { base, .. } => expr_idents(base, out),
+        Expr::MethodCall { base, args, .. } => {
+            expr_idents(base, out);
+            args.iter().for_each(|a| expr_idents(a, out));
+        }
+        Expr::IndexAccess { base, index } => {
+            expr_idents(base, out);
+            expr_idents(index, out);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_idents(left, out);
+            expr_idents(right, out);
+        }
+        Expr::FString(segs) => {
+            for seg in segs {
+                if let FStringSegment::Interp(e) = seg {
+                    expr_idents(e, out);
+                }
+            }
+        }
+        Expr::Neg(e) | Expr::Not(e) => expr_idents(e, out),
+        Expr::ArrayLiteral(es) => es.iter().for_each(|e| expr_idents(e, out)),
+        Expr::Number(_) | Expr::StringLiteral(_) => {}
+    }
 }
 
 // Message/Block params are synthesized from opcodes at the call
@@ -447,6 +829,11 @@ impl EvmYulBackend {
         abi_gen: &AbiGenerator,
         stack: &mut Vec<String>,
     ) -> Result<(String, String), String> {
+        // Lift every try/catch into a guarded self-call thunk before anything
+        // downstream (dispatcher, mutability, method compile) looks at the
+        // methods, so they all see the transformed form.
+        let hoisted = hoist_try_blocks(global_class.clone());
+        let global_class = &hoisted;
         {
             let global_class_name = global_class.name.clone();
 
@@ -494,10 +881,7 @@ impl EvmYulBackend {
             
             let translator = Translator::new(&layout_engine, &abi_gen, &top_level_fns, self.rich_reverts);
             
-            let constructor_decl = type_checker
-                .loaded_classes
-                .get(&global_class_name)
-                .unwrap_or(&global_class)
+            let constructor_decl = global_class
                 .methods
                 .iter()
                 .find(|m| m.name == "new")
@@ -715,10 +1099,14 @@ impl EvmYulBackend {
 
                 // A read-only function gets no guard, for two reasons that agree.
                 // It cannot be harmed by reentrancy, since it writes nothing. And the ABI calls it view, which invites callers to use eth_call: the guard's tstore would revert inside that STATICCALL, making the getter uncallable.
+                // A try thunk is entered only via a self-call from a site that
+                // already holds the reentrancy lock, so re-checking it here would
+                // make the self-call revert. Its capability guard is its gate.
                 let requires_guard = has_ext
                     && mutability::makes_external_call(f, &ext)
                     && !is_unsafe(f)
-                    && !mutability::is_read_only(f, &muts);
+                    && !mutability::is_read_only(f, &muts)
+                    && !is_try_thunk(f);
                 if requires_guard {
                     yul.push_str(&format!("          if tload({}) {{ revert(0, 0) }}\n", reentrancy_lock_slot()));
                     yul.push_str(&format!("          tstore({}, 1)\n", reentrancy_lock_slot()));
@@ -870,11 +1258,14 @@ impl EvmYulBackend {
             {
                 // Must agree with the dispatcher's guard decision above: this is the other half of the same lock, the clear on the return path.
                 // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its view invites.
+                // A try thunk never owns the lock: it runs inside a site that
+                // already holds it, so touching it here would double-manage it.
                 let requires_guard = has_ext
                     && mutability::makes_external_call(f, &ext)
                     && !is_unsafe(f)
                     && is_exported(f)
-                    && !mutability::is_read_only(f, &muts);
+                    && !mutability::is_read_only(f, &muts)
+                    && !is_try_thunk(f);
                 let lock_slot = if requires_guard { Some(reentrancy_lock_slot()) } else { None };
 
                 let entry_ctx = Ctx::entry(lock_slot)
