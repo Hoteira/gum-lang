@@ -377,7 +377,6 @@ impl TypeChecker {
     // Whether Abi.encode / Abi.encode_packed can take a value of this type.
     // encode handles everything the head/tail encoder does (value types,
     // String/Bytes, arrays, structs). encode_packed is value types and
-    // String/Bytes only, since a packed array/struct has extra layout rules.
     fn is_abi_encodable(&self, t: &Type, packed: bool) -> bool {
         match t {
             Type::Primitive(n) => {
@@ -1285,6 +1284,25 @@ impl TypeChecker {
                 });
             }
             Statement::Assignment { target, value } => {
+                // Vm.sender = addr: a test cheatcode, not a real field. Setting it
+                // makes every following call in the test come from that address.
+                if let Expr::PropertyAccess { base, property } = target {
+                    if let Expr::Identifier(ns) = base.as_ref() {
+                        if ns == "Vm" {
+                            if property != "sender" {
+                                return Err(format!("{} unknown cheatcode Vm.{}", error_prefix, property));
+                            }
+                            // An address, or a hex literal that reads as a u256.
+                            let vt = self.eval_type(value)?;
+                            let ok = matches!(&vt, Type::Primitive(p) if p == "Account" || p.starts_with('u'));
+                            if !ok {
+                                return Err(format!("{} Vm.sender must be set to an address, found {:?}", error_prefix, vt));
+                            }
+                            self.has_external_calls.set(true);
+                            return Ok(());
+                        }
+                    }
+                }
                 self.reject_storage_array_copy(value, &error_prefix)?;
                 let target_type = self.eval_type(target)?;
                 let evaluated_type = self.eval_type(value)?;
@@ -1532,7 +1550,7 @@ impl TypeChecker {
             }
             // Builtin hashing/recovery: keccak256 hands back a word, ecrecover
             // an address. Their codegen lives in the translator; this is only
-            // their type, so `return keccak256(...)` and friends type-check.
+            // their type, so return keccak256(...) and friends type-check.
             Expr::FnCall { name, .. } if name == "keccak256" => {
                 Ok(Type::Primitive("u256".to_string()))
             }
@@ -1574,7 +1592,7 @@ impl TypeChecker {
                     return self.eval_super_call(method);
                 }
                 // Abi.encode(...) / Abi.encode_packed(...): a variadic builtin
-                // that hands back a Bytes, so it never resolves `Abi` as a value.
+                // that hands back a Bytes, so it never resolves Abi as a value.
                 if let Expr::Identifier(ns) = &**base {
                     if ns == "Abi" && matches!(method.as_str(), "encode" | "encode_packed") {
                         let packed = method == "encode_packed";
@@ -1592,6 +1610,11 @@ impl TypeChecker {
                             }
                         }
                         return Ok(Type::Primitive("Bytes".to_string()));
+                    }
+                    // Vm is a settable test handle, not callable. The only cheatcode
+                    // is `Vm.sender = addr` (see the Assignment handler).
+                    if ns == "Vm" {
+                        return Err(format!("Vm has no method {}(); set the caller with `Vm.sender = addr`", method));
                     }
                 }
                 let base_type = self.eval_type(base)?;

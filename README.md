@@ -254,6 +254,23 @@ contract DemoTests
 needs either no `fn new` or a no-argument one. It runs the same in-process EVM
 (`revm`) the compiler's own differential suite uses.
 
+**Cheatcodes.** Inside a test, set `Vm.sender` to make the calls that follow
+come from an address you choose, so you can test access control without
+deploying from many keys:
+
+```python
+[Test]
+fn only_owner_can_pause():
+    var v = new Vault()
+    Vm.sender = 0x00000000000000000000000000000000000000AA   # not the owner
+    IVault(v).pause()                                        # this call is from 0xAA
+```
+
+The sender stays set until you change it. Setting `Vm.sender` compiles to a
+plain call to the cheatcode address, which the runner's EVM inspector
+intercepts; off the test path it hits an address with no code and is a harmless
+no-op, so a stray cheatcode never affects production behavior.
+
 ---
 
 ## What works

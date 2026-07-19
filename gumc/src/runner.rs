@@ -1,16 +1,59 @@
 use revm::context::result::{ExecutionResult, Output};
 use revm::context::TxEnv;
+use revm::context_interface::ContextTr;
 use revm::database::{CacheDB, EmptyDB};
-use revm::primitives::{hardfork::SpecId, Address, TxKind, U256};
-use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+use revm::inspector::Inspector;
+use revm::interpreter::{CallInputs, CallOutcome, Gas, InstructionResult, InterpreterResult};
+use revm::primitives::{address, hardfork::SpecId, Address, Bytes, TxKind, U256};
+use revm::{Context, ExecuteCommitEvm, InspectCommitEvm, MainBuilder, MainContext};
 
 type Db = CacheDB<EmptyDB>;
 
 // Under Osaka's per-transaction gas cap (EIP-7825, 2^24).
 const GAS_LIMIT: u64 = 16_000_000;
 
+// Foundry's cheatcode address: a call here is caught by the test inspector.
+const VM_ADDRESS: Address = address!("7109709ECfa91a80626fF3989D68f67F5b1DD12D");
+
 fn tester() -> Address {
     Address::from([0x11u8; 20])
+}
+
+// The test-time cheatcode inspector. A `Vm.*` cheatcode in gum compiles to a
+// CALL to VM_ADDRESS, which never runs on chain; here it is intercepted and
+// turned into an effect on the EVM. So far: the sender, set by `Vm.sender = a`,
+// which makes every following call in the test come from `a` — the workhorse
+// for testing access control.
+#[derive(Default)]
+struct Cheats {
+    sender: Option<Address>,
+}
+
+impl<CTX: ContextTr> Inspector<CTX> for Cheats {
+    fn call(&mut self, ctx: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        if inputs.target_address == VM_ADDRESS {
+            let data = inputs.input.bytes(&*ctx);
+            // startPrank(address): the 20-byte address sits in the low end of the
+            // first argument word (calldata bytes 16..36 after the 4-byte selector).
+            if data.len() >= 36 && data[..4] == [0x06, 0x44, 0x7d, 0x56] {
+                self.sender = Some(Address::from_slice(&data[16..36]));
+            }
+            // Swallow the cheatcode call with an empty success.
+            return Some(CallOutcome::new(
+                InterpreterResult {
+                    result: InstructionResult::Return,
+                    output: Bytes::new(),
+                    gas: Gas::new(inputs.gas_limit),
+                },
+                0..0,
+            ));
+        }
+        // A set sender applies to every real call until it is changed again.
+        if let Some(p) = self.sender {
+            inputs.caller = p;
+        }
+        None
+    }
 }
 
 fn selector(sig: &str) -> [u8; 4] {
@@ -53,8 +96,16 @@ fn deploy(db: &mut Db, creation: Vec<u8>) -> Result<Address, String> {
     }
 }
 
+// The test call runs under the cheatcode inspector (a fresh one per test), so
+// `Vm.*` calls inside the test take effect.
 fn call(db: &mut Db, to: Address, data: Vec<u8>) -> (bool, Vec<u8>) {
-    let mut evm = evm_for!(db);
+    let mut evm = Context::mainnet()
+        .with_db(&mut *db)
+        .modify_cfg_chained(|c| {
+            c.spec = SpecId::OSAKA;
+            c.disable_nonce_check = true;
+        })
+        .build_mainnet_with_inspector(Cheats::default());
     let tx = TxEnv::builder()
         .caller(tester())
         .kind(TxKind::Call(to))
@@ -63,7 +114,7 @@ fn call(db: &mut Db, to: Address, data: Vec<u8>) -> (bool, Vec<u8>) {
         .gas_limit(GAS_LIMIT)
         .build()
         .expect("bad call tx");
-    match evm.transact_commit(tx).expect("call tx failed") {
+    match evm.inspect_tx_commit(tx).expect("call tx failed") {
         ExecutionResult::Success { output, .. } => (true, output.into_data().to_vec()),
         ExecutionResult::Revert { output, .. } => (false, output.to_vec()),
         ExecutionResult::Halt { .. } => (false, vec![]),

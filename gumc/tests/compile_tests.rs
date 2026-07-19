@@ -290,6 +290,26 @@ fn constructor_call_resolves_correctly() {
 }
 
 #[test]
+fn cheatcode_sender_changes_msg_sender() {
+    // Vm.sender = addr makes following calls come from addr. The first test
+    // asserts the set sender is seen; the second (unset) asserts it is not, so
+    // the first can't pass by accident.
+    let solc = match find_solc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping sender check: no solc");
+            return;
+        }
+    };
+    let solc_arg = solc.to_string_lossy().into_owned();
+    let src = "use gum.defaults.hashable\nuse gum.defaults.Message\n\ncontract Target:\n    Account seen\n    export fn record():\n        Target.seen = Message.sender()\n    export fn who() -> Account:\n        return Target.seen\n\ninterface ITarget:\n    fn record()\n    fn who() -> Account\n\ncontract SenderTest:\n    [Test]\n    fn sender_sets_msg_sender():\n        var t = new Target()\n        Vm.sender = 0x00000000000000000000000000000000000000AA\n        ITarget(t).record()\n        assert(ITarget(t).who() == 0x00000000000000000000000000000000000000AA, \"sender not set\")\n    [Test]\n    fn without_set_sender_differs():\n        var t = new Target()\n        ITarget(t).record()\n        assert(ITarget(t).who() != 0x00000000000000000000000000000000000000AA, \"unexpected sender\")\n";
+    let (ok, output) = run_gumc_with_args(src, &["--test", "--solc", &solc_arg]);
+    assert!(ok, "sender tests should pass:\n{}", output);
+    assert!(output.contains("ok    sender_sets_msg_sender"), "Vm.sender did not take effect:\n{}", output);
+    assert!(output.contains("2 tests, 2 passed"), "expected both to pass:\n{}", output);
+}
+
+#[test]
 fn test_runner_reports_pass_and_fail() {
     // gumc --test deploys the contract and runs every no-arg export test().
     // A passing test returns; a failing one reverts, and its reason is shown.

@@ -1056,8 +1056,6 @@ pub fn byte_width(name: &str) -> Option<usize> {
 }
 
 // The packed byte width of a value type in Abi.encode_packed: a uintN/bytesN
-// occupies its own N bytes, an address 20, a bool 1. None means a dynamic value
-// (String/Bytes) whose byte length is only known at runtime.
 fn packed_width(t: &Type) -> Option<usize> {
     if let Type::Primitive(n) = t {
         if let Some((bits, _)) = numeric_meta(n) {
@@ -2139,8 +2137,6 @@ impl<'a> Translator<'a> {
             },
             Expr::MethodCall { base, method, .. } => {
                 // Abi.encode / Abi.encode_packed yield a Bytes, so keccak256 of
-                // one takes the string-hash path and a `var b = Abi.encode(...)`
-                // local types as Bytes.
                 if let Expr::Identifier(ns) = &**base {
                     if ns == "Abi" && matches!(method.as_str(), "encode" | "encode_packed") {
                         return Type::Primitive("Bytes".to_string());
@@ -2245,6 +2241,12 @@ impl<'a> Translator<'a> {
                 match target {
                     Expr::Identifier(name) => {
                         format!("{} := {}\n", name, val_expr)
+                    }
+                    Expr::PropertyAccess { base, property }
+                        if matches!(base.as_ref(), Expr::Identifier(ns) if ns == "Vm")
+                            && property == "sender" =>
+                    {
+                        self.translate_set_sender(&val_expr)
                     }
                     Expr::PropertyAccess { base, property } => {
                         self.translate_property_store(base, property, &val_expr, ctx)
@@ -4733,13 +4735,28 @@ impl<'a> Translator<'a> {
         format!("gum_uint_to_str({})", val)
     }
 
+    // Vm.sender = addr: a test cheatcode. It compiles to a plain CALL to the
+    // well-known cheatcode address (Foundry's) carrying startPrank(address);
+    // `gumc --test`'s EVM inspector recognizes that address and makes every
+    // following call come from `addr`. Outside `--test` the call hits an address
+    // with no code and is a harmless no-op, so leaving it in never affects
+    // production behavior.
+    fn translate_set_sender(&self, addr: &str) -> String {
+        const VM: &str = "0x7109709ECfa91a80626fF3989D68f67F5b1DD12D";
+        self.ensure_helper("__vm_set_sender", move || {
+            let mut b = String::from("function __vm_set_sender(a0) {\n");
+            b.push_str("    let p := allocate_memory(36)\n");
+            // startPrank(address) = 0x06447d56
+            b.push_str("    mstore(p, shl(224, 0x06447d56))\n");
+            b.push_str("    mstore(add(p, 4), a0)\n");
+            b.push_str(&format!("    pop(call(gas(), {}, 0, p, 36, 0, 0))\n", VM));
+            b.push_str("}\n");
+            b
+        });
+        format!("__vm_set_sender({})\n", addr)
+    }
+
     // Abi.encode(...) / Abi.encode_packed(...): build a Bytes value holding the
-    // ABI encoding of the arguments. encode reuses the head/tail encoder the
-    // interface-call and CREATE paths use (static + dynamic, byte-identical to
-    // Solidity's abi.encode); encode_packed writes each value in its own byte
-    // width with no padding, the tight form used for keccak hashing (merkle
-    // leaves, the EIP-712 "\x19\x01" prefix). The result is a Bytes, so
-    // keccak256(Abi.encode(...)) hashes exactly the encoding.
     fn translate_abi_encode(&self, packed: bool, args: &[Expr], ctx: &Ctx) -> String {
         let types: Vec<Type> = args.iter().map(|a| self.static_type(a, ctx)).collect();
         let arg_strs: Vec<String> = args.iter().map(|a| self.translate_expr(a, ctx)).collect();
@@ -4763,7 +4780,6 @@ impl<'a> Translator<'a> {
                     }
                 }
                 // 32 for the length header, plus a spare word so the final
-                // 32-byte mstore of a sub-word value never runs past the buffer.
                 b.push_str("    ptr := allocate_memory(add(64, plen))\n");
                 b.push_str("    mstore(ptr, shl(192, plen))\n");
                 b.push_str("    let cur := add(ptr, 32)\n");
