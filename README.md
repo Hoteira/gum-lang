@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml)
 
-**A clear, secure smart-contract language — built by web2 devs, for web2 devs.**
+**A clear, secure smart-contract language, built by web2 devs, for web2 devs.**
 
 Write Ethereum contracts without the footguns. gum compiles to ordinary EVM
 bytecode that behaves like Solidity's, and is usually smaller.
