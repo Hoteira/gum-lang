@@ -377,7 +377,6 @@ impl TypeChecker {
     // Whether Abi.encode / Abi.encode_packed can take a value of this type.
     // encode handles everything the head/tail encoder does (value types,
     // String/Bytes, arrays, structs). encode_packed is value types and
-    // String/Bytes only, since a packed array/struct has extra layout rules.
     fn is_abi_encodable(&self, t: &Type, packed: bool) -> bool {
         match t {
             Type::Primitive(n) => {
@@ -1532,7 +1531,7 @@ impl TypeChecker {
             }
             // Builtin hashing/recovery: keccak256 hands back a word, ecrecover
             // an address. Their codegen lives in the translator; this is only
-            // their type, so `return keccak256(...)` and friends type-check.
+            // their type, so return keccak256(...) and friends type-check.
             Expr::FnCall { name, .. } if name == "keccak256" => {
                 Ok(Type::Primitive("u256".to_string()))
             }
@@ -1574,7 +1573,7 @@ impl TypeChecker {
                     return self.eval_super_call(method);
                 }
                 // Abi.encode(...) / Abi.encode_packed(...): a variadic builtin
-                // that hands back a Bytes, so it never resolves `Abi` as a value.
+                // that hands back a Bytes, so it never resolves Abi as a value.
                 if let Expr::Identifier(ns) = &**base {
                     if ns == "Abi" && matches!(method.as_str(), "encode" | "encode_packed") {
                         let packed = method == "encode_packed";
