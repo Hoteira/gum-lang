@@ -425,7 +425,8 @@ impl TypeChecker {
     }
 
     // Whether the codecs can carry t as an array element or a struct field: a scalar, a payload-free enum, a struct of those, or an array of any of them to any depth.
-    // String and Bytes are deliberately absent. They are dynamic and would need an element codec that does not exist yet, so string[] stays rejected rather than silently mis-encoded.
+    // String and Bytes are carried as array elements (string[], [String; N], [[String]]) via the dynamic-element codec (gum_abi_str_cd/mem/put/size).
+    // They are still not admitted as a struct *field*: a dynamic tuple field needs the head/tail struct codec, which is separate and not built yet (see the struct-field check below).
     pub fn abi_elem_ok(&self, t: &Type) -> bool {
         if self.is_scalar_enum(t) {
             return true;
@@ -437,7 +438,7 @@ impl TypeChecker {
                     n.as_str(),
                     "u8" | "u16" | "u32" | "u64" | "u128" | "u256"
                         | "i8" | "i16" | "i32" | "i64" | "i128" | "i256"
-                        | "bool" | "Account"
+                        | "bool" | "Account" | "String" | "Bytes"
                 ) {
                     return true;
                 }
@@ -735,7 +736,12 @@ impl TypeChecker {
                         Type::Generic { name, args } if name == "HashMap" => {
                             if let Some(v) = args.get(1) {
                                 let nested_map = matches!(v, Type::Generic { name, .. } if name == "HashMap");
-                                if !nested_map && !self.storage_elem_ok(v) {
+                                // A String/Bytes value gets its own slot region at
+                                // keccak256(key ‖ p), exactly like Solidity's
+                                // mapping(K => string): the value slot is the string's
+                                // base slot, so no extra reservation is needed.
+                                let dynamic_str = matches!(v, Type::Primitive(n) if n == "String" || n == "Bytes");
+                                if !nested_map && !dynamic_str && !self.storage_elem_ok(v) {
                                     errors.push(bad("a mapping value", v));
                                 }
                             }

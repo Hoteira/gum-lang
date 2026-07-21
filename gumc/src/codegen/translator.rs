@@ -734,6 +734,57 @@ fn gum_abi_str_mem_helper_src() -> String {
     .to_string()
 }
 
+// The String/Bytes element codec, exposing the same cd/mem/put/size signatures
+// every ABI type has so the dynamic-array wrappers (abi_dynarr_*) can carry a
+// String element the way they already carry a nested array. `mem` above is the
+// same helper a top-level string argument uses; these three are its calldata,
+// encode and size counterparts. A String value in memory is a header word
+// holding its length in the high 8 bytes, then its bytes (gum_str_len reads it).
+
+// calldata -> a fresh memory String, mirroring gum_abi_str_mem against calldata.
+fn gum_abi_str_cd_helper_src() -> String {
+    "function gum_abi_str_cd(off) -> ptr {\n\
+     \x20   if gt(add(off, 32), calldatasize()) { revert(0, 0) }\n\
+     \x20   let len := calldataload(off)\n\
+     \x20   if gt(add(add(off, 32), len), calldatasize()) { revert(0, 0) }\n\
+     \x20   ptr := allocate_memory(add(32, len))\n\
+     \x20   mstore(ptr, shl(192, len))\n\
+     \x20   calldatacopy(add(ptr, 32), add(off, 32), len)\n\
+     }\n"
+    .to_string()
+}
+
+// memory String -> ABI at dst: the length word, then the bytes, the final
+// partial word masked so the tail padding is zero exactly as Solidity emits it.
+// Returns the bytes written (32 + len rounded up to a word).
+fn gum_abi_str_put_helper_src() -> String {
+    "function gum_abi_str_put(dst, ptr) -> written {\n\
+     \x20   let len := shr(192, mload(ptr))\n\
+     \x20   mstore(dst, len)\n\
+     \x20   let full := div(len, 32)\n\
+     \x20   let i := 0\n\
+     \x20   for {} lt(i, full) { i := add(i, 1) } {\n\
+     \x20       mstore(add(add(dst, 32), mul(i, 32)), mload(add(add(ptr, 32), mul(i, 32))))\n\
+     \x20   }\n\
+     \x20   let rem := mod(len, 32)\n\
+     \x20   if rem {\n\
+     \x20       let lw := and(mload(add(add(ptr, 32), mul(full, 32))), not(shr(mul(8, rem), not(0))))\n\
+     \x20       mstore(add(add(dst, 32), mul(full, 32)), lw)\n\
+     \x20   }\n\
+     \x20   written := add(32, and(add(len, 31), not(31)))\n\
+     }\n"
+    .to_string()
+}
+
+// The ABI byte size of a memory String: the length word plus its bytes rounded
+// up to a whole word, which is what the offset table above it must budget.
+fn gum_abi_str_size_helper_src() -> String {
+    "function gum_abi_str_size(ptr) -> sz {\n\
+     \x20   sz := add(32, and(add(shr(192, mload(ptr)), 31), not(31)))\n\
+     }\n"
+    .to_string()
+}
+
 // An array of static structs: [count][elem0 words][elem1 words]... with the elements inline, since a static tuple carries no offset of its own.
 fn abi_starr_cd_helper_src(fname: &str, st_cd: &str, wire: usize, packed: usize) -> String {
     format!(
@@ -1866,6 +1917,10 @@ impl<'a> Translator<'a> {
 
     // The four ensure_abi_ below give every ABI type the same four codec signatures: cd(off), mem(base, off, limit), put(dst, ptr) -> written, size(ptr).
     pub fn ensure_abi_cd(&self, t: &Type) -> Option<String> {
+        if is_str_type(t) {
+            self.ensure_helper("gum_abi_str_cd", gum_abi_str_cd_helper_src);
+            return Some("gum_abi_str_cd".to_string());
+        }
         if let Some(sn) = self.abi_struct_elem(t) {
             return self.ensure_abi_struct_arr_cd(&sn);
         }
@@ -1919,6 +1974,10 @@ impl<'a> Translator<'a> {
     }
 
     pub fn ensure_abi_mem(&self, t: &Type) -> Option<String> {
+        if is_str_type(t) {
+            self.ensure_helper("gum_abi_str_mem", gum_abi_str_mem_helper_src);
+            return Some("gum_abi_str_mem".to_string());
+        }
         if let Some(sn) = self.abi_struct_elem(t) {
             return self.ensure_abi_struct_arr_mem(&sn);
         }
@@ -1972,6 +2031,11 @@ impl<'a> Translator<'a> {
 
     // Returns the put and size helper names together, since a caller that encodes a value always has to measure it first to lay out the head.
     pub fn ensure_abi_put(&self, t: &Type) -> Option<(String, String)> {
+        if is_str_type(t) {
+            self.ensure_helper("gum_abi_str_put", gum_abi_str_put_helper_src);
+            self.ensure_helper("gum_abi_str_size", gum_abi_str_size_helper_src);
+            return Some(("gum_abi_str_put".to_string(), "gum_abi_str_size".to_string()));
+        }
         if let Some(sn) = self.abi_struct_elem(t) {
             return self.ensure_abi_struct_arr_put(&sn);
         }
@@ -2257,13 +2321,28 @@ impl<'a> Translator<'a> {
                                 if let Some(base_slot) = self.hashmap_base_slot_expr(base, ctx) {
                                     let idx = self.translate_expr(index, ctx);
                                     let tr = self.hashmap_transient(base, ctx);
-                                    return format!(
-                                        "{}(gum_hash_slot({}, {}), {})\n",
-                                        st_op(tr),
-                                        idx,
-                                        base_slot,
-                                        val_expr
-                                    );
+                                    let slot = format!("gum_hash_slot({}, {})", idx, base_slot);
+                                    // A String/Bytes value writes through the storage-string
+                                    // helper into its own slot region, the value slot being
+                                    // its base, exactly as a top-level string field does.
+                                    if is_str_type(&targs[1]) {
+                                        self.ensure_helper("gum_str_len", gum_str_len_helper_src);
+                                        self.ensure_helper(
+                                            "gum_sstr_base",
+                                            gum_sstr_base_helper_src,
+                                        );
+                                        self.ensure_helper(
+                                            &format!("gum_sstr_store{}", kind_suffix(tr)),
+                                            || gum_sstr_store_helper_src(tr),
+                                        );
+                                        return format!(
+                                            "gum_sstr_store{}({}, {})\n",
+                                            kind_suffix(tr),
+                                            slot,
+                                            val_expr
+                                        );
+                                    }
+                                    return format!("{}({}, {})\n", st_op(tr), slot, val_expr);
                                 }
                             }
                         }
@@ -2996,7 +3075,7 @@ impl<'a> Translator<'a> {
                         return n.to_string();
                     }
                     if let Type::Array(inner) = self.static_type(base, ctx) {
-                        let esz = self.layout_engine.size_of(&inner).max(1);
+                        let esz = self.mem_elem_stride(&inner).max(1);
                         let b = self.translate_expr(base, ctx);
                         return format!("div(mload({}), {})", b, esz);
                     }
@@ -3041,6 +3120,16 @@ impl<'a> Translator<'a> {
                                 return slot;
                             }
                             let tr = self.hashmap_transient(base, ctx);
+                            // A String/Bytes value loads into a fresh memory String
+                            // from its own slot region, the value slot being its base.
+                            if is_str_type(&targs[1]) {
+                                self.ensure_helper("gum_sstr_base", gum_sstr_base_helper_src);
+                                self.ensure_helper(
+                                    &format!("gum_sstr_load{}", kind_suffix(tr)),
+                                    || gum_sstr_load_helper_src(tr),
+                                );
+                                return format!("gum_sstr_load{}({})", kind_suffix(tr), slot);
+                            }
                             return format!("{}({})", ld_op(tr), slot);
                         }
                     }
@@ -3624,6 +3713,37 @@ impl<'a> Translator<'a> {
                 let inner_slot = self.hashmap_base_slot_expr(inner, ctx)?;
                 let key_expr = self.translate_expr(key, ctx);
                 return Some(format!("gum_hash_slot({}, {})", key_expr, inner_slot));
+            }
+        }
+        None
+    }
+
+    // For `m[k]` or `m.get(k)` on a HashMap, returns the value's storage slot as
+    // a runtime Yul expression (`keccak256(k ‖ p)`), its value type, and whether
+    // the mapping is transient. This is Solidity's mapping value slot, and it
+    // doubles as the base slot for a dynamic value (a `String`/`Bytes` stores its
+    // length/data from here exactly as a top-level string field does), which is
+    // what lets a `HashMap(K, String)` reuse the storage-string helpers.
+    fn hashmap_entry_slot(&self, base: &Expr, ctx: &Ctx) -> Option<(String, Type, bool)> {
+        let (map, key): (&Expr, &Expr) = match base {
+            Expr::IndexAccess { base: m, index } => (m, index),
+            Expr::MethodCall {
+                base: m,
+                method,
+                args,
+            } if method == "get" && !args.is_empty() => (m, &args[0]),
+            _ => return None,
+        };
+        if let Type::Generic { name, args: targs } = self.static_type(map, ctx) {
+            if name == "HashMap" && targs.len() == 2 {
+                let base_slot = self.hashmap_base_slot_expr(map, ctx)?;
+                let key_expr = self.translate_expr(key, ctx);
+                let tr = self.hashmap_transient(map, ctx);
+                return Some((
+                    format!("gum_hash_slot({}, {})", key_expr, base_slot),
+                    targs[1].clone(),
+                    tr,
+                ));
             }
         }
         None
@@ -4270,7 +4390,16 @@ impl<'a> Translator<'a> {
                         let slot = format!("gum_hash_slot({}, {})", key_expr, base_slot);
                         let value_is_map = matches!(&type_args[1], Type::Generic { name, .. } if name == "HashMap");
                         let tr = self.hashmap_transient(base, ctx);
+                        let value_is_str = is_str_type(&type_args[1]);
                         if method == "get" {
+                            if value_is_str {
+                                self.ensure_helper("gum_sstr_base", gum_sstr_base_helper_src);
+                                self.ensure_helper(
+                                    &format!("gum_sstr_load{}", kind_suffix(tr)),
+                                    || gum_sstr_load_helper_src(tr),
+                                );
+                                return format!("gum_sstr_load{}({})", kind_suffix(tr), slot);
+                            }
                             return if value_is_map {
                                 slot
                             } else {
@@ -4278,6 +4407,20 @@ impl<'a> Translator<'a> {
                             };
                         } else if let Some(value_arg) = args.get(1) {
                             let val_expr = self.translate_expr(value_arg, ctx);
+                            if value_is_str {
+                                self.ensure_helper("gum_str_len", gum_str_len_helper_src);
+                                self.ensure_helper("gum_sstr_base", gum_sstr_base_helper_src);
+                                self.ensure_helper(
+                                    &format!("gum_sstr_store{}", kind_suffix(tr)),
+                                    || gum_sstr_store_helper_src(tr),
+                                );
+                                return format!(
+                                    "gum_sstr_store{}({}, {})",
+                                    kind_suffix(tr),
+                                    slot,
+                                    val_expr
+                                );
+                            }
                             return format!("{}({}, {})", st_op(tr), slot, val_expr);
                         }
                     }
@@ -4403,10 +4546,22 @@ impl<'a> Translator<'a> {
         matches!(t, Type::FixedArray(..)) || is_struct_type(self.type_checker(), t)
     }
 
+    // The width of one element slot in a memory array. A String/Bytes element is
+    // stored as a pointer to its own memory block (like a nested array), so it
+    // occupies a full 32-byte slot, not its packed scalar size. size_of already
+    // reports 32 for a nested-array element; only String/Bytes need the override.
+    fn mem_elem_stride(&self, inner: &Type) -> usize {
+        if is_str_type(inner) {
+            32
+        } else {
+            self.layout_engine.size_of(inner)
+        }
+    }
+
     fn array_elem_info(&self, base: &Expr, ctx: &Ctx) -> (bool, usize) {
         match self.static_type(base, ctx) {
-            Type::Array(inner) => (true, self.layout_engine.size_of(&inner)),
-            Type::FixedArray(inner, _) => (false, self.layout_engine.size_of(&inner)),
+            Type::Array(inner) => (true, self.mem_elem_stride(&inner)),
+            Type::FixedArray(inner, _) => (false, self.mem_elem_stride(&inner)),
             _ => (false, 32),
         }
     }
@@ -4548,6 +4703,18 @@ impl<'a> Translator<'a> {
     }
 
     fn translate_delete(&self, target: &Expr, ctx: &Ctx) -> String {
+        // delete m[k] where the value is a String/Bytes: release its slot region
+        // (the long form's data slots) then zero the value slot, exactly as a
+        // top-level string field's delete does.
+        if let Some((slot, vty, tr)) = self.hashmap_entry_slot(target, ctx) {
+            if is_str_type(&vty) {
+                self.ensure_helper("gum_sstr_base", gum_sstr_base_helper_src);
+                self.ensure_helper(&format!("gum_sstr_clear{}", kind_suffix(tr)), || {
+                    gum_sstr_clear_helper_src(tr)
+                });
+                return format!("gum_sstr_clear{}({})\n", kind_suffix(tr), slot);
+            }
+        }
         if let Some((len_slot, elem_size, tr)) = self.dyn_storage_array(target, ctx) {
             let (per, es) = pack_params(elem_size);
             self.ensure_helper("arr_data_base", arr_data_base_helper_src);

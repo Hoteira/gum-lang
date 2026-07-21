@@ -85,6 +85,45 @@ fn member_errors(src: &str, span: (usize, usize)) -> Option<Vec<String>> {
     for (s, e) in top_level_spans(&src[body_start..body_end]) {
         let text = padded(src, body_start + s, body_start + e);
         if let Err(err) = GumParser::parse(Rule::member_unit, &text) {
+            // A member that fails to parse is usually a function whose body has a
+            // bad statement. Split it one level deeper, into statements, so two
+            // broken statements in the same function both surface. If that finds
+            // nothing (a bad signature, or a malformed field with no body), fall
+            // back to the member-level error, which points at the real spot.
+            match statement_errors(src, (body_start + s, body_start + e)) {
+                Some(stmt_errors) => errors.extend(stmt_errors),
+                None => errors.push(format!("Syntax Error: {}", err)),
+            }
+        }
+    }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors)
+    }
+}
+
+// When a function member fails to parse, locate the failure per statement.
+//
+// Only a function has a statement body, and it is the brace block after its
+// signature. A field (or any bodyless member) has no `{`, so `find('{')?`
+// returns None here and the caller keeps the member-level error. This is the
+// third and last level of recovery: file -> declaration (parse_program) ->
+// member (member_errors) -> statement (here).
+fn statement_errors(src: &str, span: (usize, usize)) -> Option<Vec<String>> {
+    let (start, end) = span;
+    let chunk = &src[start..end];
+    let open = chunk.find('{')?;
+    let close = chunk.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    let body_start = start + open + 1;
+    let body_end = start + close;
+    let mut errors = Vec::new();
+    for (s, e) in top_level_spans(&src[body_start..body_end]) {
+        let text = padded(src, body_start + s, body_start + e);
+        if let Err(err) = GumParser::parse(Rule::statement_unit, &text) {
             errors.push(format!("Syntax Error: {}", err));
         }
     }

@@ -147,6 +147,30 @@ contract Vault:
 
 This is exactly Solidity's `mapping(address => Stake)` storage.
 
+### String / Bytes-valued mappings
+
+When `V` is `String` or `Bytes`, `map[k]`'s value slot `keccak256(k ‖ p)`
+doubles as the **base slot of a storage string** in its own right: the exact
+short/long encoding described under [Storage strings](#storage-strings-string--bytes)
+applies, with that value slot standing in for the field slot. A short value
+(≤ 31 bytes) packs inline at `keccak256(k ‖ p)`; a long value keeps its length
+there and its data at `keccak256(keccak256(k ‖ p))`.
+
+```
+contract Names:
+    HashMap(Account, String) names   # slot p
+
+# names[who]  short → packed inline at keccak256(who ‖ p)
+# names[who]  long  → length at keccak256(who ‖ p),
+#                     data from keccak256(keccak256(who ‖ p))
+```
+
+This is exactly Solidity's `mapping(address => string)` storage, and is verified
+slot-for-slot against Solidity (header slot, data region, round-trip read, key
+isolation, and `delete`) by `mapping_string_value_matches_solidity`. A dynamic
+*array* value (`HashMap(K, [T])`) would likewise need a per-key region but is not
+yet implemented.
+
 ---
 
 ## Arrays

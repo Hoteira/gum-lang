@@ -214,3 +214,8 @@ decl_unit = { SOI ~ declaration ~ EOI }
 // declaration, so recovery has to go one level deeper than decl_unit or a
 // typical file would only ever report its first error.
 member_unit = { SOI ~ (fn_decl | class_field) ~ EOI }
+// One statement of a function body, parsed on its own. Recovery goes one level
+// deeper again than member_unit: when a member is a function whose body fails to
+// parse, its statements are split apart and parsed individually, so two broken
+// statements in the same function are both reported rather than only the first.
+statement_unit = { SOI ~ statement ~ EOI }

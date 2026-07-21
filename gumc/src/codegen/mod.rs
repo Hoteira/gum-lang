@@ -342,10 +342,17 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
         let mut base_locals: HashSet<String> =
             m.parameters.iter().map(|p| p.name.clone()).collect();
         collect_var_decls(&m.body, &mut base_locals);
+        // Explicitly-typed locals the method declares, so a try body that reads
+        // one can marshal it into the thunk the same way a parameter is. An
+        // inferred `var` local is absent here (this pass runs before type
+        // inference), so a body capturing one stays on the old inline path.
+        let mut local_types: HashMap<String, Type> = HashMap::new();
+        collect_var_types(&m.body, &mut local_types);
         let enclosing = EnclosingFn {
             params: m.parameters.clone(),
             return_type: m.return_type.clone(),
             is_entry: is_selector_entry(m),
+            local_types,
         };
         hoist_in_body(&mut m.body, &base_locals, &enclosing, &mut thunks, &mut counter);
     }
@@ -354,11 +361,12 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
 }
 
 // What the try-hoisting pass needs to know about the function a try sits in, to
-// marshal captured parameters and propagate a return out of the frame.
+// marshal captured parameters and locals and propagate a return out of the frame.
 struct EnclosingFn {
     params: Vec<Parameter>,
     return_type: Option<Type>,
     is_entry: bool,
+    local_types: HashMap<String, Type>,
 }
 
 fn hoist_in_body(
@@ -377,43 +385,65 @@ fn hoist_in_body(
 // enclosing parameters it captures. A body that reads an outer local that is not
 // a parameter, or that returns from a function we can't propagate out of, stays
 // on the existing external-call path (returns None).
-fn plan_capture<'a>(
+fn plan_capture(
     try_body: &[Spanned<Statement>],
     base_locals: &HashSet<String>,
-    enclosing: &'a EnclosingFn,
-) -> Option<Capture<'a>> {
+    enclosing: &EnclosingFn,
+) -> Option<Capture> {
     let mut inner: HashSet<String> = HashSet::new();
     collect_var_decls(try_body, &mut inner);
     let mut refs: HashSet<String> = HashSet::new();
     body_idents(try_body, &mut refs);
 
-    let param_names: HashSet<&String> = enclosing.params.iter().map(|p| &p.name).collect();
     // Outer names the body reads: base locals it references without re-binding.
-    let captured: Vec<&String> = refs
+    let captured: HashSet<&String> = refs
         .iter()
         .filter(|r| base_locals.contains(*r) && !inner.contains(*r))
         .collect();
-    // Any captured name that is not a parameter is an outer local; marshalling
-    // those is not supported yet, so leave the try on the old path.
-    if captured.iter().any(|r| !param_names.contains(*r)) {
-        return None;
-    }
 
-    // Params the body reassigns. Their new value has to travel back out of the
-    // frame (write-back), which is supported for exactly one simple value-typed
+    // Resolve every captured name to a type and marshal it into the frame. A
+    // parameter's type comes from the signature; an enclosing local's from its
+    // explicit declaration. A captured name with no type here is an inferred
+    // `var` (or a loop/match binding) this pass can't marshal, so the whole try
+    // stays on the old inline path. Params keep signature order and locals sort
+    // by name, so the site, the thunk and the selector agree and the emitted
+    // bytecode stays reproducible.
+    let param_names: HashSet<&String> = enclosing.params.iter().map(|p| &p.name).collect();
+    let mut captures: Vec<Parameter> = enclosing
+        .params
+        .iter()
+        .filter(|p| captured.contains(&p.name))
+        .map(|p| Parameter { is_mut: false, type_def: p.type_def.clone(), name: p.name.clone() })
+        .collect();
+    let mut local_caps: Vec<Parameter> = Vec::new();
+    for name in &captured {
+        if param_names.contains(*name) {
+            continue;
+        }
+        match enclosing.local_types.get(*name) {
+            Some(t) => local_caps.push(Parameter {
+                is_mut: false,
+                type_def: t.clone(),
+                name: (*name).clone(),
+            }),
+            None => return None,
+        }
+    }
+    local_caps.sort_by(|a, b| a.name.cmp(&b.name));
+    captures.extend(local_caps);
+
+    // A captured variable the body reassigns has its new value travel back out
+    // of the frame (write-back), supported for exactly one simple value-typed
     // variable; anything else stays on the old inline path for now.
     let mut assigned: HashSet<String> = HashSet::new();
     collect_assigned_idents(try_body, &mut assigned);
-    let mutated: Vec<&Parameter> = enclosing
-        .params
-        .iter()
-        .filter(|p| assigned.contains(&p.name) && captured.contains(&&p.name))
-        .collect();
+    let mutated: Vec<&Parameter> =
+        captures.iter().filter(|c| assigned.contains(&c.name)).collect();
     let has_ret = body_has_return(try_body);
     let writeback: Option<(String, Type)> = match mutated.as_slice() {
         [] => None,
-        [p] if !has_ret && is_simple_value_type(&p.type_def) => {
-            Some((p.name.clone(), p.type_def.clone()))
+        [c] if !has_ret && is_simple_value_type(&c.type_def) => {
+            Some((c.name.clone(), c.type_def.clone()))
         }
         // Multiple mutations, a reference-typed mutation, or a mutation combined
         // with a return: not yet marshalled, so keep the old inline path.
@@ -427,21 +457,14 @@ fn plan_capture<'a>(
         return None;
     }
 
-    // Capture the parameters the body reads, in the enclosing signature's order
-    // so the site and the thunk agree on the ABI.
-    let captured_set: HashSet<&&String> = captured.iter().collect();
-    let params: Vec<&Parameter> = enclosing
-        .params
-        .iter()
-        .filter(|p| captured_set.contains(&&&p.name))
-        .collect();
-    Some(Capture { params, has_ret, writeback })
+    Some(Capture { captures, has_ret, writeback })
 }
 
-// The outcome of planning a try body's capture: which params to marshal in,
-// whether a return propagates out, and an optional single variable to write back.
-struct Capture<'a> {
-    params: Vec<&'a Parameter>,
+// The outcome of planning a try body's capture: which variables to marshal in
+// (parameters and explicitly-typed locals), whether a return propagates out, and
+// an optional single variable to write back.
+struct Capture {
+    captures: Vec<Parameter>,
     has_ret: bool,
     writeback: Option<(String, Type)>,
 }
@@ -487,7 +510,7 @@ fn hoist_in_stmt(
             // Hoist any nested trys in both branches first.
             hoist_in_body(try_body, base_locals, enclosing, thunks, counter);
             hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
-            let Capture { params, has_ret, writeback } =
+            let Capture { captures, has_ret, writeback } =
                 match plan_capture(try_body, base_locals, enclosing) {
                     Some(p) => p,
                     None => return, // leave on the existing path
@@ -513,7 +536,7 @@ fn hoist_in_stmt(
                 });
             }
             let args: Vec<(String, Type)> =
-                params.iter().map(|p| (p.name.clone(), p.type_def.clone())).collect();
+                captures.iter().map(|p| (p.name.clone(), p.type_def.clone())).collect();
             // A returning body encodes through the enclosing return type; a
             // write-back encodes through the mutated variable's type.
             let thunk_ret = if has_ret {
@@ -525,7 +548,7 @@ fn hoist_in_stmt(
                 modifiers: vec!["export".to_string()],
                 attributes: vec!["TryThunk".to_string()],
                 name: thunk_name.clone(),
-                parameters: params
+                parameters: captures
                     .iter()
                     .map(|p| Parameter { is_mut: false, type_def: p.type_def.clone(), name: p.name.clone() })
                     .collect(),
@@ -545,6 +568,44 @@ fn hoist_in_stmt(
             hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
         }
         _ => {}
+    }
+}
+
+// Explicitly-typed locals a body declares, recursively through nested blocks.
+// An inferred `var` (type_def is the `_infer`/`unknown` sentinel) is skipped:
+// its type is only known after inference, which this pass runs before, so a try
+// capturing one can't be marshalled and stays on the old inline path. Loop
+// iterators and match payloads are likewise skipped (no declared type here).
+fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type>) {
+    for s in body {
+        match &s.node {
+            Statement::VarDecl { name, type_def, .. } => {
+                let unknown = matches!(type_def, Type::Primitive(n) if n == "_infer" || n == "unknown");
+                if !unknown {
+                    out.insert(name.clone(), type_def.clone());
+                }
+            }
+            Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => {
+                collect_var_types(body, out)
+            }
+            Statement::IfElse { if_body, else_body, .. } => {
+                collect_var_types(if_body, out);
+                if let Some(e) = else_body {
+                    collect_var_types(e, out);
+                }
+            }
+            Statement::Match { arms, .. } => {
+                for a in arms {
+                    collect_var_types(&a.body, out);
+                }
+            }
+            Statement::TryCatch { try_body, catch_body } => {
+                collect_var_types(try_body, out);
+                collect_var_types(catch_body, out);
+            }
+            Statement::ScopedTryCall { catch_body, .. } => collect_var_types(catch_body, out),
+            _ => {}
+        }
     }
 }
 
@@ -614,7 +675,14 @@ fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String
                 collect_assigned_idents(try_body, out);
                 collect_assigned_idents(catch_body, out);
             }
-            Statement::ScopedTryCall { catch_body, .. } => collect_assigned_idents(catch_body, out),
+            // A hoisted inner try writes its mutated variable back into this
+            // frame, so it counts as an assignment here too.
+            Statement::ScopedTryCall { writeback, catch_body, .. } => {
+                if let Some((n, _)) = writeback {
+                    out.insert(n.clone());
+                }
+                collect_assigned_idents(catch_body, out);
+            }
             _ => {}
         }
     }
@@ -631,6 +699,11 @@ fn body_has_return(body: &[Spanned<Statement>]) -> bool {
         Statement::Match { arms, .. } => arms.iter().any(|a| body_has_return(&a.body)),
         Statement::TryCatch { try_body, catch_body } => {
             body_has_return(try_body) || body_has_return(catch_body)
+        }
+        // A hoisted inner try that propagates a return forwards it out of this
+        // frame too, so the enclosing try must treat its body as returning.
+        Statement::ScopedTryCall { propagate_return, catch_body, .. } => {
+            *propagate_return || body_has_return(catch_body)
         }
         _ => false,
     })
@@ -702,7 +775,19 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
             body_idents(try_body, out);
             body_idents(catch_body, out);
         }
-        Statement::ScopedTryCall { catch_body, .. } => body_idents(catch_body, out),
+        // A hoisted inner try reads its captured args and writes back its mutated
+        // variable in the enclosing frame, so an outer try around it must capture
+        // those names too — otherwise the outer thunk references a variable it was
+        // never handed. (The inner body itself is gone into its own thunk.)
+        Statement::ScopedTryCall { args, writeback, catch_body, .. } => {
+            for (n, _) in args {
+                out.insert(n.clone());
+            }
+            if let Some((n, _)) = writeback {
+                out.insert(n.clone());
+            }
+            body_idents(catch_body, out);
+        }
         Statement::UnsafeBlock(_) => {}
     }
 }

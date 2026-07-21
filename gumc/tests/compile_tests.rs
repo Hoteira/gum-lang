@@ -1630,6 +1630,30 @@ fn every_broken_function_in_a_contract_is_reported_not_just_the_first() {
 }
 
 #[test]
+fn every_broken_statement_in_one_function_is_reported_not_just_the_first() {
+    // Recovery goes a level deeper than the member: two malformed statements in
+    // the same function body are both reported. pest alone would stop at the
+    // first (line 3) and never reach the second (line 5).
+    let src = "contract C:\n    export fn f(u256 a) -> u256:\n        retrn a\n        mut u256 r = 0\n        r = r @@ 1\n        return r\n";
+    let (ok, output) = run_gumc(src);
+    assert!(!ok, "expected failure, got:\n{}", output);
+    assert!(output.contains("2 syntax errors found"), "expected both statement errors, got:\n{}", output);
+    assert!(output.contains("--> 3:"), "first error should be on line 3, got:\n{}", output);
+    assert!(output.contains("--> 5:"), "second error should be on line 5, got:\n{}", output);
+}
+
+#[test]
+fn a_bad_statement_and_a_bad_signature_still_leave_valid_functions_alone() {
+    // A function with a broken statement (line 3) sits beside a wholly valid
+    // one; only the broken statement is reported, and the good function compiles.
+    let src = "contract C:\n    export fn bad() -> u256:\n        return @\n\n    export fn good() -> u256:\n        return 1\n";
+    let (ok, output) = run_gumc(src);
+    assert!(!ok, "expected failure, got:\n{}", output);
+    assert!(output.contains("1 syntax error"), "expected exactly one error, got:\n{}", output);
+    assert!(output.contains("--> 3:"), "error should be on line 3, got:\n{}", output);
+}
+
+#[test]
 fn a_broken_declaration_does_not_hide_a_later_one_of_a_different_kind() {
     // A malformed fn and a malformed contract body: different declaration
     // rules, both reported.
@@ -1988,7 +2012,6 @@ fn a_dynamic_value_inside_a_storage_aggregate_is_rejected() {
     assert_compile_fails("contract C:\n    [[u256]; 2] g\n\n    export fn f() -> u256:\n        return 1\n");
     assert_compile_fails("use gum.defaults.String\n\ncontract C:\n    [String] g\n\n    export fn f() -> u256:\n        return 1\n");
     assert_compile_fails("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, [u256]) m\n\n    export fn f() -> u256:\n        return 1\n");
-    assert_compile_fails("use gum.defaults.Account\nuse gum.defaults.String\n\ncontract C:\n    HashMap(Account, String) m\n\n    export fn f() -> u256:\n        return 1\n");
     // Storage is only a contract's own fields, so the same type as a parameter is untouched.
     assert_compiles("contract C:\n    export fn f([[u256]] xs) -> u256:\n        return xs[0][0]\n");
     // And what has a real layout still has one.
@@ -1996,12 +2019,25 @@ fn a_dynamic_value_inside_a_storage_aggregate_is_rejected() {
     assert_compiles("class P:\n    u256 x\n\ncontract C:\n    [P] xs\n\n    export fn f(u256 i) -> u256:\n        return C.xs[i].x\n");
     assert_compiles("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, HashMap(Account, u256)) m\n\n    export fn f(Account a, Account b) -> u256:\n        return C.m[a][b]\n");
     assert_compiles("contract C:\n    [u256] xs\n\n    export fn f(u256 i) -> u256:\n        return C.xs[i]\n");
+    // A String/Bytes mapping value gets its own slot region at keccak256(key ‖ p),
+    // exactly like Solidity's mapping(K => string), so it does have a layout.
+    assert_compiles("use gum.defaults.Account\nuse gum.defaults.String\n\ncontract C:\n    HashMap(Account, String) m\n\n    export fn f(Account a, String s):\n        C.m[a] = s\n\n    export fn g(Account a) -> String:\n        return C.m[a]\n");
 }
 
 #[test]
-fn a_dynamic_element_the_codecs_cannot_carry_is_still_rejected() {
-    // String is dynamic and has no element codec, so string[] must be refused rather than encoded as its memory pointer.
-    assert_compile_fails("use gum.defaults.String\n\ncontract C:\n    export fn f([String] xs) -> u256:\n        return 1\n");
+fn a_string_array_across_the_abi_is_accepted() {
+    // String has a dynamic-element codec now (gum_abi_str_cd/mem/put/size), so
+    // string[] rides the wire like any other dynamic-element array, and nests.
+    assert_compiles("use gum.defaults.String\n\ncontract C:\n    export fn f([String] xs) -> [String]:\n        return xs\n");
+    assert_compiles("use gum.defaults.String\n\ncontract C:\n    export fn f([String] xs) -> String:\n        return xs[0]\n");
+    assert_compiles("use gum.defaults.String\n\ncontract C:\n    export fn f([[String]] xs) -> u256:\n        return xs.length\n");
+}
+
+#[test]
+fn a_dynamic_struct_field_across_the_abi_is_still_rejected() {
+    // A struct with a String field is a dynamic tuple, which needs the head/tail
+    // struct codec (not built yet); it must be refused, not mis-encoded.
+    assert_compile_fails("use gum.defaults.String\n\nclass P:\n    u256 id\n    String name\n\ncontract C:\n    export fn f() -> P:\n        var p = new P(1, \"a\")\n        return p\n");
 }
 
 #[test]

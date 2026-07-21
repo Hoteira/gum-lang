@@ -4357,6 +4357,229 @@ fn storage_string_layout_matches_solidity() {
     assert_eq!(storage(&mut gdb, gaddr, 1), storage(&mut sdb, saddr, 1), "supply slot differs");
 }
 
+// A String value in a mapping: HashMap(Account, String). The value lives at the
+// mapping value slot keccak256(key ‖ p), which doubles as the string's base slot
+// (short packed inline, long at keccak256(valueSlot)), exactly as Solidity lays
+// out mapping(address => string). Diffs the value slot, the data region, the
+// round-trip read, key isolation, and delete against a Solidity twin, across the
+// short/long boundary.
+#[test]
+fn mapping_string_value_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "contract Names:\n    HashMap(Account, String) names\n\n    \
+                   export fn set(Account who, String name):\n        Names.names[who] = name\n\n    \
+                   export fn get(Account who) -> String:\n        return Names.names[who]\n\n    \
+                   export fn clear(Account who):\n        delete Names.names[who]\n";
+    let sol_src = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract Names {\n    \
+                   mapping(address => string) names;\n    \
+                   function set(address who, string calldata name) external { names[who] = name; }\n    \
+                   function get(address who) external view returns (string memory) { return names[who]; }\n    \
+                   function clear(address who) external { delete names[who]; }\n}\n";
+
+    let gum = gum_creation_bytecode(gum_src, &solc, false);
+    let sol = sol_creation_bytecode(sol_src, &solc);
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+
+    // keccak256 over a value slot, for the long-string data region.
+    let str_data_base = |value_slot: U256| -> U256 {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut k = Keccak::v256();
+        let mut out = [0u8; 32];
+        k.update(&value_slot.to_be_bytes::<32>());
+        k.finalize(&mut out);
+        U256::from_be_bytes(out)
+    };
+
+    let alice = Address::from([0xa1u8; 20]);
+    let bob = Address::from([0xb0u8; 20]);
+
+    // Walk the short/long boundary, and shrink back down at the end so the
+    // long-form data slots must be released, exactly as the field case does.
+    let cases: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"Alice",
+        &[b'x'; 31], // longest short form
+        &[b'y'; 32], // first long form
+        &[b'z'; 100], // spans four data slots
+        b"short again",
+        b"",
+    ];
+
+    for name in cases {
+        let data = encode_abi("set(address,string)", &[Arg::Static(word_addr(alice)), Arg::Dyn(name)]);
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert!(g.success && s.success, "set failed for len {}", name.len());
+
+        // The mapping value slot (string header) must be identical.
+        let vslot = mapping_slot(alice, 0);
+        assert_eq!(
+            storage_at(&mut gdb, ga, vslot),
+            storage_at(&mut sdb, sa, vslot),
+            "value/header slot differs for len {}", name.len()
+        );
+        // ...and every data slot at keccak256(valueSlot), including any a longer
+        // previous value wrote that a shorter one must now have cleared.
+        let base = str_data_base(vslot);
+        for i in 0..5u64 {
+            let slot = base + U256::from(i);
+            assert_eq!(
+                storage_at(&mut gdb, ga, slot),
+                storage_at(&mut sdb, sa, slot),
+                "data slot {} differs for len {}", i, name.len()
+            );
+        }
+        // And the value must round-trip identically, and equal what we set.
+        let rd = encode_abi("get(address)", &[Arg::Static(word_addr(alice))]);
+        let g = call(&mut gdb, ga, rd.clone());
+        let s = call(&mut sdb, sa, rd);
+        assert!(g.success && s.success, "get failed for len {}", name.len());
+        assert_eq!(g.output, s.output, "get round-trip differs for len {}", name.len());
+        assert_eq!(g.output, abi_encode_string(name), "get must return the value we set");
+    }
+
+    // A second key must be independent: writing bob leaves alice untouched, and
+    // both slots match Solidity.
+    let bob_name: &[u8] = b"Bob the builder, a long enough name to go long-form for sure yes";
+    let data = encode_abi("set(address,string)", &[Arg::Static(word_addr(bob)), Arg::Dyn(bob_name)]);
+    assert!(call(&mut gdb, ga, data.clone()).success);
+    assert!(call(&mut sdb, sa, data).success);
+    for who in [alice, bob] {
+        let vslot = mapping_slot(who, 0);
+        assert_eq!(
+            storage_at(&mut gdb, ga, vslot),
+            storage_at(&mut sdb, sa, vslot),
+            "value slot differs for {:?}", who
+        );
+    }
+
+    // delete releases the slot region exactly as Solidity's delete does.
+    let del = encode_abi("clear(address)", &[Arg::Static(word_addr(bob))]);
+    assert!(call(&mut gdb, ga, del.clone()).success);
+    assert!(call(&mut sdb, sa, del).success);
+    let vslot = mapping_slot(bob, 0);
+    assert_eq!(storage_at(&mut gdb, ga, vslot), U256::ZERO, "value slot not cleared");
+    let base = str_data_base(vslot);
+    for i in 0..3u64 {
+        let slot = base + U256::from(i);
+        assert_eq!(
+            storage_at(&mut gdb, ga, slot),
+            storage_at(&mut sdb, sa, slot),
+            "data slot {} not released like Solidity", i
+        );
+    }
+}
+
+// A String element across the ABI: string[] as an argument and a return, plus
+// indexing one element out. gum decodes the calldata blob and re-encodes it
+// through the new String element codec (gum_abi_str_cd/put/size) wrapped by the
+// existing dynamic-array codec; feeding identical calldata to a Solidity twin
+// and diffing the output proves the decode+encode round-trips byte-for-byte.
+#[test]
+fn string_array_across_the_abi_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = "use gum.defaults.String\n\ncontract Strs:\n    \
+                   export fn echo([String] xs) -> [String]:\n        return xs\n\n    \
+                   export fn first([String] xs) -> String:\n        var s = xs[0]\n        return s\n\n    \
+                   export fn alen([String] xs) -> u256:\n        return xs.length\n\n    \
+                   export fn plen([String] xs) -> u256:\n        return xs[0].length\n";
+    let sol_src = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract Strs {\n    \
+                   function echo(string[] calldata xs) external pure returns (string[] memory) { return xs; }\n    \
+                   function first(string[] calldata xs) external pure returns (string memory) { return xs[0]; }\n    \
+                   function alen(string[] calldata xs) external pure returns (uint256) { return xs.length; }\n    \
+                   function plen(string[] calldata xs) external pure returns (uint256) { return bytes(xs[0]).length; }\n}\n";
+
+    let gum = gum_creation_bytecode(gum_src, &solc, false);
+    let sol = sol_creation_bytecode(sol_src, &solc);
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+
+    // Hand-encode a `string[]` as the single argument of `sig`, walking the
+    // short/long boundary so element widths and padding both get exercised.
+    let encode_str_arr = |sig: &str, items: &[&[u8]]| -> Vec<u8> {
+        let mut data = selector(sig).to_vec();
+        data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>()); // offset to the array
+        let n = items.len();
+        let mut table = Vec::new();
+        let mut tails = Vec::new();
+        let mut cur = n * 32; // offsets are measured from just after the count word
+        for it in items {
+            table.extend_from_slice(&U256::from(cur).to_be_bytes::<32>());
+            let mut e = Vec::new();
+            e.extend_from_slice(&U256::from(it.len()).to_be_bytes::<32>());
+            e.extend_from_slice(it);
+            let pad = (32 - (it.len() % 32)) % 32;
+            e.extend(std::iter::repeat(0u8).take(pad));
+            cur += e.len();
+            tails.extend_from_slice(&e);
+        }
+        data.extend_from_slice(&U256::from(n).to_be_bytes::<32>()); // count
+        data.extend_from_slice(&table);
+        data.extend_from_slice(&tails);
+        data
+    };
+
+    let cases: Vec<Vec<&[u8]>> = vec![
+        vec![],
+        vec![b"a"],
+        vec![b"", b"x"],
+        vec![b"Alice", &[b'y'; 32], b"", &[b'z'; 65]],
+        vec![&[b'w'; 31], &[b'v'; 33]],
+    ];
+
+    for items in &cases {
+        let data = encode_str_arr("echo(string[])", items);
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert_eq!(g.success, s.success, "echo success mismatch for {} items", items.len());
+        assert!(g.success, "echo reverted for {} items", items.len());
+        assert_eq!(g.output, s.output, "echo output differs for {} items", items.len());
+
+        // `xs.length` (memory array of pointer-sized String slots) must match.
+        let da = encode_str_arr("alen(string[])", items);
+        let g = call(&mut gdb, ga, da.clone());
+        let s = call(&mut sdb, sa, da);
+        assert_eq!(g.output, s.output, "xs.length differs for {} items", items.len());
+        assert_eq!(U256::from_be_slice(&g.output), U256::from(items.len()), "xs.length wrong");
+
+        if !items.is_empty() {
+            // `xs[0].length`: index one String element out, then read its length.
+            let dp = encode_str_arr("plen(string[])", items);
+            let g = call(&mut gdb, ga, dp.clone());
+            let s = call(&mut sdb, sa, dp);
+            assert_eq!(g.output, s.output, "xs[0].length differs");
+            assert_eq!(U256::from_be_slice(&g.output), U256::from(items[0].len()), "xs[0].length wrong");
+
+            // `return xs[0]`: index a String out and return it whole.
+            let data = encode_str_arr("first(string[])", items);
+            let g = call(&mut gdb, ga, data.clone());
+            let s = call(&mut sdb, sa, data);
+            assert_eq!(g.success, s.success, "first success mismatch");
+            assert!(g.success, "first reverted");
+            assert_eq!(g.output, s.output, "first output differs");
+            assert_eq!(g.output, abi_encode_string(items[0]), "first must return element 0");
+        }
+    }
+}
+
 #[test]
 fn const_fields_are_baked_in_per_deployment() {
     // Two deployments of the same creation code with different constructor
@@ -6224,4 +6447,95 @@ contract C:
     assert_eq!(U256::from_be_slice(&r.output), U256::from(99));
     let r = call(&mut db, c, selector("getmark()").to_vec());
     assert_eq!(U256::from_be_slice(&r.output), U256::from(1), "caught revert must roll back the write");
+}
+
+#[test]
+fn test_try_catch_captures_a_local_and_catches_internal_revert() {
+    // Same as the parameter case, but the try body captures an enclosing *local*
+    // (n, explicitly typed) rather than a parameter. That used to fall back to
+    // the external-call-only path and NOT catch the internal assert; now the
+    // local is marshalled into the frame like a parameter, so the assert is
+    // caught and the pre-assert storage write rolls back.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = r#"
+contract C:
+    u256 mark
+
+    export fn classify(u256 arg) -> u256:
+        u256 n = arg
+        C.mark = 1
+        try:
+            C.mark = 2
+            assert(n < 10, "too big")
+            return n
+        catch:
+            return 99
+
+    export fn getmark() -> u256:
+        return C.mark
+"#;
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    // arg = 5: the try succeeds, returns n, the write to 2 sticks.
+    let mut d = selector("classify(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 5; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success);
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(5), "captured local should reach the body");
+    let r = call(&mut db, c, selector("getmark()").to_vec());
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "success keeps the write");
+
+    // arg = 20: the assert reverts inside the try, is caught (returns 99), and
+    // the write to 2 rolls back to the pre-try 1 — proof the local took the
+    // internal-revert-catching path, not the old external-only one.
+    let mut d = selector("classify(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 20; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success, "internal revert must be caught with a captured local, not bubble out");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(99));
+    let r = call(&mut db, c, selector("getmark()").to_vec());
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(1), "caught revert must roll back the write");
+}
+
+#[test]
+fn test_nested_try_catches_at_each_level() {
+    // A try nested inside another try: the inner one catches an internal revert
+    // and its result propagates out, so the outer catch is never reached. Proves
+    // nested trys hoist and compose (each becomes its own guarded frame).
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = r#"
+contract C:
+    export fn f(u256 a) -> u256:
+        try:
+            try:
+                assert(a < 5, "inner")
+                return 1
+            catch:
+                return 2
+        catch:
+            return 3
+"#;
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    // a = 2: inner assert holds, inner try returns 1.
+    let mut d = selector("f(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 2; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success);
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(1), "inner success path");
+
+    // a = 9: inner assert reverts, inner catch returns 2 (outer catch untouched).
+    let mut d = selector("f(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 9; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success, "inner internal revert must be caught by the inner catch");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "inner catch path");
 }
