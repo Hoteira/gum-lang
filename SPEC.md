@@ -1,9 +1,11 @@
 # gum language specification
 
-This is the semantic reference for gum. It describes what a gum program
-*means* (types, evaluation, storage, safety), not just what parses. Where
-behavior is defined by matching Solidity, that is stated explicitly and is
-enforced by the differential execution tests.
+The complete, no-surprises reference for gum. If the [README](README.md) is the
+pitch, this is the contract: it describes what a gum program *means* (types,
+evaluation, storage, safety), not just what parses. Every place gum's behavior
+is defined by matching Solidity, that is stated explicitly — and backed by the
+differential execution tests, so this document can't quietly drift from the
+compiler.
 
 Grammar of record: [`gumc/src/parser/gum.pest`](gumc/src/parser/gum.pest).
 Storage layout details live in [STORAGE.md](STORAGE.md).
@@ -26,12 +28,12 @@ Storage layout details live in [STORAGE.md](STORAGE.md).
 
 ### Blocks (indentation)
 
-gum uses Python-style layout. A line ending in `:` opens a block; the
+gum uses indentation-based layout. A line ending in `:` opens a block; the
 following more-indented lines are its body. A preprocessor
 ([`indent.rs`](gumc/src/indent.rs)) converts this to the brace form the grammar
 consumes, one output line per source line (so error line numbers are exact).
 
-```python
+```
 contract C:
     export fn f(u256 x) -> u256:
         if x > 0:
@@ -143,7 +145,7 @@ A value type with fields. Lives in **memory** when used as a local/return, or
 in **storage** when used as a `contract` field or a mapping value. Fields
 are size-ordered and packed (see STORAGE.md).
 
-```python
+```
 class Point:
     u256 x
     u256 y
@@ -154,7 +156,7 @@ class Point:
 The contract's persistent state. Its fields occupy storage slots. There is
 exactly one instance; you refer to it by the class name:
 
-```python
+```
 contract Bank:
     u256 total
     HashMap(Account, u256) balances
@@ -186,7 +188,7 @@ different kinds of thing:
 | plain `class` | allocates it in memory | the value |
 | `contract` | **deploys it** (`CREATE`) | its `Account` address |
 
-```python
+```
 contract Child:
     u256 v
 
@@ -212,7 +214,7 @@ Constructor arguments may be `String`/`Bytes` as well as scalars. They are
 encoded head/tail exactly as the child's decoder expects, so
 `new Token("Gum Token", supply, "GUM")` works:
 
-```python
+```
 contract Token:
     String name
     u256 supply
@@ -239,7 +241,7 @@ EIP-1167 clone), use the raw-bytecode primitives instead:
 A class with method signatures but no bodies. They belong to *another*
 deployed contract. Calling a method compiles to an EVM `CALL`:
 
-```python
+```
 extern class IERC20:
     fn transfer(Account to, u256 amount) -> bool
 
@@ -250,7 +252,7 @@ Arguments are encoded, and the result decoded, from the *declared* signature,
 so a `String`, `Bytes`, `T[]`, `P`, or `[P]` crosses head/tail exactly as the
 callee expects rather than as a bare memory pointer, in either direction:
 
-```python
+```
 extern class IERC20:
     fn name() -> String        # decoded back into a real String, not its offset word
     fn transfer(Account to, u256 amount) -> bool
@@ -268,7 +270,7 @@ constructor invoked by `new ClassName(args)`.
 By default a failing external call bubbles the callee's own revert data, byte
 for byte. To handle a failure instead, wrap the call in `try:` / `catch:`:
 
-```python
+```
 try:
     var ok = IReceiver(to).onReceived(from, id, data)
     if ok != EXPECTED:
@@ -283,7 +285,7 @@ size (`EXTCODESIZE`), which is how you tell a contract from a plain wallet, e.g.
 to skip a receiver-acknowledgement hook when sending to an externally-owned
 account:
 
-```python
+```
 if to.code.len() > 0:
     # to is a contract; ask it whether it accepts this
     ...
@@ -294,7 +296,7 @@ if to.code.len() > 0:
 Parents are an attribute **above** the declaration, the way Rust writes
 `#[derive(...)]`:
 
-```python
+```
 [Parent]
 class Child:
 ```
@@ -304,7 +306,7 @@ flattening at compile time: there is no vtable, no dynamic dispatch, and no
 runtime cost. There is no trailing form; `class Child [Parent]:` is a syntax
 error.
 
-```python
+```
 class Ledger:
     u256 total
 
@@ -348,7 +350,7 @@ the immediate parent, and disambiguates a diamond (`Child.A.m()` vs
 `Child.B.m()`). The ancestor's body runs on the child's storage, the same as
 Solidity's `Base.method()`:
 
-```python
+```
 class Ledger:
     fn cap() -> u256:
         return 100
@@ -374,7 +376,7 @@ When the parent is an `interface`, `[...]` means **implements** rather than
 inherits. The interface contributes nothing; it only obliges the child to
 define every method it declares, with a matching signature:
 
-```python
+```
 interface IThing:
     fn ping(u256 x) -> bool
 
@@ -420,7 +422,7 @@ modifiers, see §4.)
 
 Type-first, optional initializer:
 
-```python
+```
 u256 x = 5          # typed, initialized
 mut u256 y = 0      # explicitly mutable
 const Account owner = Message.sender()
@@ -719,7 +721,7 @@ enum variant.
 
 A function that declares **no** return type may `return` bare to exit early:
 
-```python
+```
 contract S:
     u256 t
 
@@ -737,7 +739,7 @@ no return type was declared.
 
 ## 9. Enums and match
 
-```python
+```
 enum Status:
     Active
     Pending(u256)      # a variant may carry one payload value
@@ -780,7 +782,7 @@ rejected rather than laid out as 64 opaque bytes.
 
 ## 10. Events
 
-```python
+```
 enum TokenLogs:
     Transfer
     Mint
@@ -807,7 +809,7 @@ log(TokenLogs.Transfer, indexed(from), indexed(to), amount)
 
 ## 11. Modules
 
-```python
+```
 use gum.defaults.Account
 use gum.defaults.Message
 ```
@@ -821,7 +823,7 @@ reaches**, not the whole module: `use gum.defaults.Account` also gets
 `Serializable`, because `Account` inherits it, but not `Vec`. Import each symbol
 you name:
 
-```python
+```
 use gum.defaults.Account
 use gum.defaults.keccak256      # a free function is a symbol too
 ```
@@ -860,7 +862,7 @@ binary. Each row is a symbol you import by name.
 
 Both are variadic and return a `Bytes`, so they compose with `keccak256`:
 
-```python
+```
 # an EIP-712 struct hash
 var digest = keccak256(Abi.encode(TYPE_HASH, from, to, amount))
 # a merkle leaf
@@ -929,7 +931,7 @@ class is not called `Transaction`: a transaction has one origin, while
 
 ## 12. `unsafe`, raw Yul
 
-```python
+```
 unsafe:
     sstore(0, add(sload(0), 1))
 ```

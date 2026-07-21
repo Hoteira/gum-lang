@@ -1,10 +1,13 @@
 # gum storage model
 
-gum's storage layout is **byte-for-byte compatible with Solidity's**, verified
-by the differential execution tests (they read raw storage slots from both
-gum's and Solidity's deployed bytecode and assert equality). This document
-specifies exactly how gum places state in storage, and how the storage-layout
-lock keeps that placement safe across upgrades.
+This is the part that lets you migrate without holding your breath: gum's
+storage layout is **byte-for-byte compatible with Solidity's**, verified by the
+differential execution tests (they read raw storage slots from both gum's and
+Solidity's deployed bytecode and assert equality). Your explorers, indexers, and
+proxy patterns keep working because the bytes on chain land exactly where they'd
+land in Solidity. This document specifies exactly how gum places state in
+storage, and how the storage-layout lock keeps that placement safe across
+upgrades.
 
 Everything here concerns **`contract` fields**, the singleton contract
 state. Non-`contract` classes are values (in memory or as mapping entries), not
@@ -24,7 +27,7 @@ Unlike Solidity, which lays fields out in **declaration order**, gum
 gaps. This is the manual optimization Solidity asks *you* to do; gum does it
 automatically.
 
-```python
+```
 contract C:
     u128 a      # 16 bytes
     u256 big    # 32 bytes
@@ -130,7 +133,7 @@ compile to this, and match Solidity's `mapping(K => mapping(K => V))` exactly.
 When `V` is a user `class`, `map[k]` is a **struct base slot**
 `keccak256(k ‖ p)`, and each field sits at `base + field's relative slot`:
 
-```python
+```
 class Stake:
     u256 amount    # relative slot 0
     u256 since     # relative slot 1
@@ -224,7 +227,7 @@ slot(arr[i].field)  = base(arr[i]) + field's relative slot
 which is the same rule a struct behind a mapping follows, only the base differs
 (an index instead of a hash), so both go through the same field addressing.
 
-```python
+```
 class Stake:
     u256 amount    # relative slot 0
     u256 since     # relative slot 1
@@ -261,7 +264,7 @@ A `contract` field marked `transient` lives in **transient storage**
 (EIP-1153): `TSTORE`/`TLOAD` instead of `SSTORE`/`SLOAD`, cleared at the end of
 the **transaction**.
 
-```python
+```
 contract Router:
     u256 total                      # persistent
     transient u256 depth            # transient
@@ -321,7 +324,7 @@ and is **not storage at all**. It is assigned exactly once, in `fn new()`, and
 lives in the contract's own bytecode, so a read is a `PUSH32` (~3 gas), not a
 2100-gas cold `SLOAD`. It occupies no slot.
 
-```python
+```
 contract Cfg:
     const Account owner    # from a constructor arg -> fixed at deploy
     const u256 cap         # from a literal         -> fixed at compile time
@@ -398,7 +401,7 @@ each is a compile error rather than a silently-zero field:
 field is fixed at zero for the life of the contract. So the compiler checks that
 every path reaching the end of `fn new()` has assigned it.
 
-```python
+```
 fn new(u256 x, bool c):
     if c:
         C.a = x            # error: not assigned on every path
@@ -407,7 +410,7 @@ fn new(u256 x, bool c):
 A branch satisfies the rule by either assigning or **diverging**, a branch that
 reverts never produces a contract, so it owes nothing:
 
-```python
+```
 fn new(u256 x, bool c):
     if c:
         C.a = x
@@ -417,7 +420,7 @@ fn new(u256 x, bool c):
 
 A **loop never counts**, since it may run zero times:
 
-```python
+```
 fn new(u256 x, bool c):
     while c:
         C.a = x            # error: not assigned on every path

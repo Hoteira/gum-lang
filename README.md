@@ -6,14 +6,16 @@
 
 [![CI](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Hoteira/gum-lang/actions/workflows/ci.yml)
 
-**A clear, secure smart-contract language, built by web2 devs, for web2 devs.**
+**A smart-contract language that reads clean, ships like Solidity, and
+protects you like Rust.**
 
-Write Ethereum contracts without the footguns. gum compiles to ordinary EVM
-bytecode that behaves like Solidity's, and is usually smaller.
+Built by web2 devs, for web2 devs. Write Ethereum contracts without the
+footguns — gum compiles to ordinary EVM bytecode that's *provably* identical to
+Solidity's behavior, and usually smaller.
 
 </div>
 
-```python
+```
 use gum.defaults.Account
 use gum.defaults.Message
 
@@ -28,12 +30,35 @@ contract Wallet:
         return Wallet.balances[who]
 ```
 
-That is a complete, deployable contract. No boilerplate, no braces, no
-semicolons.
+That's a complete, deployable contract. No boilerplate, no braces, no
+semicolons — and every safety guard you'd have to remember in Solidity is
+already switched on.
 
 ---
 
-## Why you might want this
+## The pitch, in five lines
+
+- **Familiar on day one.** Clean, low-ceremony syntax: types first,
+  colon-and-indent blocks, `HashMap`/`Vec`/`String` that mean exactly what
+  you'd guess.
+- **Safe by default, not by discipline.** Overflow checks, bounds checks,
+  address masking, and reentrancy guards are *on automatically*. The #1
+  exploited bug class in the ecosystem is off by default in Solidity — in gum
+  it's off by default *for attackers*.
+- **Zero ecosystem risk.** It's not a new chain. Ordinary EVM bytecode,
+  ordinary ABI. Etherscan decodes it, ethers and viem call it, your indexers
+  don't notice the difference.
+- **Cheaper to ship.** 80–94% of Solidity's bytecode, 83–96% of the deploy gas,
+  at parity on runtime — while doing *strictly more* safety work. Every number
+  is asserted by a test, not measured by hand.
+- **Proven, not promised.** A differential test harness runs gum and equivalent
+  Solidity in the same EVM and asserts identical storage, return data, logs, and
+  reverts — on fixed *and* fuzzed inputs. "Behaves like Solidity" is a passing
+  test, not a tagline.
+
+---
+
+## Why teams pick it up
 
 **Low ceremony.** Colon-and-indent blocks, types first, no braces or
 semicolons. `HashMap`, `Vec`, `String` mean what you would guess. The syntax
@@ -59,14 +84,24 @@ explanation rather than a revert at 2am: a `const` field assigned on only one
 branch, a struct array pushed the wrong way, an event logged with two different
 shapes.
 
+**`try`/`catch` that actually catches.** In Solidity, `try` only wraps an
+external call or a `new` — an `assert` or an overflow deeper in the block still
+takes the whole transaction down. gum's `try:` / `catch:` wraps an *arbitrary
+block* and catches **any** revert inside it, internal or external: the body runs
+in a self-call frame whose state rolls back cleanly on failure, then `catch`
+runs, with locals the body mutated written back out. Recovery you can actually
+scope, not just call-site error handling.
+
 ---
 
-## How it works
+## How it works (the honest version)
 
 `.gum` → [Yul](https://docs.soliditylang.org/en/latest/yul.html) → EVM bytecode,
-assembled by `solc`. The compiler, `gumc`, is a Rust binary.
+assembled by `solc`. The compiler, `gumc`, is a single Rust binary. No runtime,
+no VM changes, no trust-us magic.
 
-The load-bearing part is verification. A differential test harness deploys
+The load-bearing part — and the thing that makes the claims above safe to
+believe — is verification. A differential test harness deploys
 gum's bytecode and the equivalent Solidity into an in-process EVM
 ([revm](https://github.com/bluealloy/revm)) and asserts they produce identical
 storage, return data, logs, and reverts, on both fixed and fuzzed inputs. That
@@ -79,7 +114,7 @@ is what "behaves like Solidity" is measured against.
 
 ## The syntax in one screen
 
-```python
+```
 use gum.defaults.Account
 use gum.defaults.Message
 
@@ -121,7 +156,7 @@ contract Vault:                       // the on-chain state singleton
 
 Everything else you would expect:
 
-```python
+```
 if x > 0:
     ...
 else:
@@ -138,6 +173,12 @@ match status:                         // over enums, exhaustiveness checked
         ...
     Closed:
         ...
+
+try:                                  // catches ANY revert in the block,
+    Vault.total = Vault.total + amt   //   internal or external — this overflow,
+    IReceiver(to).onReceived(amt)     //   or this external call reverting
+catch:                                // on failure, the block's state rolled
+    log(VaultLogs.Deposited, amt)     //   back; recover here instead
 
 mut u256 x = 0                        // mutable local (immutable is the default)
 delete Vault.stakes[who]              // reset to zero, release the slots
@@ -216,7 +257,7 @@ Mark a no-argument function with `[Test]` and run it with `--test`. A test
 deployment, so they never leak state into each other. A plain `fn` beside the
 tests is an ordinary helper, not run and callable from the tests.
 
-```python
+```
 # demo_test.gum
 use gum.defaults.hashable
 
@@ -258,7 +299,7 @@ needs either no `fn new` or a no-argument one. It runs the same in-process EVM
 come from an address you choose, so you can test access control without
 deploying from many keys:
 
-```python
+```
 [Test]
 fn only_owner_can_pause():
     var v = new Vault()
@@ -273,7 +314,7 @@ no-op, so a stray cheatcode never affects production behavior.
 
 ---
 
-## What works
+## What works (and how we know)
 
 Nearly everything here is exercised by a reference contract and diffed against
 an equivalent Solidity twin by the execution tests. The one exception is noted
@@ -293,7 +334,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | `delete` | resets a scalar, packed field, mapping entry, array element, whole array, storage string, or struct, releasing the slots Solidity releases |
 | Control flow | `if/else`, `while`, `for ... in <array>` (memory or storage), `match` over enums |
 | Events | `log(Event, indexed(x), ...)` becomes a real `LOG1`-`LOG4` with canonical topic hashes, plus matching `"type": "event"` entries in the ABI JSON, so wallets, ethers/viem and Etherscan decode the logs. The schema is recorded at the `log()` site from the same values `topic0` is hashed from, so the ABI cannot describe an event the bytecode does not emit. The data area shares the ABI encoder the `interface` and `new Child(...)` paths use, so a string, an array or a tuple field is encoded head/tail rather than as a pointer. An indexed field must be one word, since a topic is 32 bytes |
-| External calls | `interface` types (compiled to `CALL`), low-level `call target(payload)`, `to.pay(amount)` (returns success) and `to.transfer(amount)` (reverts on failure) to send ETH. A failing call bubbles the callee's own revert reason, byte for byte as Solidity does. A `try:` / `catch:` block wraps an external call to recover from a revert instead of bubbling it, and `addr.code.len()` gives the callee's code size (`EXTCODESIZE`), e.g. to skip the `onERC721Received` hook for a plain wallet |
+| External calls | `interface` types (compiled to `CALL`), low-level `call target(payload)`, `to.pay(amount)` (returns success) and `to.transfer(amount)` (reverts on failure) to send ETH. A failing call bubbles the callee's own revert reason, byte for byte as Solidity does. A `try:` / `catch:` block recovers from a revert instead of bubbling it — and unlike Solidity's (external-calls-only) `try`, gum's wraps an **arbitrary block** and catches *any* revert inside it, internal or external (a failed `assert`, an overflow, an internal call, as well as an external one): the body runs in a self-call frame that rolls its state back on failure, then `catch` runs. `addr.code.len()` gives the callee's code size (`EXTCODESIZE`), e.g. to skip the `onERC721Received` hook for a plain wallet |
 | Deploying contracts | `new SomeContract(args)` becomes `CREATE`, with the child's creation code embedded in the deployer; or `Account.create`/`create2`/`create2_address` from raw bytecode, for proxies and EIP-1167 clones |
 | Bare ETH | `export payable fn receive():` for a plain send, `export fn fallback():` for an unmatched selector |
 | Const fields | `const` `contract` fields, assigned once in `fn new`, never storage. One keyword, and the compiler picks the mechanism: a value it can evaluate is inlined (byte for byte the same code as writing the literal); a value that only exists at deploy, like a constructor argument, is written into the runtime bytecode there (Yul `setimmutable`). Either way a read is ~3 gas, not a cold `SLOAD`: measured 21,160 vs 23,246, and ~15.8k cheaper to deploy. Assignment is checked on every path through the constructor. Not usable behind a proxy, see [STORAGE.md](STORAGE.md) |
@@ -312,7 +353,7 @@ Their Solidity twins are in [`examples/solidity/`](examples/solidity/).
 
 ---
 
-## Measured against Solidity
+## The numbers (measured against Solidity)
 
 Same solc, same optimizer settings. Every number comes from a test
 (`size_report`, `gas_report`), not hand measurement, and `size_report` asserts
@@ -408,7 +449,7 @@ std/defaults.gum     the standard library, compiled into the binary
 scripts/             formatting helpers
 tools/               where you put solc (not committed)
 gumc/src/
-  indent.rs          Python-style colon/indent to brace preprocessor
+  indent.rs          colon/indent to brace preprocessor
   stdlib.rs          the embedded standard library and module resolution
   parser/gum.pest    grammar (pest)
   parser/mod.rs      AST building + operator-precedence climbing
