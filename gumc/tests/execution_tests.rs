@@ -6950,3 +6950,29 @@ fn test_nested_try_catches_at_each_level() {
     assert!(r.success, "inner internal revert must be caught by the inner catch");
     assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "inner catch path");
 }
+
+#[test]
+fn tmp_literal_operand_probe() {
+    let solc = match solc_path() { Some(p) => p, None => return };
+    // u256 (the asked case) plus u8 overflow with the literal in each position.
+    let gum = "contract C:\n    u256 a\n    export fn seta(u256 v):\n        C.a = v\n    export fn a_lit() -> u256:\n        return C.a * 2\n    export fn a_var(u256 b) -> u256:\n        return C.a * b\n    export fn u8_lit_r(u8 v) -> u8:\n        return v * 2\n    export fn u8_lit_l(u8 v) -> u8:\n        return 2 * v\n    export fn u8_var(u8 v, u8 w) -> u8:\n        return v * w\n";
+    let sol = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract C {\n  uint256 a;\n  function seta(uint256 v) external { a=v; }\n  function a_lit() external view returns (uint256){ return a*2; }\n  function a_var(uint256 b) external view returns (uint256){ return a*b; }\n  function u8_lit_r(uint8 v) external pure returns (uint8){ return v*2; }\n  function u8_lit_l(uint8 v) external pure returns (uint8){ return 2*v; }\n  function u8_var(uint8 v, uint8 w) external pure returns (uint8){ return v*w; }\n}\n";
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum_creation_bytecode(gum, &solc, false));
+    let sa = deploy(&mut sdb, sol_creation_bytecode(sol, &solc));
+    let w = |v: u64| { let mut b=[0u8;32]; b[24..32].copy_from_slice(&v.to_be_bytes()); b };
+    // a = 10: a*2 vs a*b(=2)
+    call(&mut gdb, ga, encode_words("seta(uint256)", &[w(10)])); call(&mut sdb, sa, encode_words("seta(uint256)", &[w(10)]));
+    for (label, sig, args) in [
+        ("a_lit", "a_lit()", vec![]),
+        ("a_var", "a_var(uint256)", vec![w(2)]),
+        ("u8_lit_r(v=200)", "u8_lit_r(uint8)", vec![w(200)]),
+        ("u8_lit_l(v=200)", "u8_lit_l(uint8)", vec![w(200)]),
+        ("u8_var(200,2)", "u8_var(uint8,uint8)", vec![w(200), w(2)]),
+    ] {
+        let g = call(&mut gdb, ga, encode_words(sig, &args));
+        let s = call(&mut sdb, sa, encode_words(sig, &args));
+        eprintln!("{}: gum(ok={} out={}) sol(ok={} out={}) MATCH={}", label, g.success, hex::encode(&g.output), s.success, hex::encode(&s.output), g.success==s.success && g.output==s.output);
+    }
+}
