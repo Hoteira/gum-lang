@@ -1,0 +1,22 @@
+use gum.defaults.String
+use gum.defaults.Account
+
+class Meta:
+    u256 id
+    String name
+
+    fn new(u256 i, String n):
+        self.id = i
+        self.name = n
+
+interface IStore:
+    fn store(Meta m) -> Meta
+
+contract Target:
+    export fn store(Meta m) -> Meta:
+        return m
+
+contract Caller:
+    export fn call_it(Account t, u256 i, String n) -> Meta:
+        var m = new Meta(i, n)
+        return IStore(t).store(m)

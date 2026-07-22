@@ -1,0 +1,13 @@
+use gum.defaults.String
+
+class Meta:
+    u256 id
+    String name
+
+    fn new(u256 i, String n):
+        self.id = i
+        self.name = n
+
+contract C:
+    export fn echo(Meta m) -> Meta:
+        return m

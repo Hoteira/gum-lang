@@ -65,7 +65,7 @@ pub struct StorageField {
 
 // Where a memory-backed (non-global class instance) field lives: a byte
 // offset from the struct's base pointer, plus its width. Memory is
-// byte-addressable, so unlike storage this needs no slot bookkeeping 
+// byte-addressable, so unlike storage this needs no slot bookkeeping
 // fields are packed back-to-back with no padding.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryField {
@@ -86,7 +86,7 @@ pub struct LayoutEngine<'a> {
     // this offset/size within that slot. Distinct from storage_fields, which
     // is the absolute layout of global singleton classes.
     struct_storage_fields: HashMap<String, StorageField>,
-    // If a storage lock was supplied, this is the layout actually used 
+    // If a storage lock was supplied, this is the layout actually used
     // committed fields honored, new fields placed, ready to be written back.
     pub manifest_out: StorageManifest,
 }
@@ -365,11 +365,13 @@ impl<'a> LayoutEngine<'a> {
                 if let Some(w) = Self::scalar_byte_width(type_def) {
                     w
                 } else if name == "u256" || name == "i256" || name == "f32" || name == "f64" {
-                    32 // Standard EVM word size (bool is handled by scalar_byte_width above)
+                    // full EVM word
+                    32
                 } else if let Some(&packed) = self.packed_class_size.get(name) {
                     packed
                 } else if self.type_checker.loaded_classes.contains_key(name) {
-                    32 // Class known but not yet laid out (shouldn't normally happen)
+                    // class known but not yet laid out
+                    32
                 } else if self.type_checker.loaded_enums.contains_key(name) {
                     // A payload-free enum is a tag and nothing else, so it is one byte, exactly as Solidity lays an enum out. Saying 64 here was the root of a family of bugs: it burned two storage slots instead of one byte, displaced every field after it, and made the mapping/log paths write the memory pointer instead of the value.
                     // A payload-carrying enum keeps the [tag][payload] pair, which only exists in memory; it is rejected anywhere that needs a size, so this number is never used to lay one out.
@@ -382,7 +384,8 @@ impl<'a> LayoutEngine<'a> {
                 self.size_of(inner) * size
             }
             Type::Array(_) => {
-                32 // Dynamic arrays are just a 32-byte pointer
+                // dynamic arrays are a 32-byte pointer
+                32
             }
             Type::Generic { .. } => {
                 32
@@ -455,7 +458,8 @@ impl<'a> LayoutEngine<'a> {
             _ => return None,
         };
         if signed {
-            return None; // two's-complement bounds need their own reasoning
+            // two's-complement bounds need their own reasoning
+            return None;
         }
         if bits < 128 && n > (1u128 << bits) - 1 {
             return None;

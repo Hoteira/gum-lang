@@ -1,0 +1,11 @@
+contract Names:
+    HashMap(Account, String) names
+
+    export fn set(Account who, String name):
+        Names.names[who] = name
+
+    export fn get(Account who) -> String:
+        return Names.names[who]
+
+    export fn clear(Account who):
+        delete Names.names[who]

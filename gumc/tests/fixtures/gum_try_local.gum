@@ -1,0 +1,15 @@
+contract C:
+    u256 mark
+
+    export fn classify(u256 arg) -> u256:
+        __DECL__
+        C.mark = 1
+        try:
+            C.mark = 2
+            assert(n < 10, "too big")
+            return n
+        catch:
+            return 99
+
+    export fn getmark() -> u256:
+        return C.mark

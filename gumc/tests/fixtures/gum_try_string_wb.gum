@@ -1,0 +1,9 @@
+contract C:
+    export fn label(u256 n) -> String:
+        mut var s = "start"
+        try:
+            s = "updated-to-a-long-value-past-31-bytes-so-it-goes-long-form"
+            assert(n < 10, "big")
+        catch:
+            s = "caught"
+        return s

@@ -1,0 +1,10 @@
+contract C:
+    export fn f(u256 a) -> u256:
+        try:
+            try:
+                assert(a < 5, "inner")
+                return 1
+            catch:
+                return 2
+        catch:
+            return 3

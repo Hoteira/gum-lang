@@ -1,8 +1,9 @@
 use logos::Logos;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
-#[logos(skip r"[ \t\n\f]+")] // Skip whitespace
-#[logos(skip(r"//.*", allow_greedy = true))]   // Skip single-line comments
+// skip whitespace and single-line comments
+#[logos(skip r"[ \t\n\f]+")]
+#[logos(skip(r"//.*", allow_greedy = true))]
 pub enum Token {
     // Keywords
     #[token("use")]

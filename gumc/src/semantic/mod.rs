@@ -426,7 +426,7 @@ impl TypeChecker {
 
     // Whether the codecs can carry t as an array element or a struct field: a scalar, a payload-free enum, a struct of those, or an array of any of them to any depth.
     // String and Bytes are carried as array elements (string[], [String; N], [[String]]) via the dynamic-element codec (gum_abi_str_cd/mem/put/size).
-    // They are still not admitted as a struct *field*: a dynamic tuple field needs the head/tail struct codec, which is separate and not built yet (see the struct-field check below).
+    // They are still not admitted as a struct field: a dynamic tuple field needs the head/tail struct codec, which is separate and not built yet (see the struct-field check below).
     pub fn abi_elem_ok(&self, t: &Type) -> bool {
         if self.is_scalar_enum(t) {
             return true;
@@ -453,6 +453,35 @@ impl TypeChecker {
             }
             _ => false,
         }
+    }
+
+    // Whether a struct crosses the ABI as a dynamic tuple this compiler can encode:
+    // at least one dynamic field, every field a scalar/enum, String/Bytes, or array
+    // of those, no nested struct. Top-level only; abi_elem_ok stays strict.
+    pub fn abi_dyn_struct_ok(&self, t: &Type) -> bool {
+        let fields = match self.abi_struct_fields(t) {
+            Some(fs) => fs,
+            None => return false,
+        };
+        if fields.is_empty() {
+            return false;
+        }
+        let mut any_dynamic = false;
+        for f in &fields {
+            let scalar = self.is_scalar_enum(f)
+                || matches!(f, Type::Primitive(n) if matches!(n.as_str(),
+                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" |
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" |
+                    "bool" | "Account"));
+            let is_str = matches!(f, Type::Primitive(n) if n == "String" || n == "Bytes");
+            let is_arr = matches!(f, Type::Array(inner) | Type::FixedArray(inner, _) if self.abi_elem_ok(inner));
+            if is_str || is_arr {
+                any_dynamic = true;
+            } else if !scalar {
+                return false;
+            }
+        }
+        any_dynamic
     }
 
     // Whether a type can be an element of a storage array or a Vec, or the value of a mapping: something the slot arithmetic knows a fixed width for.
@@ -737,11 +766,18 @@ impl TypeChecker {
                             if let Some(v) = args.get(1) {
                                 let nested_map = matches!(v, Type::Generic { name, .. } if name == "HashMap");
                                 // A String/Bytes value gets its own slot region at
-                                // keccak256(key ‖ p), exactly like Solidity's
+                                // keccak256(key p), exactly like Solidity's
                                 // mapping(K => string): the value slot is the string's
                                 // base slot, so no extra reservation is needed.
                                 let dynamic_str = matches!(v, Type::Primitive(n) if n == "String" || n == "Bytes");
-                                if !nested_map && !dynamic_str && !self.storage_elem_ok(v) {
+                                // A dynamic-array value m[k] holds its length at
+                                // keccak256(key p) and its elements from
+                                // keccak256(that slot), exactly like Solidity's
+                                // mapping(K => T[]). Its element must itself have a
+                                // fixed slot layout (a scalar), the same rule a
+                                // top-level array field follows.
+                                let dynamic_arr = matches!(v, Type::Array(inner) if self.storage_elem_ok(inner));
+                                if !nested_map && !dynamic_str && !dynamic_arr && !self.storage_elem_ok(v) {
                                     errors.push(bad("a mapping value", v));
                                 }
                             }
@@ -773,9 +809,12 @@ impl TypeChecker {
                     ));
                     return;
                 }
-                if self.abi_struct_fields(t).is_some() && !self.abi_elem_ok(t) {
+                if self.abi_struct_fields(t).is_some()
+                    && !self.abi_elem_ok(t)
+                    && !self.abi_dyn_struct_ok(t)
+                {
                     errors.push(format!(
-                        "Semantic Error: {} has no ABI encoding: a struct crossing the ABI boundary must have at least one field and hold only scalar fields, and '{}' does not. Pass its parts separately, or flatten it.",
+                        "Semantic Error: {} has no ABI encoding: a struct crossing the ABI boundary must hold ABI fields (scalars, String/Bytes, or arrays of those) and cannot nest another struct, and '{}' does not qualify. Pass its parts separately, or flatten it.",
                         what,
                         type_name(t)
                     ));
@@ -993,9 +1032,9 @@ impl TypeChecker {
         }
 
         if errors.is_empty() {
-            // Types validated: now write each inferred `var`'s resolved type back
+            // Types validated: now write each inferred var's resolved type back
             // into the loaded classes, so later passes see it instead of the
-            // `_infer` sentinel (see elaborate_infer_types).
+            // _infer sentinel (see elaborate_infer_types).
             self.elaborate_infer_types();
             println!("    [OK] Validation passed!");
             Ok(())
@@ -1004,15 +1043,9 @@ impl TypeChecker {
         }
     }
 
-    // Resolves every inferred `var x = expr` local to its concrete type in place,
-    // in the loaded class methods codegen reads. Verification already computed and
-    // validated these types, but in a transient scope it then discarded; this
-    // replays the same scoped walk once more and writes the result back, so later
-    // passes — especially the codegen try-hoist, which runs before translation and
-    // has no scope of its own — see the real type rather than the `_infer`
-    // sentinel. Best-effort and non-failing: an initializer whose type this
-    // lightweight walk can't resolve simply keeps its sentinel, exactly as before,
-    // so this can only ever add information, never change a validated program.
+    // Writes each inferred var's resolved type back into the loaded classes that
+    // codegen reads, so later passes (the try-hoist) see it instead of the _infer
+    // sentinel. Best-effort: an unresolvable initializer keeps its sentinel.
     fn elaborate_infer_types(&mut self) {
         let names: Vec<String> = self.loaded_classes.keys().cloned().collect();
         for name in names {
@@ -1047,8 +1080,8 @@ impl TypeChecker {
         }
     }
 
-    // Mirrors the scoping the verify pass uses (§ verify_statement_inner) so the
-    // type of a `var` that reads an earlier local, a loop element, etc. resolves
+    // Mirrors the scoping the verify pass uses ( verify_statement_inner) so the
+    // type of a var that reads an earlier local, a loop element, etc. resolves
     // the same way it did during validation.
     fn elaborate_stmt(&mut self, stmt: &mut Statement) {
         match stmt {
@@ -1309,7 +1342,7 @@ impl TypeChecker {
         Ok(())
     }
 
-    // A fixed-point value is a WAD-scaled integer: 1.0 is 10^18, not 1. So mixing one with a plain integer is almost always a bug, price  2 means "times 0.000000000000000002", and the result carries the fixed-point type as if it were fine.
+    // A fixed-point value is a WAD-scaled integer: 1.0 is 10^18, not 1. So mixing one with a plain integer is almost always a bug, price 2 means "times 0.000000000000000002", and the result carries the fixed-point type as if it were fine.
     // The right operand's type was evaluated here and dropped, so nothing rejected the mix. Nothing else checks binary operand compatibility either, so this is the only place it can be caught.
     fn check_fixed_point_math(&self, expr: &Expr) -> Result<(), String> {
         if let Expr::BinaryOp { left, operator, right } = expr {
@@ -1319,7 +1352,7 @@ impl TypeChecker {
             let lf = fixed(&left_type);
             let rf = fixed(&right_type);
             if lf != rf {
-                // A literal is typed u256 until it is coerced, so x  2 on a fixed-point x would trip this. Comparisons are fine either way, only arithmetic carries the scale.
+                // A literal is typed u256 until it is coerced, so x 2 on a fixed-point x would trip this. Comparisons are fine either way, only arithmetic carries the scale.
                 let arith = matches!(operator.as_str(), "+" | "-" | "*" | "/" | "%" | "**");
                 if arith && !matches!(if lf { right } else { left }.as_ref(), Expr::Number(_)) {
                     return Err(format!(
@@ -1737,7 +1770,7 @@ impl TypeChecker {
                         return Ok(Type::Primitive("Bytes".to_string()));
                     }
                     // Vm is a settable test handle, not callable. The only cheatcode
-                    // is `Vm.sender = addr` (see the Assignment handler).
+                    // is Vm.sender = addr (see the Assignment handler).
                     if ns == "Vm" {
                         return Err(format!("Vm has no method {}(); set the caller with `Vm.sender = addr`", method));
                     }

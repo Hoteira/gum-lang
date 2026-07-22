@@ -1,0 +1,22 @@
+use gum.defaults.Account
+
+contract Lists:
+    HashMap(Account, [u256]) items
+
+    export fn add(Account who, u256 v):
+        Lists.items[who].push(v)
+
+    export fn get(Account who, u256 i) -> u256:
+        return Lists.items[who][i]
+
+    export fn set(Account who, u256 i, u256 v):
+        Lists.items[who][i] = v
+
+    export fn size(Account who) -> u256:
+        return Lists.items[who].length
+
+    export fn drop_last(Account who):
+        Lists.items[who].pop()
+
+    export fn clear(Account who):
+        delete Lists.items[who]

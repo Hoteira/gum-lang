@@ -635,6 +635,19 @@ pub struct AbiStructField {
     is_addr: bool,
 }
 
+// One field of a struct that crosses the ABI as a dynamic tuple: carries its
+// type (to pick the field codec), its packed-memory slot, and whether it is a
+// dynamic field (a String/Bytes/array, held in memory as a pointer and encoded
+// through the tail) or a static scalar (inline in the head, one word).
+#[derive(Clone)]
+struct AbiDynField {
+    ty: Type,
+    mem_offset: usize,
+    width: usize,
+    is_addr: bool,
+    is_dynamic: bool,
+}
+
 // A stable, unique suffix naming one type's codecs, so two functions taking the same type share a decoder and two different types never collide on one.
 fn abi_mangle(t: &Type) -> String {
     match t {
@@ -721,6 +734,97 @@ fn abi_st_put_helper_src(fname: &str, fields: &[AbiStructField]) -> String {
     body
 }
 
+// --- Dynamic struct (a tuple with at least one String/Bytes/array field) ---
+//
+// The wire form is a dynamic tuple: a head of one word per field (a scalar value
+// inline, a dynamic field an offset into the tail measured from the tuple start),
+// then the tail holding each dynamic field's own ABI data. In memory the struct
+// is the usual packed form, a dynamic field held as a pointer at its slot. These
+// four builders compose the per-field codecs (a scalar inline, a String/array
+// through gum_abi_str_ / gum_abi_arr_), exactly as the dynamic-array codecs
+// compose their element codec.
+
+// calldata -> packed memory struct.
+fn build_dyn_struct_cd(fname: &str, fields: &[AbiDynField], sub: &[Option<String>], head: usize, packed: usize) -> String {
+    let mut b = format!("function {}(off) -> ptr {{\n", fname);
+    b.push_str(&format!("    if lt(calldatasize(), add(off, {})) {{ revert(0, 0) }}\n", head));
+    b.push_str(&format!("    ptr := allocate_memory({})\n", packed));
+    for (i, f) in fields.iter().enumerate() {
+        if f.is_dynamic {
+            let cd = sub[i].as_ref().unwrap();
+            b.push_str(&format!("    let eo{i} := calldataload(add(off, {ho}))\n", i = i, ho = i * 32));
+            b.push_str(&format!("    if gt(eo{i}, calldatasize()) {{ revert(0, 0) }}\n", i = i));
+            b.push_str(&format!("    mstore(add(ptr, {mo}), {cd}(add(off, eo{i})))\n", mo = f.mem_offset, cd = cd, i = i));
+        } else {
+            let asf = AbiStructField { mem_offset: f.mem_offset, width: f.width, is_addr: f.is_addr };
+            b.push_str(&abi_st_field_store(&format!("calldataload(add(off, {}))", i * 32), &asf));
+        }
+    }
+    b.push_str("}\n");
+    b
+}
+
+// A memory ABI blob (constructor args) -> packed memory struct.
+fn build_dyn_struct_mem(fname: &str, fields: &[AbiDynField], sub: &[Option<String>], head: usize, packed: usize) -> String {
+    let mut b = format!("function {}(base, off, limit) -> ptr {{\n", fname);
+    b.push_str(&format!("    if lt(limit, add(off, {})) {{ revert(0, 0) }}\n", head));
+    b.push_str(&format!("    ptr := allocate_memory({})\n", packed));
+    for (i, f) in fields.iter().enumerate() {
+        if f.is_dynamic {
+            let mem = sub[i].as_ref().unwrap();
+            b.push_str(&format!("    let eo{i} := mload(add(base, add(off, {ho})))\n", i = i, ho = i * 32));
+            b.push_str(&format!("    if gt(eo{i}, limit) {{ revert(0, 0) }}\n", i = i));
+            b.push_str(&format!("    mstore(add(ptr, {mo}), {mem}(base, add(off, eo{i}), limit))\n", mo = f.mem_offset, mem = mem, i = i));
+        } else {
+            let asf = AbiStructField { mem_offset: f.mem_offset, width: f.width, is_addr: f.is_addr };
+            b.push_str(&abi_st_field_store(&format!("mload(add(base, add(off, {})))", i * 32), &asf));
+        }
+    }
+    b.push_str("}\n");
+    b
+}
+
+// packed memory struct -> ABI at dst, returns bytes written (head + all tails).
+fn build_dyn_struct_put(fname: &str, fields: &[AbiDynField], sub_put: &[Option<String>], head: usize) -> String {
+    let mut b = format!("function {}(dst, ptr) -> written {{\n", fname);
+    b.push_str(&format!("    let cur := {}\n", head));
+    for (i, f) in fields.iter().enumerate() {
+        if f.is_dynamic {
+            let put = sub_put[i].as_ref().unwrap();
+            b.push_str(&format!("    mstore(add(dst, {ho}), cur)\n", ho = i * 32));
+            b.push_str(&format!(
+                "    cur := add(cur, {put}(add(dst, cur), mload(add(ptr, {mo}))))\n",
+                put = put, mo = f.mem_offset
+            ));
+        } else {
+            let read = read_packed(&format!("mload(add(ptr, {}))", f.mem_offset), 0, f.width);
+            let v = if f.is_addr {
+                format!("and({}, 0xffffffffffffffffffffffffffffffffffffffff)", read)
+            } else {
+                read
+            };
+            b.push_str(&format!("    mstore(add(dst, {ho}), {v})\n", ho = i * 32, v = v));
+        }
+    }
+    b.push_str("    written := cur\n");
+    b.push_str("}\n");
+    b
+}
+
+// The ABI byte size of a memory struct: the head plus each dynamic field's size.
+fn build_dyn_struct_size(fname: &str, fields: &[AbiDynField], sub_size: &[Option<String>], head: usize) -> String {
+    let mut b = format!("function {}(ptr) -> sz {{\n", fname);
+    b.push_str(&format!("    sz := {}\n", head));
+    for (i, f) in fields.iter().enumerate() {
+        if f.is_dynamic {
+            let sz = sub_size[i].as_ref().unwrap();
+            b.push_str(&format!("    sz := add(sz, {sz}(mload(add(ptr, {mo}))))\n", sz = sz, mo = f.mem_offset));
+        }
+    }
+    b.push_str("}\n");
+    b
+}
+
 // An ABI string or bytes in memory -> gum's own shape, where the length lives in the top 8 bytes of the header word rather than in a word of its own.
 fn gum_abi_str_mem_helper_src() -> String {
     "function gum_abi_str_mem(base, off, limit) -> ptr {\n\
@@ -735,8 +839,8 @@ fn gum_abi_str_mem_helper_src() -> String {
 }
 
 // The String/Bytes element codec, exposing the same cd/mem/put/size signatures
-// every ABI type has so the dynamic-array wrappers (abi_dynarr_*) can carry a
-// String element the way they already carry a nested array. `mem` above is the
+// every ABI type has so the dynamic-array wrappers (abi_dynarr_) can carry a
+// String element the way they already carry a nested array. mem above is the
 // same helper a top-level string argument uses; these three are its calldata,
 // encode and size counterparts. A String value in memory is a header word
 // holding its length in the high 8 bytes, then its bytes (gum_str_len reads it).
@@ -1083,7 +1187,7 @@ fn numeric_meta(name: &str) -> Option<(usize, bool)> {
     }
 }
 
-// Whether a type is WAD-scaled fixed point, whose  and / must correct the scale.
+// Whether a type is WAD-scaled fixed point, whose and / must correct the scale.
 fn is_fixed_point(t: &Type) -> bool {
     matches!(t, Type::Primitive(p) if p == "f32" || p == "f64")
 }
@@ -1688,7 +1792,7 @@ pub struct Translator<'a> {
 #[derive(Clone, PartialEq)]
 pub struct EventSchema {
     pub inputs: Vec<AbiInput>,
-    // The canonical Name(type,…) string topic0 was hashed from. Two log()
+    // The canonical Name(type,...) string topic0 was hashed from. Two log()
     // sites that disagree on it are two different events wearing one name.
     pub signature: String,
 }
@@ -1802,6 +1906,104 @@ impl<'a> Translator<'a> {
         Some(out)
     }
 
+    // Per-field layout for a struct that crosses the ABI as a dynamic tuple, or
+    // None for a static struct or one with a field this codec can't carry. Each
+    // field must be a scalar/enum or a String/Bytes/array, not a nested struct.
+    fn abi_dyn_struct_layout(&self, name: &str) -> Option<Vec<AbiDynField>> {
+        let class = self.type_checker().loaded_classes.get(name)?;
+        let mut out = Vec::new();
+        let mut any_dynamic = false;
+        for f in &class.fields {
+            let mf = self.layout_engine.memory_field(name, &f.name)?;
+            let is_dynamic = self.abi_is_dynamic(&f.type_def);
+            if is_dynamic {
+                let ok = is_str_type(&f.type_def)
+                    || matches!(&f.type_def, Type::Array(_) | Type::FixedArray(..));
+                if !ok {
+                    return None;
+                }
+                any_dynamic = true;
+            } else if !is_abi_scalar(&f.type_def)
+                && !self.type_checker().is_scalar_enum(&f.type_def)
+            {
+                return None;
+            }
+            out.push(AbiDynField {
+                ty: f.type_def.clone(),
+                mem_offset: mf.offset,
+                width: mf.size,
+                is_addr: crate::codegen::is_address_type(&f.type_def),
+                is_dynamic,
+            });
+        }
+        if !any_dynamic || out.is_empty() {
+            return None;
+        }
+        Some(out)
+    }
+
+    pub fn ensure_abi_dyn_struct_cd(&self, name: &str) -> Option<String> {
+        let fields = self.abi_dyn_struct_layout(name)?;
+        let fname = format!("gum_abi_dst_{}_cd", name);
+        if self.helper_thunks.borrow().contains_key(&fname) {
+            return Some(fname);
+        }
+        let mut sub = Vec::new();
+        for f in &fields {
+            sub.push(if f.is_dynamic { Some(self.ensure_abi_cd(&f.ty)?) } else { None });
+        }
+        let head = fields.len() * 32;
+        let packed = self.abi_struct_packed(name);
+        let n2 = fname.clone();
+        self.ensure_helper(&fname, move || build_dyn_struct_cd(&n2, &fields, &sub, head, packed));
+        Some(fname)
+    }
+
+    pub fn ensure_abi_dyn_struct_mem(&self, name: &str) -> Option<String> {
+        let fields = self.abi_dyn_struct_layout(name)?;
+        let fname = format!("gum_abi_dst_{}_mem", name);
+        if self.helper_thunks.borrow().contains_key(&fname) {
+            return Some(fname);
+        }
+        let mut sub = Vec::new();
+        for f in &fields {
+            sub.push(if f.is_dynamic { Some(self.ensure_abi_mem(&f.ty)?) } else { None });
+        }
+        let head = fields.len() * 32;
+        let packed = self.abi_struct_packed(name);
+        let n2 = fname.clone();
+        self.ensure_helper(&fname, move || build_dyn_struct_mem(&n2, &fields, &sub, head, packed));
+        Some(fname)
+    }
+
+    // Returns (put, size) helper names, since encoding a dynamic struct needs its
+    // size measured first to place the head.
+    pub fn ensure_abi_dyn_struct_put(&self, name: &str) -> Option<(String, String)> {
+        let fields = self.abi_dyn_struct_layout(name)?;
+        let fname = format!("gum_abi_dst_{}_put", name);
+        let sname = format!("gum_abi_dst_{}_size", name);
+        if self.helper_thunks.borrow().contains_key(&fname) {
+            return Some((fname, sname));
+        }
+        let mut sub_put = Vec::new();
+        let mut sub_size = Vec::new();
+        for f in &fields {
+            if f.is_dynamic {
+                let (p, s) = self.ensure_abi_put(&f.ty)?;
+                sub_put.push(Some(p));
+                sub_size.push(Some(s));
+            } else {
+                sub_put.push(None);
+                sub_size.push(None);
+            }
+        }
+        let head = fields.len() * 32;
+        let (fields2, n2, s2) = (fields.clone(), fname.clone(), sname.clone());
+        self.ensure_helper(&fname, move || build_dyn_struct_put(&n2, &fields2, &sub_put, head));
+        self.ensure_helper(&sname, move || build_dyn_struct_size(&s2, &fields, &sub_size, head));
+        Some((fname, sname))
+    }
+
     // The wire width of a static struct: one word per field, however tightly memory packs them.
     pub fn abi_struct_wire_size(&self, name: &str) -> Option<usize> {
         self.abi_struct_layout(name).map(|f| f.len() * 32)
@@ -1900,7 +2102,19 @@ impl<'a> Translator<'a> {
         match t {
             Type::Array(_) => true,
             Type::FixedArray(inner, _) => self.abi_is_dynamic(inner),
-            Type::Primitive(n) => n == "String" || n == "Bytes",
+            Type::Primitive(n) => {
+                if n == "String" || n == "Bytes" {
+                    return true;
+                }
+                // A struct is dynamic if any of its fields is: it then rides the
+                // wire as a dynamic tuple (head of offsets/values, then a tail).
+                if is_struct_type(self.type_checker(), t) {
+                    if let Some(c) = self.type_checker().loaded_classes.get(n) {
+                        return c.fields.iter().any(|f| self.abi_is_dynamic(&f.type_def));
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -2356,7 +2570,7 @@ impl<'a> Translator<'a> {
                         if let Some((base_slot, elem_size, tr)) = self.dyn_storage_array(base, ctx)
                         {
                             let idx = self.translate_expr(index, ctx);
-                            return self.dyn_array_set(base_slot, elem_size, &idx, &val_expr, tr);
+                            return self.dyn_array_set(&base_slot, elem_size, &idx, &val_expr, tr);
                         }
                         let i = self.translate_expr(index, ctx);
                         let (addr_expr, stride) = self.mem_array_addr(base, &i, ctx);
@@ -2412,7 +2626,16 @@ impl<'a> Translator<'a> {
                             is_dynamic = true;
                         }
                         if ctx.is_entry && is_struct_type(self.type_checker(), ret_ty) {
-                            struct_ret = self.ensure_abi_struct_put(name);
+                            if self.abi_is_dynamic(ret_ty) {
+                                // A dynamic struct is a dynamic tuple: encode it the
+                                // same way a dynamic array return is, behind an
+                                // offset word, its size measured by its size helper.
+                                if let Some((put, size_fn)) = self.ensure_abi_dyn_struct_put(name) {
+                                    arr_ret = Some((put, size_fn, true, 32));
+                                }
+                            } else {
+                                struct_ret = self.ensure_abi_struct_put(name);
+                            }
                         }
                     }
                     if ctx.is_entry && matches!(ret_ty, Type::Array(_) | Type::FixedArray(..)) {
@@ -2733,7 +2956,8 @@ impl<'a> Translator<'a> {
                 topics.push(self.translate_expr(e, ctx));
             }
         }
-        let log_op = format!("log{}", topics.len()); // topics.len() is 1..=4
+        // topics.len() is 1..=4
+        let log_op = format!("log{}", topics.len());
 
         let data: Vec<(String, Type)> = fields
             .iter()
@@ -2858,6 +3082,28 @@ impl<'a> Translator<'a> {
             .unwrap_or(false)
     }
 
+    // Sign-extends a freshly-read packed value to a full word for a signed integer
+    // narrower than 32 bytes. A packed read masks unsigned, so without this a
+    // negative iN reads back positive and its checked arithmetic misses underflow.
+    fn sign_extend_read(&self, ty: &Type, raw: String) -> String {
+        if let Type::Primitive(n) = ty {
+            if let Some(bits) = n.strip_prefix('i').and_then(|s| s.parse::<usize>().ok()) {
+                if bits < 256 {
+                    return format!("signextend({}, {})", bits / 8 - 1, raw);
+                }
+            }
+        }
+        raw
+    }
+
+    fn field_type(&self, class_name: &str, property: &str) -> Option<Type> {
+        self.type_checker()
+            .loaded_classes
+            .get(class_name)
+            .and_then(|c| c.fields.iter().find(|f| f.name == property))
+            .map(|f| f.type_def.clone())
+    }
+
     fn load_storage_field(&self, class_name: &str, property: &str, sf: &StorageField) -> String {
         let tr = sf.is_transient;
         if self.field_is_str(class_name, property) {
@@ -2868,11 +3114,15 @@ impl<'a> Translator<'a> {
             return format!("gum_sstr_load{}({})", kind_suffix(tr), sf.slot);
         }
         if sf.size <= 32 {
-            return read_slot_packed(
+            let raw = read_slot_packed(
                 &format!("{}({})", ld_op(tr), sf.slot),
                 sf.offset_in_slot,
                 sf.size,
             );
+            return match self.field_type(class_name, property) {
+                Some(t) => self.sign_extend_read(&t, raw),
+                None => raw,
+            };
         }
         let fn_name = format!("__load_{}_{}_{}", class_name, sf.slot, tr);
         let (slot, size) = (sf.slot, sf.size);
@@ -3044,7 +3294,10 @@ impl<'a> Translator<'a> {
                                 .layout_engine
                                 .memory_field(&self_ctx.class_name, property)
                             {
-                                return self.load_memory_field("self", &mf);
+                                return self.sign_extend_read(
+                                    &self.static_type(expr, ctx),
+                                    self.load_memory_field("self", &mf),
+                                );
                             }
                         }
                     }
@@ -3085,12 +3338,18 @@ impl<'a> Translator<'a> {
                         self.struct_field_slot(&base_slot, &struct_name, property)
                     {
                         let tr = self.struct_base_transient(base, ctx);
-                        return read_slot_packed(&format!("{}({})", ld_op(tr), slot), off, size);
+                        return self.sign_extend_read(
+                            &self.static_type(expr, ctx),
+                            read_slot_packed(&format!("{}({})", ld_op(tr), slot), off, size),
+                        );
                     }
                 }
                 if let Type::Primitive(class_name) = self.static_type(base, ctx) {
                     if let Some(mf) = self.layout_engine.memory_field(&class_name, property) {
-                        return self.load_memory_field(&self.translate_expr(base, ctx), &mf);
+                        return self.sign_extend_read(
+                            &self.static_type(expr, ctx),
+                            self.load_memory_field(&self.translate_expr(base, ctx), &mf),
+                        );
                     }
                 }
                 // The read half of the same rule: offset 0 is not a default, it is the first field, so an unresolved property silently read the wrong one.
@@ -3134,20 +3393,27 @@ impl<'a> Translator<'a> {
                         }
                     }
                 }
+                // A signed narrow element is read packed (masked unsigned), so it
+                // is sign-extended to a full word here, the same as a storage field.
+                let elem_ty = self.static_type(expr, ctx);
                 if let Some((base_slot, elem_size, len, tr)) = self.storage_array_info(base, ctx) {
                     let idx = self.translate_expr(index, ctx);
-                    return self.storage_array_get(base_slot, elem_size, len, &idx, tr);
+                    return self.sign_extend_read(
+                        &elem_ty,
+                        self.storage_array_get(base_slot, elem_size, len, &idx, tr),
+                    );
                 }
                 if let Some((slot, elem_size, tr)) = self.dyn_storage_array(base, ctx) {
                     let idx = self.translate_expr(index, ctx);
-                    return self.dyn_array_get(slot, elem_size, &idx, tr);
+                    return self
+                        .sign_extend_read(&elem_ty, self.dyn_array_get(&slot, elem_size, &idx, tr));
                 }
                 let i = self.translate_expr(index, ctx);
                 let (addr, stride) = self.mem_array_addr(base, &i, ctx);
-                if self.elem_is_inline(&self.static_type(expr, ctx)) {
+                if self.elem_is_inline(&elem_ty) {
                     return addr;
                 }
-                read_packed(&format!("mload({})", addr), 0, stride)
+                self.sign_extend_read(&elem_ty, read_packed(&format!("mload({})", addr), 0, stride))
             }
             Expr::FnCall { name, args } => {
                 if name == "keccak256" && args.len() == 1 {
@@ -3220,6 +3486,19 @@ impl<'a> Translator<'a> {
                 }
             })
             .collect();
+        // A dynamic struct argument encodes like a dynamic array: an offset word
+        // in the head, its tuple written into the tail, its size measured first.
+        let dyn_struct_put: Vec<Option<(String, String)>> = types
+            .iter()
+            .map(|t| match t {
+                Type::Primitive(n)
+                    if is_struct_type(self.type_checker(), t) && self.abi_is_dynamic(t) =>
+                {
+                    self.ensure_abi_dyn_struct_put(n)
+                }
+                _ => None,
+            })
+            .collect();
 
         // Only a dynamic value adds to alen; a static array is already counted, since abi_head_bytes gives its whole inline width rather than one offset word.
         let mut size_src = format!("    let alen := {}\n", head_bytes);
@@ -3229,6 +3508,9 @@ impl<'a> Translator<'a> {
                 size_src.push_str(&format!("    let a{i}_pad := and(add(a{i}_len, 31), not(31))\n", i = i));
                 size_src.push_str(&format!("    alen := add(alen, add(32, a{}_pad))\n", i));
             } else if let Some((_, size_fn, true)) = &arr_put[i] {
+                size_src.push_str(&format!("    let a{i}_abi := {s}(a{i})\n", i = i, s = size_fn));
+                size_src.push_str(&format!("    alen := add(alen, a{}_abi)\n", i));
+            } else if let Some((_, size_fn)) = &dyn_struct_put[i] {
                 size_src.push_str(&format!("    let a{i}_abi := {s}(a{i})\n", i = i, s = size_fn));
                 size_src.push_str(&format!("    alen := add(alen, a{}_abi)\n", i));
             }
@@ -3258,6 +3540,12 @@ impl<'a> Translator<'a> {
                 } else {
                     write_src.push_str(&format!("    pop({}(add(blob, {}), a{}))\n", put, at, i));
                 }
+            } else if let Some((put, _)) = &dyn_struct_put[i] {
+                write_src.push_str(&format!("    mstore(add(blob, {}), tail)\n", at));
+                write_src.push_str(&format!(
+                    "    tail := add(tail, {}(add(blob, tail), a{}))\n",
+                    put, i
+                ));
             } else if let Some(helper) = &struct_put[i] {
                 write_src.push_str(&format!("    {}(add(blob, {}), a{})\n", helper, at, i));
             } else {
@@ -3465,7 +3753,8 @@ impl<'a> Translator<'a> {
 
         let result: u128 = match op {
             "+" => a.checked_add(b)?,
-            "-" => a.checked_sub(b)?, // None on underflow → keep checked_sub (which reverts)
+            // None on underflow keeps checked_sub, which reverts
+            "-" => a.checked_sub(b)?,
             "*" => a.checked_mul(b)?,
             _ => return None,
         };
@@ -3511,7 +3800,7 @@ impl<'a> Translator<'a> {
 
         let rich = self.rich_reverts;
 
-        // Only  and / move a WAD scale, and only when both sides carry one: two WAD values multiplied are WAD-squared, and divided they are unscaled.
+        // Only and / move a WAD scale, and only when both sides carry one: two WAD values multiplied are WAD-squared, and divided they are unscaled.
         if matches!(operator, "*" | "/")
             && is_fixed_point(&self.static_type(left, ctx))
             && is_fixed_point(&self.static_type(right, ctx))
@@ -3718,12 +4007,9 @@ impl<'a> Translator<'a> {
         None
     }
 
-    // For `m[k]` or `m.get(k)` on a HashMap, returns the value's storage slot as
-    // a runtime Yul expression (`keccak256(k ‖ p)`), its value type, and whether
-    // the mapping is transient. This is Solidity's mapping value slot, and it
-    // doubles as the base slot for a dynamic value (a `String`/`Bytes` stores its
-    // length/data from here exactly as a top-level string field does), which is
-    // what lets a `HashMap(K, String)` reuse the storage-string helpers.
+    // For m[k] or m.get(k) on a HashMap, returns the value's storage slot as a
+    // runtime keccak256(k,p) expression, its value type, and whether it is transient.
+    // That slot doubles as the base slot for a dynamic value like a String/Bytes.
     fn hashmap_entry_slot(&self, base: &Expr, ctx: &Ctx) -> Option<(String, Type, bool)> {
         let (map, key): (&Expr, &Expr) = match base {
             Expr::IndexAccess { base: m, index } => (m, index),
@@ -3778,7 +4064,11 @@ impl<'a> Translator<'a> {
         }
         let esz = esz.max(1);
         let (per, es) = pack_params(esz);
-        let name = format!("sarr_to_mem_{}_{}{}", esz, slot, kind_suffix(tr));
+        // The helper takes the length-slot as a parameter, so the name keys only
+        // on element size and storage kind, never on the slot, which may now be a
+        // runtime keccak expression (a dynamic-array mapping value) rather than a
+        // constant field slot.
+        let name = format!("sarr_to_mem_{}{}", esz, kind_suffix(tr));
         self.ensure_helper("arr_data_base", arr_data_base_helper_src);
         self.ensure_pack_read(tr);
         let n = name.clone();
@@ -3786,10 +4076,17 @@ impl<'a> Translator<'a> {
         Some(format!("{}({})", name, slot))
     }
 
-    fn dyn_storage_array(&self, base: &Expr, ctx: &Ctx) -> Option<(usize, usize, bool)> {
-        let sf = self.resolve_storage_field(base, ctx)?;
-        if let Type::Array(inner) = self.static_type(base, ctx) {
-            return Some((sf.slot, self.layout_engine.size_of(&inner), sf.is_transient));
+    // A dynamic storage array's location, as (length-slot expression, element
+    // size, transient?). The slot is a Yul expression, not a constant, so this
+    // serves both a contract field and a dynamic-array mapping value m[k].
+    fn dyn_storage_array(&self, base: &Expr, ctx: &Ctx) -> Option<(String, usize, bool)> {
+        if let Some(sf) = self.resolve_storage_field(base, ctx) {
+            if let Type::Array(inner) = self.static_type(base, ctx) {
+                return Some((sf.slot.to_string(), self.layout_engine.size_of(&inner), sf.is_transient));
+            }
+        }
+        if let Some((slot, Type::Array(inner), tr)) = self.hashmap_entry_slot(base, ctx) {
+            return Some((slot, self.layout_engine.size_of(&inner), tr));
         }
         None
     }
@@ -3855,7 +4152,7 @@ impl<'a> Translator<'a> {
 
     fn dyn_array_get(
         &self,
-        len_slot: usize,
+        len_slot: &str,
         elem_size: usize,
         index_expr: &str,
         tr: bool,
@@ -3878,7 +4175,7 @@ impl<'a> Translator<'a> {
 
     fn dyn_array_set(
         &self,
-        len_slot: usize,
+        len_slot: &str,
         elem_size: usize,
         index_expr: &str,
         val: &str,
@@ -4302,7 +4599,7 @@ impl<'a> Translator<'a> {
                 }
                 if method == "get" && args.len() == 1 {
                     let idx = self.translate_expr(&args[0], ctx);
-                    return self.dyn_array_get(slot, elem_size, &idx, tr);
+                    return self.dyn_array_get(&slot, elem_size, &idx, tr);
                 }
             }
         }
@@ -4546,10 +4843,8 @@ impl<'a> Translator<'a> {
         matches!(t, Type::FixedArray(..)) || is_struct_type(self.type_checker(), t)
     }
 
-    // The width of one element slot in a memory array. A String/Bytes element is
-    // stored as a pointer to its own memory block (like a nested array), so it
-    // occupies a full 32-byte slot, not its packed scalar size. size_of already
-    // reports 32 for a nested-array element; only String/Bytes need the override.
+    // The width of one element slot in a memory array. A String/Bytes element is a
+    // pointer, so it occupies a full 32-byte slot, not its packed scalar size.
     fn mem_elem_stride(&self, inner: &Type) -> usize {
         if is_str_type(inner) {
             32
@@ -4905,19 +5200,9 @@ impl<'a> Translator<'a> {
         format!("gum_uint_to_str({})", val)
     }
 
-    // Vm.sender = addr: a test cheatcode. It compiles to a plain CALL to the
-    // well-known cheatcode address (Foundry's) carrying startPrank(address);
-    // `gumc --test`'s EVM inspector recognizes that address and makes every
-    // following call come from `addr`. Outside `--test` the call hits an address
-    // with no code and is a harmless no-op, so leaving it in never affects
-    // production behavior.
-    // Runs a hoisted try body in its own frame. Encodes the captured arguments
-    // as calldata, sets the capability flag the thunk's guard requires,
-    // self-calls, then clears the flag. A call frame is the only place the EVM
-    // lets a revert be caught, and it makes the scope transactional: on revert
-    // the frame's storage changes roll back and catch runs. If the body can
-    // return, a non-empty returndata carries the value and becomes the enclosing
-    // function's return (which is why this is only used from returning entries).
+    // Runs a hoisted try body in its own call frame: encodes the captured args,
+    // sets the capability flag the thunk requires, self-calls, clears the flag.
+    // On revert the frame rolls back and catch runs; a return comes back as returndata.
     fn translate_scoped_try(
         &self,
         thunk: &str,
@@ -4991,15 +5276,14 @@ impl<'a> Translator<'a> {
             out.push_str("}\n");
         }
         // Write-back: on success the thunk returned the mutated variable's new
-        // value in returndata; assign it back to the enclosing local. (Only
-        // reached when the body does not return, so this is unambiguous.)
+        // value in returndata; decode it through its type's codec and assign it
+        // back to the enclosing local. Any type works, a String/Bytes, struct or
+        // array comes back through the same decoder an interface-call return uses,
+        // not just a one-word scalar. (Only reached when the body does not return,
+        // so this is unambiguous.)
         if let Some((name, ty)) = writeback {
-            let scratch = format!("__try_wb_{}", id);
             out.push_str(&format!("if {} {{\n", ok));
-            out.push_str(&format!("    let {} := allocate_memory(32)\n", scratch));
-            out.push_str(&format!("    returndatacopy({}, 0, 32)\n", scratch));
-            let loaded = self.mask_for_type(&format!("mload({})", scratch), ty);
-            out.push_str(&format!("    {} := {}\n", name, loaded));
+            out.push_str(&self.returndata_to_var(ty, name));
             out.push_str("}\n");
         }
         out.push_str(&format!("if iszero({}) {{\n", ok));
@@ -5261,6 +5545,58 @@ impl<'a> Translator<'a> {
         }
     }
 
+    // Decodes an ABI-encoded value of type t from the current return data into the
+    // Yul variable dst, using the per-type codecs an interface-call return uses.
+    // Shared with the try write-back path, which hands a value back the same way.
+    fn returndata_to_var(&self, t: &Type, dst: &str) -> String {
+        let decode = |min: String, expr: String| -> String {
+            let mut o = format!("    if lt(returndatasize(), {}) {{ revert(0, 0) }}\n", min);
+            o.push_str("    let rd := allocate_memory(returndatasize())\n");
+            o.push_str("    returndatacopy(rd, 0, returndatasize())\n");
+            o.push_str(&format!("    {} := {}\n", dst, expr));
+            o
+        };
+        if is_str_type(t) {
+            self.ensure_helper("gum_abi_str_mem", gum_abi_str_mem_helper_src);
+            return decode(
+                "32".to_string(),
+                "gum_abi_str_mem(rd, mload(rd), returndatasize())".to_string(),
+            );
+        }
+        if matches!(t, Type::Array(_) | Type::FixedArray(..)) {
+            if let Some(h) = self.ensure_abi_mem(t) {
+                return if self.abi_is_dynamic(t) {
+                    decode("32".to_string(), format!("{}(rd, mload(rd), returndatasize())", h))
+                } else {
+                    decode(
+                        self.abi_head_bytes(t).to_string(),
+                        format!("{}(rd, 0, returndatasize())", h),
+                    )
+                };
+            }
+        }
+        if let Type::Primitive(nm) = t {
+            if is_struct_type(self.type_checker(), t) {
+                // A dynamic struct return sits behind an offset word, like a
+                // dynamic array; a static one is inline from the start.
+                if self.abi_is_dynamic(t) {
+                    if let Some(h) = self.ensure_abi_dyn_struct_mem(nm) {
+                        return decode("32".to_string(), format!("{}(rd, mload(rd), returndatasize())", h));
+                    }
+                }
+                if let Some((h, wire)) = self.ensure_abi_struct_mem(nm) {
+                    return decode(wire.to_string(), format!("{}(rd, 0, returndatasize())", h));
+                }
+            }
+        }
+        // Scalar: one word, masked to the declared width.
+        format!(
+            "    if lt(returndatasize(), 32) {{ revert(0, 0) }}\n    returndatacopy(0, 0, 32)\n    {} := {}\n",
+            dst,
+            self.mask_for_type("mload(0)", t)
+        )
+    }
+
     // An interface call is the same ABI layout problem as a CREATE, only the prefix differs: a 4-byte selector instead of the child's creation code, so it shares abi_arg_blob_src.
     fn extcall_return_src(&self, ret_ty: &Option<Type>) -> String {
         let t = match ret_ty {
@@ -5301,6 +5637,13 @@ impl<'a> Translator<'a> {
         }
         match t {
             Type::Primitive(nm) if is_struct_type(self.type_checker(), t) => {
+                // A dynamic struct return sits behind an offset word; a static one
+                // is inline from the start.
+                if self.abi_is_dynamic(t) {
+                    if let Some(h) = self.ensure_abi_dyn_struct_mem(nm) {
+                        return decode("32".to_string(), format!("{}(rd, mload(rd), returndatasize())", h));
+                    }
+                }
                 if let Some((h, wire)) = self.ensure_abi_struct_mem(nm) {
                     return decode(wire.to_string(), format!("{}(rd, 0, returndatasize())", h));
                 }

@@ -26,14 +26,16 @@ impl AbiInput {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AbiEntry {
     #[serde(rename = "type")]
-    pub entry_type: String, // "function", "constructor", "error", "event"
+    // "function", "constructor", "error", "event"
+    pub entry_type: String,
     pub name: String,
     pub inputs: Vec<AbiInput>,
     // Option rather than always emitted, so an event or error omits these keys entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<AbiInput>>,
     #[serde(rename = "stateMutability", skip_serializing_if = "Option::is_none")]
-    pub state_mutability: Option<String>, // "nonpayable", "view", "pure", "payable"
+    // "nonpayable", "view", "pure", "payable"
+    pub state_mutability: Option<String>,
     // Events only, and always Some(false): gum has no anonymous event syntax, but the key is required for the entry to be well formed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
@@ -58,9 +60,10 @@ impl<'a> AbiGenerator<'a> {
                     "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => format!("int{}", name[1..].to_string()),
                     "Address" | "Account" => "address".to_string(),
                     "bool" => "bool".to_string(),
-                    "f32" | "f64" => "int256".to_string(), // Default mapped to fixed math sizes
-                    "Message" => "Message".to_string(), // Handled by ABI filtering
-                    "Block" => "Block".to_string(), // Handled by ABI filtering
+                    // fixed-point maps to int256; Message/Block are removed by ABI filtering
+                    "f32" | "f64" => "int256".to_string(),
+                    "Message" => "Message".to_string(),
+                    "Block" => "Block".to_string(),
                     _ if crate::codegen::translator::byte_width(name).is_some() => {
                         format!("bytes{}", crate::codegen::translator::byte_width(name).unwrap())
                     }
@@ -156,7 +159,8 @@ impl<'a> AbiGenerator<'a> {
 
             entries.push(AbiEntry {
                 entry_type: "constructor".to_string(),
-                name: "".to_string(), // constructors do not have a name in ABI
+                // constructors do not have a name in ABI
+                name: "".to_string(),
                 inputs,
                 outputs: Some(Vec::new()),
                 state_mutability: Some("nonpayable".to_string()),

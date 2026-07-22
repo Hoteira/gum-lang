@@ -91,8 +91,9 @@ pub struct Parameter {
 pub enum Statement {
     VarDecl { is_mut: bool, is_const: bool, type_def: Type, name: String, value: Option<Expr> },
     Assignment { target: Expr, value: Expr },
-    BitwiseFlip { name: String, index: Expr, value: Expr }, // Syntax sugar
-    // assert(cond) or assert(cond, msg), where msg is a string (→ the
+    // Syntax sugar
+    BitwiseFlip { name: String, index: Expr, value: Expr },
+    // assert(cond) or assert(cond, msg), where msg is a string (-> the
     Assert { condition: Expr, message: Option<Expr> },
     Revert { error: Expr },
     // delete x, reset an lvalue to its type's zero value. For most types
@@ -103,15 +104,9 @@ pub enum Statement {
     ForLoop { iterator: String, iterable: Expr, body: Vec<Spanned<Statement>> },
     WhileLoop { condition: Expr, body: Vec<Spanned<Statement>> },
     TryCatch { try_body: Vec<Spanned<Statement>>, catch_body: Vec<Spanned<Statement>> },
-    // Produced by the codegen try-hoisting pre-pass, never by the parser. The
-    // try body has been lifted into a synthesized entry fn named `thunk`; this
-    // runs it as a guarded self-call so any revert inside (internal or external)
-    // is caught and its state changes roll back, then runs catch_body on failure.
-    // `args` are the enclosing locals the body reads, marshalled in as the
-    // thunk's parameters. `propagate_return` means the body can return, so on
-    // success the thunk's returned value becomes the enclosing function's.
-    // `writeback` names a captured variable the body mutates: the thunk returns
-    // its new value and the site assigns it back on success.
+    // Produced by the codegen try-hoisting pass. The try body runs as a guarded
+    // self-call so any revert is caught and rolled back before catch. args marshal
+    // captured locals in; propagate_return and writeback carry a value back out.
     ScopedTryCall {
         thunk: String,
         args: Vec<(String, Type)>,
@@ -121,7 +116,8 @@ pub enum Statement {
     },
     Match { expr: Expr, arms: Vec<MatchArm> },
     Expression(Expr),
-    Call { target: String, args: Vec<Expr> }, // Low-level external contract call, e.g. call target(args)
+    // Low-level external contract call, e.g. call target(args)
+    Call { target: String, args: Vec<Expr> },
     UnsafeBlock(String),
 }
 

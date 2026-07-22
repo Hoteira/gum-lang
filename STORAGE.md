@@ -167,9 +167,29 @@ contract Names:
 
 This is exactly Solidity's `mapping(address => string)` storage, and is verified
 slot-for-slot against Solidity (header slot, data region, round-trip read, key
-isolation, and `delete`) by `mapping_string_value_matches_solidity`. A dynamic
-*array* value (`HashMap(K, [T])`) would likewise need a per-key region but is not
-yet implemented.
+isolation, and `delete`) by `mapping_string_value_matches_solidity`.
+
+### Dynamic-array-valued mappings
+
+When `V` is a dynamic array `[T]`, `map[k]`'s value slot `keccak256(k ‖ p)` holds
+the **length**, and the elements pack from `keccak256(keccak256(k ‖ p))` — the
+value slot standing in for the array field's own slot in the [dynamic-array
+layout](#dynamic-arrays-t) below.
+
+```
+contract Lists:
+    HashMap(Account, [u256]) items   # slot p
+
+# items[who].length         → keccak256(who ‖ p)
+# items[who][i]             → keccak256(keccak256(who ‖ p)) + (i / per) × es
+```
+
+`push`, `pop`, `[i]`, `.length` and `delete` all apply, addressing off that
+runtime slot exactly as they do off a constant field slot. This is exactly
+Solidity's `mapping(address => T[])` storage, verified slot-for-slot (length
+slot, element slots, reads, key isolation, and `delete`) by
+`mapping_dynamic_array_value_matches_solidity`. The element `T` must itself have
+a fixed slot layout (a scalar); an array of a dynamic element is still rejected.
 
 ---
 

@@ -1,0 +1,15 @@
+use gum.defaults.String
+
+contract Strs:
+    export fn echo([String] xs) -> [String]:
+        return xs
+
+    export fn first([String] xs) -> String:
+        var s = xs[0]
+        return s
+
+    export fn alen([String] xs) -> u256:
+        return xs.length
+
+    export fn plen([String] xs) -> u256:
+        return xs[0].length

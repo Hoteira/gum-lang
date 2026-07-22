@@ -1,0 +1,24 @@
+use gum.defaults.Account
+
+class P:
+    i32 s
+    fn new(i32 v):
+        self.s = v
+
+contract C:
+    HashMap(u256, i32) m
+    [i32] a
+    P p
+
+    export fn setm(u256 k, i32 v):
+        C.m[k] = v
+    export fn addm(u256 k, i32 v):
+        C.m[k] = C.m[k] + v
+    export fn pusha(i32 v):
+        C.a.push(v)
+    export fn adda(u256 i, i32 v):
+        C.a[i] = C.a[i] + v
+    export fn setp(i32 v):
+        C.p.s = v
+    export fn addp(i32 v):
+        C.p.s = C.p.s + v

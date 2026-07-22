@@ -19,10 +19,10 @@ fn tester() -> Address {
     Address::from([0x11u8; 20])
 }
 
-// The test-time cheatcode inspector. A `Vm.*` cheatcode in gum compiles to a
+// The test-time cheatcode inspector. A Vm. cheatcode in gum compiles to a
 // CALL to VM_ADDRESS, which never runs on chain; here it is intercepted and
-// turned into an effect on the EVM. So far: the sender, set by `Vm.sender = a`,
-// which makes every following call in the test come from `a` — the workhorse
+// turned into an effect on the EVM. So far: the sender, set by Vm.sender = a,
+// which makes every following call in the test come from a, the workhorse
 // for testing access control.
 #[derive(Default)]
 struct Cheats {
@@ -97,7 +97,7 @@ fn deploy(db: &mut Db, creation: Vec<u8>) -> Result<Address, String> {
 }
 
 // The test call runs under the cheatcode inspector (a fresh one per test), so
-// `Vm.*` calls inside the test take effect.
+// Vm. calls inside the test take effect.
 fn call(db: &mut Db, to: Address, data: Vec<u8>) -> (bool, Vec<u8>) {
     let mut evm = Context::mainnet()
         .with_db(&mut *db)

@@ -35,7 +35,7 @@ fn hash_slot(key: &str) -> String {
 }
 
 // Storage slot for a once function's has-run flag. Derived from keccak of the
-// function name so it can never collide with a normal field's slot (0, 1, 2, …)
+// function name so it can never collide with a normal field's slot (0, 1, 2, ...)
 // the same trick namespaced storage uses.
 fn once_flag_slot(fn_name: &str) -> String {
     hash_slot(&format!("gum.once:{}", fn_name))
@@ -139,8 +139,7 @@ fn collect_generic_instantiations(program: &Program, type_checker: &TypeChecker)
         for f in &class_decl.fields {
             note_generic(&f.type_def, &mut found);
         }
-        // Deliberately not scanning method parameter/return types here: a
-        // Deliberately not scanning method parameter/return types here: a
+        // Deliberately not scanning method parameter/return types here.
         for m in &class_decl.methods {
             scan_stmts_for_generics(&m.body, &mut found);
         }
@@ -326,12 +325,9 @@ fn is_try_thunk(f: &FnDecl) -> bool {
 pub(crate) const TRY_CAPABILITY_SLOT: &str =
     "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe";
 
-// Rewrites every try/catch in a contract into a guarded self-call. The try body
-// is lifted into a synthesized entry fn (__try_thunk_N); the site becomes a
-// ScopedTryCall that runs it in its own call frame. A call frame is the only
-// place the EVM lets a revert be caught, so this is what makes try catch every
-// revert (internal or external), and it makes the scope transactional: on revert
-// the frame's storage changes roll back before catch runs.
+// Rewrites every try/catch into a guarded self-call: the try body is lifted into
+// a synthesized entry fn and the site becomes a ScopedTryCall run in its own
+// frame, so any revert is caught and its state rolls back before catch runs.
 fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
     let mut thunks: Vec<FnDecl> = Vec::new();
     let mut counter = 0usize;
@@ -344,7 +340,7 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
         collect_var_decls(&m.body, &mut base_locals);
         // Explicitly-typed locals the method declares, so a try body that reads
         // one can marshal it into the thunk the same way a parameter is. An
-        // inferred `var` local is absent here (this pass runs before type
+        // inferred var local is absent here (this pass runs before type
         // inference), so a body capturing one stays on the old inline path.
         let mut local_types: HashMap<String, Type> = HashMap::new();
         collect_var_types(&m.body, &mut local_types);
@@ -381,10 +377,9 @@ fn hoist_in_body(
     }
 }
 
-// Decides whether a try body can be lifted into its own frame, and if so which
-// enclosing parameters it captures. A body that reads an outer local that is not
-// a parameter, or that returns from a function we can't propagate out of, stays
-// on the existing external-call path (returns None).
+// Decides whether a try body can be scoped into its own frame, and if so what it
+// captures and writes back. A body this pass can't marshal stays on the old
+// inline external-call path (returns None).
 fn plan_capture(
     try_body: &[Spanned<Statement>],
     base_locals: &HashSet<String>,
@@ -404,7 +399,7 @@ fn plan_capture(
     // Resolve every captured name to a type and marshal it into the frame. A
     // parameter's type comes from the signature; an enclosing local's from its
     // explicit declaration. A captured name with no type here is an inferred
-    // `var` (or a loop/match binding) this pass can't marshal, so the whole try
+    // var (or a loop/match binding) this pass can't marshal, so the whole try
     // stays on the old inline path. Params keep signature order and locals sort
     // by name, so the site, the thunk and the selector agree and the emitted
     // bytecode stays reproducible.
@@ -442,11 +437,14 @@ fn plan_capture(
     let has_ret = body_has_return(try_body);
     let writeback: Option<(String, Type)> = match mutated.as_slice() {
         [] => None,
-        [c] if !has_ret && is_simple_value_type(&c.type_def) => {
-            Some((c.name.clone(), c.type_def.clone()))
-        }
-        // Multiple mutations, a reference-typed mutation, or a mutation combined
-        // with a return: not yet marshalled, so keep the old inline path.
+        // One mutated captured variable of ANY type travels back out of the frame:
+        // the thunk returns it (ABI-encoded through the entry return path, which
+        // already handles String/Bytes/struct/array) and the site decodes it with
+        // that type's codec. A mutation combined with a return, or more than one
+        // mutated variable, still stays on the old inline path (the thunk can carry
+        // one value in returndata, not a returned value plus a write-back, nor a
+        // tuple of several).
+        [c] if !has_ret => Some((c.name.clone(), c.type_def.clone())),
         _ => return None,
     };
 
@@ -467,21 +465,6 @@ struct Capture {
     captures: Vec<Parameter>,
     has_ret: bool,
     writeback: Option<(String, Type)>,
-}
-
-// A value type small enough to travel back out of a frame in one word: the
-// numeric widths, bool, an address, or fixed bytes. Excludes String/Bytes,
-// arrays, structs, and enums, whose write-back is not marshalled yet.
-fn is_simple_value_type(t: &Type) -> bool {
-    match t {
-        Type::Primitive(n) => {
-            n == "bool"
-                || n == "Account"
-                || (n.starts_with('b') && n[1..].parse::<usize>().is_ok())
-                || ((n.starts_with('u') || n.starts_with('i')) && n[1..].parse::<usize>().is_ok())
-        }
-        _ => false,
-    }
 }
 
 fn hoist_in_stmt(
@@ -513,7 +496,8 @@ fn hoist_in_stmt(
             let Capture { captures, has_ret, writeback } =
                 match plan_capture(try_body, base_locals, enclosing) {
                     Some(p) => p,
-                    None => return, // leave on the existing path
+                    // leave on the existing path
+                    None => return,
                 };
             let id = *counter;
             *counter += 1;
@@ -571,11 +555,9 @@ fn hoist_in_stmt(
     }
 }
 
-// Explicitly-typed locals a body declares, recursively through nested blocks.
-// An inferred `var` (type_def is the `_infer`/`unknown` sentinel) is skipped:
-// its type is only known after inference, which this pass runs before, so a try
-// capturing one can't be marshalled and stays on the old inline path. Loop
-// iterators and match payloads are likewise skipped (no declared type here).
+// Explicitly-typed locals a body declares, recursively. An inferred var (the
+// _infer sentinel) is skipped: its type isn't known until after this pass, so a
+// try capturing one stays on the old inline path. Loop/match bindings too.
 fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type>) {
     for s in body {
         match &s.node {
@@ -777,7 +759,7 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
         }
         // A hoisted inner try reads its captured args and writes back its mutated
         // variable in the enclosing frame, so an outer try around it must capture
-        // those names too — otherwise the outer thunk references a variable it was
+        // those names too, otherwise the outer thunk references a variable it was
         // never handed. (The inner body itself is gone into its own thunk.)
         Statement::ScopedTryCall { args, writeback, catch_body, .. } => {
             for (n, _) in args {
@@ -1084,6 +1066,18 @@ impl EvmYulBackend {
                     }
                     if let Type::Primitive(name) = &p.type_def {
                         if is_struct_type(layout_engine.type_checker, &p.type_def) {
+                            // A dynamic struct constructor arg sits behind an offset
+                            // word, like a dynamic array; a static one is inline.
+                            if translator.abi_is_dynamic(&p.type_def) {
+                                if let Some(helper) = translator.ensure_abi_dyn_struct_mem(name) {
+                                    yul.push_str(&format!(
+                                        "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
+                                        arg_name, helper, offset
+                                    ));
+                                    offset += 32;
+                                    continue;
+                                }
+                            }
                             if let Some((helper, wire)) = translator.ensure_abi_struct_mem(name) {
                                 yul.push_str(&format!(
                                     "    let {} := {}(args_mem, {}, _args_len)\n",
@@ -1163,7 +1157,8 @@ impl EvmYulBackend {
         }
         yul.push_str(&format!("    return(0, datasize(\"{r}\"))\n", r = runtime_obj));
 
-        yul.push_str("  }\n"); // End of deployment block
+        // End of deployment block
+        yul.push_str("  }\n");
 
         yul.push_str(&format!("  object \"{}\" {{\n", runtime_obj));
         yul.push_str("    code {\n");
@@ -1311,6 +1306,19 @@ impl EvmYulBackend {
                         // A static struct is inline in the head, so it advances the cursor by its whole wire width rather than the one word an offset would take.
                         if let Type::Primitive(name) = &p.type_def {
                             if is_struct_type(layout_engine.type_checker, &p.type_def) {
+                                // A dynamic struct (a struct with a String/Bytes/array
+                                // field) sits behind an offset word like a dynamic
+                                // array, decoded at add(4, that offset).
+                                if translator.abi_is_dynamic(&p.type_def) {
+                                    if let Some(helper) = translator.ensure_abi_dyn_struct_cd(name) {
+                                        yul.push_str(&format!(
+                                            "          let {} := {}(add(4, calldataload({})))\n",
+                                            arg_name, helper, offset
+                                        ));
+                                        offset += 32;
+                                        continue;
+                                    }
+                                }
                                 if let Some((helper, wire)) = translator.ensure_abi_struct_cd(name) {
                                     yul.push_str(&format!("          let {} := {}({})\n", arg_name, helper, offset));
                                     offset += wire;
@@ -1379,7 +1387,8 @@ impl EvmYulBackend {
         }
 
         yul.push_str("    }\n");
-        yul.push_str("  }\n"); // End of runtime object
+        // End of runtime object
+        yul.push_str("  }\n");
         
         
         let mut shared_functions = String::new();

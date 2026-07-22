@@ -2011,7 +2011,8 @@ fn a_dynamic_value_inside_a_storage_aggregate_is_rejected() {
     assert_compile_fails("contract C:\n    [[u256]] g\n\n    export fn f(u256 i, u256 j) -> u256:\n        return C.g[i][j]\n");
     assert_compile_fails("contract C:\n    [[u256]; 2] g\n\n    export fn f() -> u256:\n        return 1\n");
     assert_compile_fails("use gum.defaults.String\n\ncontract C:\n    [String] g\n\n    export fn f() -> u256:\n        return 1\n");
-    assert_compile_fails("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, [u256]) m\n\n    export fn f() -> u256:\n        return 1\n");
+    // A mapping to an array of a dynamic element still has no per-element layout.
+    assert_compile_fails("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, [[u256]]) m\n\n    export fn f() -> u256:\n        return 1\n");
     // Storage is only a contract's own fields, so the same type as a parameter is untouched.
     assert_compiles("contract C:\n    export fn f([[u256]] xs) -> u256:\n        return xs[0][0]\n");
     // And what has a real layout still has one.
@@ -2022,6 +2023,9 @@ fn a_dynamic_value_inside_a_storage_aggregate_is_rejected() {
     // A String/Bytes mapping value gets its own slot region at keccak256(key ‖ p),
     // exactly like Solidity's mapping(K => string), so it does have a layout.
     assert_compiles("use gum.defaults.Account\nuse gum.defaults.String\n\ncontract C:\n    HashMap(Account, String) m\n\n    export fn f(Account a, String s):\n        C.m[a] = s\n\n    export fn g(Account a) -> String:\n        return C.m[a]\n");
+    // A dynamic-array mapping value likewise has a layout (mapping(K => T[])): the
+    // value slot holds the length, elements pack from keccak256(that slot).
+    assert_compiles("use gum.defaults.Account\n\ncontract C:\n    HashMap(Account, [u256]) m\n\n    export fn f(Account a, u256 v):\n        C.m[a].push(v)\n\n    export fn g(Account a, u256 i) -> u256:\n        return C.m[a][i]\n\n    export fn n(Account a) -> u256:\n        return C.m[a].length\n");
 }
 
 #[test]
@@ -2034,10 +2038,15 @@ fn a_string_array_across_the_abi_is_accepted() {
 }
 
 #[test]
-fn a_dynamic_struct_field_across_the_abi_is_still_rejected() {
-    // A struct with a String field is a dynamic tuple, which needs the head/tail
-    // struct codec (not built yet); it must be refused, not mis-encoded.
-    assert_compile_fails("use gum.defaults.String\n\nclass P:\n    u256 id\n    String name\n\ncontract C:\n    export fn f() -> P:\n        var p = new P(1, \"a\")\n        return p\n");
+fn a_dynamic_struct_crosses_the_abi_but_not_nested_or_in_an_array() {
+    // A struct with a String (or array) field rides the wire as a dynamic tuple
+    // now — head of (id, offset), then the name's tail — as an argument and a
+    // return.
+    assert_compiles("use gum.defaults.String\n\nclass Meta:\n    u256 id\n    String name\n\n    fn new(u256 i, String n):\n        self.id = i\n        self.name = n\n\ncontract C:\n    export fn echo(Meta m) -> Meta:\n        return m\n");
+    assert_compiles("class Nums:\n    u256 id\n    [u256] xs\n\ncontract C:\n    export fn f(Nums n) -> u256:\n        return n.id\n");
+    // But a dynamic struct as an *array element*, or a struct nested in a struct,
+    // still has no codec.
+    assert_compile_fails("use gum.defaults.String\n\nclass Meta:\n    u256 id\n    String name\n\ncontract C:\n    export fn f([Meta] ms) -> u256:\n        return 1\n");
 }
 
 #[test]
@@ -2149,8 +2158,10 @@ contract C:
 }
 
 #[test]
-fn a_struct_with_a_non_scalar_field_across_the_abi_is_rejected() {
-    // A nested struct and a String field are multi-word or dynamic on the wire, and neither has a codec yet.
+fn a_struct_nesting_another_struct_across_the_abi_is_rejected() {
+    // A struct field that is itself a struct is multi-word and would need the
+    // dynamic-tuple codec applied recursively, which is not built; it is refused
+    // rather than mis-encoded. (A String/array field, by contrast, now works.)
     assert_compile_fails("class I:
     u256 x
 
@@ -2161,14 +2172,6 @@ class O:
 contract C:
     export fn f(O o) -> u256:
         return o.y
-");
-    assert_compile_fails("class W:
-    u256 z
-    String s
-
-contract C:
-    export fn f(W w) -> u256:
-        return w.z
 ");
 }
 

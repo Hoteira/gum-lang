@@ -2531,8 +2531,7 @@ fn bare_return_early_exits_void_function() {
             return;
         }
     };
-    let gum_src = "\
-
+    let gum_src = "
 contract S:
     u256 t
 
@@ -4372,15 +4371,8 @@ fn mapping_string_value_matches_solidity() {
             return;
         }
     };
-    let gum_src = "contract Names:\n    HashMap(Account, String) names\n\n    \
-                   export fn set(Account who, String name):\n        Names.names[who] = name\n\n    \
-                   export fn get(Account who) -> String:\n        return Names.names[who]\n\n    \
-                   export fn clear(Account who):\n        delete Names.names[who]\n";
-    let sol_src = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract Names {\n    \
-                   mapping(address => string) names;\n    \
-                   function set(address who, string calldata name) external { names[who] = name; }\n    \
-                   function get(address who) external view returns (string memory) { return names[who]; }\n    \
-                   function clear(address who) external { delete names[who]; }\n}\n";
+    let gum_src = include_str!("fixtures/gum_map_string.gum");
+    let sol_src = include_str!("fixtures/sol_map_string.sol");
 
     let gum = gum_creation_bytecode(gum_src, &solc, false);
     let sol = sol_creation_bytecode(sol_src, &solc);
@@ -4480,6 +4472,119 @@ fn mapping_string_value_matches_solidity() {
     }
 }
 
+// A dynamic array as a mapping value: HashMap(Account, [u256]). m[k] lives at the
+// mapping value slot keccak256(key ‖ p), which holds the length; the elements
+// pack from keccak256(that slot), exactly as Solidity lays out
+// mapping(address => uint256[]). Diffs the length slot, the element data slots,
+// the get/size reads, key isolation and delete against a Solidity twin across a
+// push/set/pop/delete sequence.
+#[test]
+fn mapping_dynamic_array_value_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = include_str!("fixtures/gum_map_dyn_arr.gum");
+    let sol_src = include_str!("fixtures/sol_map_dyn_arr.sol");
+
+    let gum = gum_creation_bytecode(gum_src, &solc, false);
+    let sol = sol_creation_bytecode(sol_src, &solc);
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+
+    let arr_base = |value_slot: U256| -> U256 {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut k = Keccak::v256();
+        let mut out = [0u8; 32];
+        k.update(&value_slot.to_be_bytes::<32>());
+        k.finalize(&mut out);
+        U256::from_be_bytes(out)
+    };
+
+    let alice = Address::from([0xa1u8; 20]);
+    let bob = Address::from([0xb0u8; 20]);
+
+    // A push/set/pop/delete script across two keys. Each step runs on both, then
+    // the length slot, the first few element slots, and the read-backs are diffed.
+    let steps: Vec<(Address, &str, Vec<[u8; 32]>)> = vec![
+        (alice, "add(address,uint256)", vec![word_u256(U256::from(10u64))]),
+        (alice, "add(address,uint256)", vec![word_u256(U256::from(20u64))]),
+        (alice, "add(address,uint256)", vec![word_u256(U256::from(30u64))]),
+        (bob, "add(address,uint256)", vec![word_u256(U256::from(99u64))]),
+        (alice, "set(address,uint256,uint256)", vec![word_addr(alice), word_u256(U256::from(1u64)), word_u256(U256::from(25u64))]),
+        (alice, "drop_last(address)", vec![]),
+    ];
+
+    for (caller, sig, tail) in &steps {
+        // The address is the first arg for every entry here; build calldata as
+        // selector + who + the remaining words (which already include who for the
+        // multi-arg sigs, so use encode_words for those and prepend who for the rest).
+        let data = if sig.starts_with("set") {
+            encode_words(sig, tail)
+        } else if sig.starts_with("add") {
+            let mut w = vec![word_addr(*caller)];
+            w.extend_from_slice(tail);
+            encode_words(sig, &w)
+        } else {
+            encode_words(sig, &[word_addr(*caller)])
+        };
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert_eq!(g.success, s.success, "{}: success mismatch", sig);
+        assert_eq!(g.output, s.output, "{}: output mismatch", sig);
+
+        for who in [alice, bob] {
+            let vslot = mapping_slot(who, 0);
+            assert_eq!(
+                storage_at(&mut gdb, ga, vslot),
+                storage_at(&mut sdb, sa, vslot),
+                "{}: length slot for {:?}", sig, who
+            );
+            let base = arr_base(vslot);
+            for i in 0..4u64 {
+                let slot = base + U256::from(i);
+                assert_eq!(
+                    storage_at(&mut gdb, ga, slot),
+                    storage_at(&mut sdb, sa, slot),
+                    "{}: element slot {} for {:?}", sig, i, who
+                );
+            }
+            // size() and each element get() must read back identically.
+            let sz = call(&mut gdb, ga, encode_words("size(address)", &[word_addr(who)]));
+            let sz2 = call(&mut sdb, sa, encode_words("size(address)", &[word_addr(who)]));
+            assert_eq!(sz.output, sz2.output, "{}: size() for {:?}", sig, who);
+            let n = U256::from_be_slice(&sz.output).to::<u64>();
+            for i in 0..n {
+                let gi = call(&mut gdb, ga, encode_words("get(address,uint256)", &[word_addr(who), word_u256(U256::from(i))]));
+                let si = call(&mut sdb, sa, encode_words("get(address,uint256)", &[word_addr(who), word_u256(U256::from(i))]));
+                assert_eq!(gi.success, si.success, "{}: get({}) success for {:?}", sig, i, who);
+                assert_eq!(gi.output, si.output, "{}: get({}) for {:?}", sig, i, who);
+            }
+        }
+    }
+
+    // delete releases the region exactly as Solidity's delete does.
+    let del = encode_words("clear(address)", &[word_addr(alice)]);
+    assert!(call(&mut gdb, ga, del.clone()).success);
+    assert!(call(&mut sdb, sa, del).success);
+    let vslot = mapping_slot(alice, 0);
+    assert_eq!(storage_at(&mut gdb, ga, vslot), U256::ZERO, "length not cleared");
+    let base = arr_base(vslot);
+    for i in 0..4u64 {
+        let slot = base + U256::from(i);
+        assert_eq!(
+            storage_at(&mut gdb, ga, slot),
+            storage_at(&mut sdb, sa, slot),
+            "element slot {} not released like Solidity", i
+        );
+    }
+}
+
 // A String element across the ABI: string[] as an argument and a return, plus
 // indexing one element out. gum decodes the calldata blob and re-encodes it
 // through the new String element codec (gum_abi_str_cd/put/size) wrapped by the
@@ -4494,16 +4599,8 @@ fn string_array_across_the_abi_matches_solidity() {
             return;
         }
     };
-    let gum_src = "use gum.defaults.String\n\ncontract Strs:\n    \
-                   export fn echo([String] xs) -> [String]:\n        return xs\n\n    \
-                   export fn first([String] xs) -> String:\n        var s = xs[0]\n        return s\n\n    \
-                   export fn alen([String] xs) -> u256:\n        return xs.length\n\n    \
-                   export fn plen([String] xs) -> u256:\n        return xs[0].length\n";
-    let sol_src = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract Strs {\n    \
-                   function echo(string[] calldata xs) external pure returns (string[] memory) { return xs; }\n    \
-                   function first(string[] calldata xs) external pure returns (string memory) { return xs[0]; }\n    \
-                   function alen(string[] calldata xs) external pure returns (uint256) { return xs.length; }\n    \
-                   function plen(string[] calldata xs) external pure returns (uint256) { return bytes(xs[0]).length; }\n}\n";
+    let gum_src = include_str!("fixtures/gum_string_array.gum");
+    let sol_src = include_str!("fixtures/sol_string_array.sol");
 
     let gum = gum_creation_bytecode(gum_src, &solc, false);
     let sol = sol_creation_bytecode(sol_src, &solc);
@@ -4577,6 +4674,307 @@ fn string_array_across_the_abi_matches_solidity() {
             assert_eq!(g.output, s.output, "first output differs");
             assert_eq!(g.output, abi_encode_string(items[0]), "first must return element 0");
         }
+    }
+}
+
+// A struct with a dynamic field across the ABI: Meta { u256 id; String name }.
+// It rides the wire as a dynamic tuple — a head of (id, offset-to-name) then the
+// name's tail — through the new dynamic-struct codec composing the scalar and
+// String field codecs. echo decodes the tuple and re-encodes it; feeding identical
+// calldata to a Solidity twin and diffing the output proves it round-trips
+// byte-for-byte, and a struct arg + struct return both work.
+#[test]
+fn dynamic_struct_across_the_abi_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = include_str!("fixtures/gum_dyn_struct.gum");
+    let sol_src = include_str!("fixtures/sol_dyn_struct.sol");
+
+    let gum = gum_creation_bytecode(gum_src, &solc, false);
+    let sol = sol_creation_bytecode(sol_src, &solc);
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+
+    // Hand-encode `echo((uint256,string))`: the tuple is dynamic, so it sits
+    // behind an offset; inside, the head is (id, offset-to-name), then the name.
+    let encode = |id: u64, name: &[u8]| -> Vec<u8> {
+        let mut data = selector("echo((uint256,string))").to_vec();
+        data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>()); // offset to the tuple
+        data.extend_from_slice(&U256::from(id).to_be_bytes::<32>()); // id (head word 0)
+        data.extend_from_slice(&U256::from(64u64).to_be_bytes::<32>()); // offset to name within tuple
+        data.extend_from_slice(&U256::from(name.len()).to_be_bytes::<32>()); // name length
+        let mut nb = name.to_vec();
+        let pad = (32 - (name.len() % 32)) % 32;
+        nb.extend(std::iter::repeat(0u8).take(pad));
+        data.extend_from_slice(&nb);
+        data
+    };
+
+    let cases: &[(u64, &[u8])] = &[
+        (0, b""),
+        (7, b"Alice"),
+        (42, &[b'x'; 31]),  // longest short
+        (100, &[b'y'; 32]), // first long
+        (999, &[b'z'; 80]),
+    ];
+    for (id, name) in cases {
+        let data = encode(*id, name);
+        let g = call(&mut gdb, ga, data.clone());
+        let s = call(&mut sdb, sa, data);
+        assert_eq!(g.success, s.success, "echo success for id {} len {}", id, name.len());
+        assert!(g.success, "echo reverted for id {} len {}", id, name.len());
+        assert_eq!(g.output, s.output, "echo output differs for id {} len {}", id, name.len());
+    }
+}
+
+// The outbound side of the dynamic-struct codec: a Caller encodes a Meta as an
+// interface-call argument (abi_arg_blob) and decodes the Meta it gets back. The
+// Target echoes it. Diffing the Caller's output against a Solidity twin exercises
+// the whole loop — arg encode, the target's arg decode + return encode, and the
+// caller's return decode — end to end.
+#[test]
+fn dynamic_struct_through_an_interface_call_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: no solc");
+            return;
+        }
+    };
+    let gum_src = include_str!("fixtures/gum_dyn_struct_iface.gum");
+    let sol_src = include_str!("fixtures/sol_dyn_struct_iface.sol");
+
+    let gum_target = gum_creation_bytecode_for(gum_src, &solc, false, "Target");
+    let gum_caller = gum_creation_bytecode_for(gum_src, &solc, false, "Caller");
+    let sol_target = sol_creation_bytecode_for(sol_src, &solc, "Target");
+    let sol_caller = sol_creation_bytecode_for(sol_src, &solc, "Caller");
+
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let gt = deploy(&mut gdb, gum_target);
+    let gc = deploy(&mut gdb, gum_caller);
+    let st = deploy(&mut sdb, sol_target);
+    let sc = deploy(&mut sdb, sol_caller);
+
+    let encode = |target: Address, id: u64, name: &[u8]| -> Vec<u8> {
+        let mut data = selector("call_it(address,uint256,string)").to_vec();
+        data.extend_from_slice(&word_addr(target));
+        data.extend_from_slice(&U256::from(id).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(96u64).to_be_bytes::<32>()); // offset to the string (3 head words)
+        data.extend_from_slice(&U256::from(name.len()).to_be_bytes::<32>());
+        let mut nb = name.to_vec();
+        let pad = (32 - (name.len() % 32)) % 32;
+        nb.extend(std::iter::repeat(0u8).take(pad));
+        data.extend_from_slice(&nb);
+        data
+    };
+
+    for (id, name) in [(1u64, &b""[..]), (7, b"Alice"), (42, &[b'z'; 70][..])] {
+        let g = call(&mut gdb, gc, encode(gt, id, name));
+        let s = call(&mut sdb, sc, encode(st, id, name));
+        assert_eq!(g.success, s.success, "call_it success for id {} len {}", id, name.len());
+        assert!(g.success, "call_it reverted for id {} len {}", id, name.len());
+        assert_eq!(g.output, s.output, "call_it output differs for id {} len {}", id, name.len());
+    }
+}
+
+// Structural differential fuzzer. Instead of running random call *sequences*
+// against a fixed contract (fuzz_erc20 etc.), this generates random *contracts* —
+// a random set of fields of random scalar types, each with a setter, a getter,
+// and (for numeric types) a checked-add mutator — and diffs gum against an
+// equivalent Solidity twin. The random field mix produces random storage packing,
+// which is exactly where a slot/mask bug hides: gum reorders fields largest-first
+// and read-modify-writes packed slots, so a wrong mask or offset corrupts a
+// slot-mate. Because both sides receive *identical* calldata (a raw random word,
+// not a canonically-encoded value), the encoder need not be canonical — any
+// behavioural divergence, including mishandled dirty upper bits, is a real gum bug.
+#[test]
+fn fuzz_random_storage_layout_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping fuzz: no solc");
+            return;
+        }
+    };
+
+    // (gum type, solidity type, supports checked +)
+    let types: &[(&str, &str, bool)] = &[
+        ("bool", "bool", false),
+        ("u8", "uint8", true),
+        ("u16", "uint16", true),
+        ("u32", "uint32", true),
+        ("u64", "uint64", true),
+        ("u128", "uint128", true),
+        ("u256", "uint256", true),
+        ("i8", "int8", true),
+        ("i32", "int32", true),
+        ("i128", "int128", true),
+        ("i256", "int256", true),
+        ("Account", "address", false),
+    ];
+
+    for seed in 0..24u64 {
+        let mut rng = Rng(0xf022_0000 ^ seed);
+        let nfields = 3 + (rng.next_u64() % 6) as usize; // 3..=8 fields
+        let fields: Vec<(&str, &str, bool)> =
+            (0..nfields).map(|_| types[(rng.next_u64() as usize) % types.len()]).collect();
+
+        // Build the two twins field-by-field with matching setters/getters/adders.
+        let mut gum = String::from("contract C:\n");
+        for (i, (g, _, _)) in fields.iter().enumerate() {
+            gum.push_str(&format!("    {} f{}\n", g, i));
+        }
+        for (i, (g, _, arith)) in fields.iter().enumerate() {
+            gum.push_str(&format!("\n    export fn s{i}({g} v):\n        C.f{i} = v\n", i = i, g = g));
+            gum.push_str(&format!("\n    export fn g{i}() -> {g}:\n        return C.f{i}\n", i = i, g = g));
+            if *arith {
+                gum.push_str(&format!("\n    export fn a{i}({g} v):\n        C.f{i} = C.f{i} + v\n", i = i, g = g));
+            }
+        }
+
+        let mut sol = String::from("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract C {\n");
+        for (i, (_, s, _)) in fields.iter().enumerate() {
+            sol.push_str(&format!("    {} f{};\n", s, i));
+        }
+        for (i, (_, s, arith)) in fields.iter().enumerate() {
+            sol.push_str(&format!("    function s{i}({s} v) external {{ f{i} = v; }}\n", i = i, s = s));
+            sol.push_str(&format!("    function g{i}() external view returns ({s}) {{ return f{i}; }}\n", i = i, s = s));
+            if *arith {
+                sol.push_str(&format!("    function a{i}({s} v) external {{ f{i} = f{i} + v; }}\n", i = i, s = s));
+            }
+        }
+        sol.push_str("}\n");
+
+        let gbc = gum_creation_bytecode(&gum, &solc, false);
+        let sbc = sol_creation_bytecode(&sol, &solc);
+        let mut gdb: Db = CacheDB::new(EmptyDB::default());
+        let mut sdb: Db = CacheDB::new(EmptyDB::default());
+        let ga = deploy(&mut gdb, gbc);
+        let sa = deploy(&mut sdb, sbc);
+
+        // A canonical, in-range argument word for the field's type, so both sides
+        // accept it (no decode-validation divergence) and the diff isolates the
+        // storage/packing/arithmetic paths. Values skew toward type boundaries and
+        // near-max to exercise sign bits, mask edges and checked-arithmetic reverts.
+        let encode_arg = |rng: &mut Rng, ty: &str| -> [u8; 32] {
+            if ty == "bool" {
+                let mut w = [0u8; 32];
+                w[31] = (rng.next_u64() & 1) as u8;
+                return w;
+            }
+            if ty == "Account" {
+                let mut w = [0u8; 32];
+                for b in w.iter_mut().skip(12) {
+                    *b = (rng.next_u64() & 0xff) as u8;
+                }
+                return w;
+            }
+            let signed = ty.starts_with('i');
+            let bits: usize = ty[1..].parse().unwrap();
+            let raw = rng.next_u256(true);
+            let val = if bits >= 256 {
+                raw
+            } else {
+                let mask = (U256::from(1u64) << bits) - U256::from(1u64);
+                let low = raw & mask;
+                if signed && ((low >> (bits - 1)) & U256::from(1u64)) == U256::from(1u64) {
+                    low | !mask // sign-extend a negative into the full word
+                } else {
+                    low
+                }
+            };
+            val.to_be_bytes::<32>()
+        };
+
+        let getters_match = |gdb: &mut Db, sdb: &mut Db| {
+            for i in 0..fields.len() {
+                let sig = format!("g{}()", i);
+                let g = call(gdb, ga, selector(&sig).to_vec());
+                let s = call(sdb, sa, selector(&sig).to_vec());
+                assert_eq!(g.success, s.success, "seed {}: {} success mismatch", seed, sig);
+                assert_eq!(g.output, s.output, "seed {}: {} value diverged\ngum:\n{}", seed, sig, gum);
+            }
+        };
+
+        for _ in 0..140 {
+            let k = (rng.next_u64() as usize) % fields.len();
+            let (g, s, arith) = fields[k];
+            let is_add = arith && rng.next_u64() % 2 == 0;
+            let (op, tyname) = if is_add { ("a", s) } else { ("s", s) };
+            let sig = format!("{}{}({})", op, k, tyname);
+            let arg = encode_arg(&mut rng, g);
+            let data = encode_words(&sig, &[arg]);
+            let g = call(&mut gdb, ga, data.clone());
+            let s2 = call(&mut sdb, sa, data);
+            assert_eq!(
+                g.success, s2.success,
+                "seed {}: {} success mismatch (arg {})\ngum:\n{}",
+                seed, sig, hex::encode(arg), gum
+            );
+            if g.success {
+                // The touched field must read back identically on both sides.
+                let gg = call(&mut gdb, ga, selector(&format!("g{}()", k)).to_vec());
+                let sg = call(&mut sdb, sa, selector(&format!("g{}()", k)).to_vec());
+                assert_eq!(gg.output, sg.output, "seed {}: after {} field {} diverged\ngum:\n{}", seed, sig, k, gum);
+            }
+        }
+        // Final full sweep: every field must still agree (catches a write to one
+        // field silently corrupting a packed slot-mate).
+        getters_match(&mut gdb, &mut sdb);
+    }
+}
+
+// Narrow signed integers in every container must round-trip through a read +
+// checked-arithmetic exactly as Solidity: a negative iN is read sign-extended, so
+// its underflow is caught, not silently wrapped. A regression for the bug the
+// structural fuzzer surfaced (found first in a plain field; the same read path
+// underlies mapping values, array elements and struct fields).
+#[test]
+fn narrow_signed_underflow_reverts_in_every_container() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let neg = |v: i32| {
+        let mut w = [0u8; 32];
+        if v < 0 {
+            for b in w[..28].iter_mut() {
+                *b = 0xff;
+            }
+        }
+        w[28..32].copy_from_slice(&v.to_be_bytes());
+        w
+    };
+    let gum = include_str!("fixtures/gum_signed_containers.gum");
+    let sol = include_str!("fixtures/sol_signed_containers.sol");
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum_creation_bytecode(gum, &solc, false));
+    let sa = deploy(&mut sdb, sol_creation_bytecode(sol, &solc));
+    let step = |gdb: &mut Db, sdb: &mut Db, sig: &str, args: &[[u8; 32]]| -> (bool, bool) {
+        let g = call(gdb, ga, encode_words(sig, args));
+        let s = call(sdb, sa, encode_words(sig, args));
+        (g.success, s.success)
+    };
+    let k = word_u256(U256::from(1u64));
+    for (label, setsig, setargs, addsig, addargs) in [
+        ("mapping", "setm(uint256,int32)", vec![k, neg(-2_000_000_000)], "addm(uint256,int32)", vec![k, neg(-500_000_000)]),
+        ("array", "pusha(int32)", vec![neg(-2_000_000_000)], "adda(uint256,int32)", vec![word_u256(U256::ZERO), neg(-500_000_000)]),
+        ("struct", "setp(int32)", vec![neg(-2_000_000_000)], "addp(int32)", vec![neg(-500_000_000)]),
+    ] {
+        let (gs, ss) = step(&mut gdb, &mut sdb, setsig, &setargs);
+        assert!(gs && ss, "{}: set should succeed", label);
+        let (ga_ok, sa_ok) = step(&mut gdb, &mut sdb, addsig, &addargs);
+        assert_eq!(ga_ok, sa_ok, "{}: underflow revert must agree with Solidity", label);
+        assert!(!ga_ok, "{}: underflow must revert", label);
     }
 }
 
@@ -6464,14 +6862,7 @@ fn test_try_catch_captures_a_local_and_catches_internal_revert() {
         None => return,
     };
     for decl in ["u256 n = arg", "var n = arg"] {
-        let src = format!(
-            "contract C:\n    u256 mark\n\n    \
-             export fn classify(u256 arg) -> u256:\n        {}\n        C.mark = 1\n        \
-             try:\n            C.mark = 2\n            assert(n < 10, \"too big\")\n            return n\n        \
-             catch:\n            return 99\n\n    \
-             export fn getmark() -> u256:\n        return C.mark\n",
-            decl
-        );
+        let src = include_str!("fixtures/gum_try_local.gum").replace("__DECL__", decl);
         let mut db: Db = CacheDB::new(EmptyDB::default());
         let c = deploy(&mut db, gum_creation_bytecode(&src, &solc, false));
 
@@ -6498,6 +6889,41 @@ fn test_try_catch_captures_a_local_and_catches_internal_revert() {
 }
 
 #[test]
+fn test_try_catch_writes_back_a_string_of_any_type() {
+    // Write-back is no longer limited to one-word value types: a captured String
+    // the body reassigns travels back out of the frame on success, decoded through
+    // the String codec. On a caught revert the frame rolls back, so the reassigned
+    // value is gone and catch's assignment stands. Solidity's try can't express
+    // any of this, so this is checked by gum's own behaviour.
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = include_str!("fixtures/gum_try_string_wb.gum");
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+
+    // n = 3: the try succeeds, the reassigned String is written back and returned.
+    let mut d = selector("label(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 3; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success, "label(3) reverted");
+    assert_eq!(
+        r.output,
+        abi_encode_string(b"updated-to-a-long-value-past-31-bytes-so-it-goes-long-form"),
+        "success must write back the mutated String"
+    );
+
+    // n = 20: the assert reverts inside the try, rolls the reassignment back, and
+    // catch sets s = "caught".
+    let mut d = selector("label(uint256)").to_vec();
+    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 20; w });
+    let r = call(&mut db, c, d);
+    assert!(r.success, "internal revert must be caught");
+    assert_eq!(r.output, abi_encode_string(b"caught"), "caught path returns the catch value");
+}
+
+#[test]
 fn test_nested_try_catches_at_each_level() {
     // A try nested inside another try: the inner one catches an internal revert
     // and its result propagates out, so the outer catch is never reached. Proves
@@ -6506,18 +6932,7 @@ fn test_nested_try_catches_at_each_level() {
         Some(p) => p,
         None => return,
     };
-    let src = r#"
-contract C:
-    export fn f(u256 a) -> u256:
-        try:
-            try:
-                assert(a < 5, "inner")
-                return 1
-            catch:
-                return 2
-        catch:
-            return 3
-"#;
+    let src = include_str!("fixtures/gum_try_nested.gum");
     let mut db: Db = CacheDB::new(EmptyDB::default());
     let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
 

@@ -103,13 +103,9 @@ fn member_errors(src: &str, span: (usize, usize)) -> Option<Vec<String>> {
     }
 }
 
-// When a function member fails to parse, locate the failure per statement.
-//
-// Only a function has a statement body, and it is the brace block after its
-// signature. A field (or any bodyless member) has no `{`, so `find('{')?`
-// returns None here and the caller keeps the member-level error. This is the
-// third and last level of recovery: file -> declaration (parse_program) ->
-// member (member_errors) -> statement (here).
+// When a function member fails to parse, locate the failure per statement. The
+// third recovery level: file -> declaration -> member -> statement. A bodyless
+// member has no brace, so find('{')? returns None and the member error stands.
 fn statement_errors(src: &str, span: (usize, usize)) -> Option<Vec<String>> {
     let (start, end) = span;
     let chunk = &src[start..end];
@@ -590,7 +586,8 @@ fn climb_prec(terms: &[Expr], ops: &[String], cursor: &mut usize, min_prec: u8) 
         if prec < min_prec {
             break;
         }
-        *cursor += 1; // consume operator; right operand starts at the new cursor
+        // consume operator; right operand starts at the new cursor
+        *cursor += 1;
         let next_min = if is_right_assoc(&op) { prec } else { prec + 1 };
         let right = climb_prec(terms, ops, cursor, next_min);
         left = Expr::BinaryOp {
@@ -627,7 +624,8 @@ fn parse_term(pair: pest::iterators::Pair<Rule>) -> Expr {
         }
         Rule::fstring_literal => {
             let raw = atom.as_str();
-            let inner = &raw[2..raw.len() - 1]; // strip leading f" and trailing "
+            // strip leading f" and trailing "
+            let inner = &raw[2..raw.len() - 1];
             Expr::FString(parse_fstring_segments(inner))
         }
         Rule::instantiation => {
