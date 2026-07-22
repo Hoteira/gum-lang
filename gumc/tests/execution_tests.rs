@@ -6451,54 +6451,50 @@ contract C:
 
 #[test]
 fn test_try_catch_captures_a_local_and_catches_internal_revert() {
-    // Same as the parameter case, but the try body captures an enclosing *local*
-    // (n, explicitly typed) rather than a parameter. That used to fall back to
-    // the external-call-only path and NOT catch the internal assert; now the
-    // local is marshalled into the frame like a parameter, so the assert is
-    // caught and the pre-assert storage write rolls back.
+    // The try body captures an enclosing *local* (n) rather than a parameter.
+    // This used to fall back to the external-call-only path and NOT catch the
+    // internal assert; now the local is marshalled into the frame like a
+    // parameter, so the assert is caught and the pre-assert storage write rolls
+    // back. Runs the same checks for both spellings of the local — an explicit
+    // type and an inferred `var` — to lock in that they behave *identically*
+    // (the inferred type is resolved into the AST before the try is hoisted, so
+    // neither silently downgrades to the weaker path).
     let solc = match solc_path() {
         Some(p) => p,
         None => return,
     };
-    let src = r#"
-contract C:
-    u256 mark
+    for decl in ["u256 n = arg", "var n = arg"] {
+        let src = format!(
+            "contract C:\n    u256 mark\n\n    \
+             export fn classify(u256 arg) -> u256:\n        {}\n        C.mark = 1\n        \
+             try:\n            C.mark = 2\n            assert(n < 10, \"too big\")\n            return n\n        \
+             catch:\n            return 99\n\n    \
+             export fn getmark() -> u256:\n        return C.mark\n",
+            decl
+        );
+        let mut db: Db = CacheDB::new(EmptyDB::default());
+        let c = deploy(&mut db, gum_creation_bytecode(&src, &solc, false));
 
-    export fn classify(u256 arg) -> u256:
-        u256 n = arg
-        C.mark = 1
-        try:
-            C.mark = 2
-            assert(n < 10, "too big")
-            return n
-        catch:
-            return 99
+        // arg = 5: the try succeeds, returns n, the write to 2 sticks.
+        let mut d = selector("classify(uint256)").to_vec();
+        d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 5; w });
+        let r = call(&mut db, c, d);
+        assert!(r.success, "[{}] classify(5) reverted", decl);
+        assert_eq!(U256::from_be_slice(&r.output), U256::from(5), "[{}] captured local should reach the body", decl);
+        let r = call(&mut db, c, selector("getmark()").to_vec());
+        assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "[{}] success keeps the write", decl);
 
-    export fn getmark() -> u256:
-        return C.mark
-"#;
-    let mut db: Db = CacheDB::new(EmptyDB::default());
-    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
-
-    // arg = 5: the try succeeds, returns n, the write to 2 sticks.
-    let mut d = selector("classify(uint256)").to_vec();
-    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 5; w });
-    let r = call(&mut db, c, d);
-    assert!(r.success);
-    assert_eq!(U256::from_be_slice(&r.output), U256::from(5), "captured local should reach the body");
-    let r = call(&mut db, c, selector("getmark()").to_vec());
-    assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "success keeps the write");
-
-    // arg = 20: the assert reverts inside the try, is caught (returns 99), and
-    // the write to 2 rolls back to the pre-try 1 — proof the local took the
-    // internal-revert-catching path, not the old external-only one.
-    let mut d = selector("classify(uint256)").to_vec();
-    d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 20; w });
-    let r = call(&mut db, c, d);
-    assert!(r.success, "internal revert must be caught with a captured local, not bubble out");
-    assert_eq!(U256::from_be_slice(&r.output), U256::from(99));
-    let r = call(&mut db, c, selector("getmark()").to_vec());
-    assert_eq!(U256::from_be_slice(&r.output), U256::from(1), "caught revert must roll back the write");
+        // arg = 20: the assert reverts inside the try, is caught (returns 99), and
+        // the write to 2 rolls back to the pre-try 1 — proof the local took the
+        // internal-revert-catching path, not the old external-only one.
+        let mut d = selector("classify(uint256)").to_vec();
+        d.extend_from_slice(&{ let mut w = [0u8; 32]; w[31] = 20; w });
+        let r = call(&mut db, c, d);
+        assert!(r.success, "[{}] internal revert must be caught with a captured local, not bubble out", decl);
+        assert_eq!(U256::from_be_slice(&r.output), U256::from(99), "[{}] catch should return 99", decl);
+        let r = call(&mut db, c, selector("getmark()").to_vec());
+        assert_eq!(U256::from_be_slice(&r.output), U256::from(1), "[{}] caught revert must roll back the write", decl);
+    }
 }
 
 #[test]

@@ -993,10 +993,126 @@ impl TypeChecker {
         }
 
         if errors.is_empty() {
+            // Types validated: now write each inferred `var`'s resolved type back
+            // into the loaded classes, so later passes see it instead of the
+            // `_infer` sentinel (see elaborate_infer_types).
+            self.elaborate_infer_types();
             println!("    [OK] Validation passed!");
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    // Resolves every inferred `var x = expr` local to its concrete type in place,
+    // in the loaded class methods codegen reads. Verification already computed and
+    // validated these types, but in a transient scope it then discarded; this
+    // replays the same scoped walk once more and writes the result back, so later
+    // passes — especially the codegen try-hoist, which runs before translation and
+    // has no scope of its own — see the real type rather than the `_infer`
+    // sentinel. Best-effort and non-failing: an initializer whose type this
+    // lightweight walk can't resolve simply keeps its sentinel, exactly as before,
+    // so this can only ever add information, never change a validated program.
+    fn elaborate_infer_types(&mut self) {
+        let names: Vec<String> = self.loaded_classes.keys().cloned().collect();
+        for name in names {
+            let mut methods = self.loaded_classes[&name].methods.clone();
+            for m in &mut methods {
+                if m.body.is_empty() {
+                    continue;
+                }
+                self.push_scope();
+                self.insert_symbol(
+                    "self".to_string(),
+                    SymbolInfo { is_const: true, type_def: Type::Primitive(name.clone()) },
+                );
+                for p in &m.parameters {
+                    self.insert_symbol(
+                        p.name.clone(),
+                        SymbolInfo { is_const: !p.is_mut, type_def: p.type_def.clone() },
+                    );
+                }
+                self.elaborate_body(&mut m.body);
+                self.pop_scope();
+            }
+            if let Some(c) = self.loaded_classes.get_mut(&name) {
+                c.methods = methods;
+            }
+        }
+    }
+
+    fn elaborate_body(&mut self, body: &mut [Spanned<Statement>]) {
+        for s in body.iter_mut() {
+            self.elaborate_stmt(&mut s.node);
+        }
+    }
+
+    // Mirrors the scoping the verify pass uses (§ verify_statement_inner) so the
+    // type of a `var` that reads an earlier local, a loop element, etc. resolves
+    // the same way it did during validation.
+    fn elaborate_stmt(&mut self, stmt: &mut Statement) {
+        match stmt {
+            Statement::VarDecl { name, type_def, value, is_const, .. } => {
+                if is_infer(type_def) {
+                    if let Some(v) = value {
+                        if let Ok(t) = self.eval_type(v) {
+                            *type_def = t;
+                        }
+                    }
+                }
+                self.insert_symbol(
+                    name.clone(),
+                    SymbolInfo { is_const: *is_const, type_def: type_def.clone() },
+                );
+            }
+            Statement::IfElse { if_body, else_body, .. } => {
+                self.push_scope();
+                self.elaborate_body(if_body);
+                self.pop_scope();
+                if let Some(e) = else_body {
+                    self.push_scope();
+                    self.elaborate_body(e);
+                    self.pop_scope();
+                }
+            }
+            Statement::ForLoop { iterator, iterable, body } => {
+                self.push_scope();
+                if let Ok(t) = self.eval_type(iterable) {
+                    let elem = match t {
+                        Type::Array(inner) | Type::FixedArray(inner, _) => Some(*inner),
+                        _ => None,
+                    };
+                    if let Some(elem) = elem {
+                        self.insert_symbol(
+                            iterator.clone(),
+                            SymbolInfo { is_const: false, type_def: elem },
+                        );
+                    }
+                }
+                self.elaborate_body(body);
+                self.pop_scope();
+            }
+            Statement::WhileLoop { body, .. } => {
+                self.push_scope();
+                self.elaborate_body(body);
+                self.pop_scope();
+            }
+            Statement::Match { arms, .. } => {
+                for a in arms {
+                    self.push_scope();
+                    self.elaborate_body(&mut a.body);
+                    self.pop_scope();
+                }
+            }
+            Statement::TryCatch { try_body, catch_body } => {
+                self.push_scope();
+                self.elaborate_body(try_body);
+                self.pop_scope();
+                self.push_scope();
+                self.elaborate_body(catch_body);
+                self.pop_scope();
+            }
+            _ => {}
         }
     }
 
