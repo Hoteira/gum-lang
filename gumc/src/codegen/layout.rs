@@ -16,7 +16,6 @@ pub struct FieldLoc {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClassLayout {
-    // BTreeMap so the serialized JSON has a stable field order (diff-friendly).
     pub fields: BTreeMap<String, FieldLoc>,
 }
 
@@ -45,7 +44,8 @@ impl StorageManifest {
     pub fn save(&self, path: &str) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Could not serialize storage lock: {}", e))?;
-        std::fs::write(path, json + "\n").map_err(|e| format!("Could not write storage lock '{}': {}", path, e))
+        std::fs::write(path, json + "\n")
+            .map_err(|e| format!("Could not write storage lock '{}': {}", path, e))
     }
 }
 
@@ -57,9 +57,9 @@ pub struct StorageField {
     pub slot: usize,
     pub offset_in_slot: usize,
     pub size: usize,
-    // Transient storage (EIP-1153) rather than persistent. A separate 256-bit
+    // Transient storage (EIP-1153) rather than persistent. THey have separate
     // keyspace, so this slot number is only meaningful together with this
-    // flag, transient slot 0 and persistent slot 0 are different locations.
+    // flag, tslot 0 and sslot 0 are different locations.
     pub is_transient: bool,
 }
 
@@ -96,14 +96,20 @@ impl<'a> LayoutEngine<'a> {
         Self::with_lock(type_checker, None).expect("unlocked layout cannot fail")
     }
 
-    pub fn with_lock(type_checker: &'a TypeChecker, lock: Option<StorageManifest>) -> Result<Self, String> {
+    pub fn with_lock(
+        type_checker: &'a TypeChecker,
+        lock: Option<StorageManifest>,
+    ) -> Result<Self, String> {
         let mut engine = Self {
             type_checker,
             storage_fields: HashMap::new(),
             memory_fields: HashMap::new(),
             packed_class_size: HashMap::new(),
             struct_storage_fields: HashMap::new(),
-            manifest_out: StorageManifest { version: 1, classes: BTreeMap::new() },
+            manifest_out: StorageManifest {
+                version: 1,
+                classes: BTreeMap::new(),
+            },
         };
         engine.allocate_memory_layouts();
         engine.allocate_struct_layouts();
@@ -118,13 +124,16 @@ impl<'a> LayoutEngine<'a> {
         for (class_name, class_decl) in self.ordered_classes() {
             let (fields, _next) = self.pack_storage_fields(&class_decl.fields, 0, false);
             for (fname, sf) in fields {
-                self.struct_storage_fields.insert(format!("{}.{}", class_name, fname), sf);
+                self.struct_storage_fields
+                    .insert(format!("{}.{}", class_name, fname), sf);
             }
         }
     }
 
     pub fn struct_storage_field(&self, class_name: &str, property: &str) -> Option<StorageField> {
-        self.struct_storage_fields.get(&format!("{}.{}", class_name, property)).copied()
+        self.struct_storage_fields
+            .get(&format!("{}.{}", class_name, property))
+            .copied()
     }
 
     // Real byte width of a scalar integer/bool type. Everything else (u256,
@@ -184,8 +193,19 @@ impl<'a> LayoutEngine<'a> {
             let f = &fields[idx];
             let w = self.field_byte_width(&f.type_def);
             if w > 32 {
-                if used > 0 { slot += 1; used = 0; }
-                layout.insert(f.name.clone(), StorageField { slot, offset_in_slot: 0, size: w, is_transient });
+                if used > 0 {
+                    slot += 1;
+                    used = 0;
+                }
+                layout.insert(
+                    f.name.clone(),
+                    StorageField {
+                        slot,
+                        offset_in_slot: 0,
+                        size: w,
+                        is_transient,
+                    },
+                );
                 slot += (w + 31) / 32;
                 continue;
             }
@@ -193,7 +213,15 @@ impl<'a> LayoutEngine<'a> {
                 slot += 1;
                 used = 0;
             }
-            layout.insert(f.name.clone(), StorageField { slot, offset_in_slot: used, size: w, is_transient });
+            layout.insert(
+                f.name.clone(),
+                StorageField {
+                    slot,
+                    offset_in_slot: used,
+                    size: w,
+                    is_transient,
+                },
+            );
             used += w;
         }
         let next_free_slot = if used > 0 { slot + 1 } else { slot };
@@ -218,8 +246,15 @@ impl<'a> LayoutEngine<'a> {
     // registered in (declaration order locally, then import order), rather
     // than loaded_classes directly. loaded_classes is a HashMap, and Rust
     fn ordered_classes(&self) -> Vec<(String, ClassDecl)> {
-        self.type_checker.class_order.iter()
-            .filter_map(|name| self.type_checker.loaded_classes.get(name).map(|c| (name.clone(), c.clone())))
+        self.type_checker
+            .class_order
+            .iter()
+            .filter_map(|name| {
+                self.type_checker
+                    .loaded_classes
+                    .get(name)
+                    .map(|c| (name.clone(), c.clone()))
+            })
             .collect()
     }
 
@@ -227,9 +262,11 @@ impl<'a> LayoutEngine<'a> {
         for (class_name, class_decl) in self.ordered_classes() {
             let (fields, total) = self.pack_memory_fields(&class_decl.fields);
             for (fname, mf) in fields {
-                self.memory_fields.insert(format!("{}.{}", class_name, fname), mf);
+                self.memory_fields
+                    .insert(format!("{}.{}", class_name, fname), mf);
             }
-            self.packed_class_size.insert(class_name, if total == 0 { 32 } else { total });
+            self.packed_class_size
+                .insert(class_name, if total == 0 { 32 } else { total });
         }
     }
 
@@ -254,7 +291,12 @@ impl<'a> LayoutEngine<'a> {
                 .partition(|f| !f.is_transient);
 
             let mut layout = match lock.and_then(|m| m.classes.get(&class_name)) {
-                Some(committed) => self.pack_storage_fields_locked(&class_name, &persistent, committed, &mut append)?,
+                Some(committed) => self.pack_storage_fields_locked(
+                    &class_name,
+                    &persistent,
+                    committed,
+                    &mut append,
+                )?,
                 // The returned next-free slot is discarded: append is per-class, and the transient pass below starts its own keyspace at 0.
                 None => self.pack_storage_fields(&persistent, append, false).0,
             };
@@ -267,18 +309,24 @@ impl<'a> LayoutEngine<'a> {
                     continue;
                 }
                 if let Some(sf) = layout.get(&f.name) {
-                    class_out.fields.insert(f.name.clone(), FieldLoc {
-                        slot: sf.slot,
-                        offset: sf.offset_in_slot,
-                        size: sf.size,
-                        type_name: super::type_suffix(&f.type_def),
-                    });
+                    class_out.fields.insert(
+                        f.name.clone(),
+                        FieldLoc {
+                            slot: sf.slot,
+                            offset: sf.offset_in_slot,
+                            size: sf.size,
+                            type_name: super::type_suffix(&f.type_def),
+                        },
+                    );
                 }
             }
-            self.manifest_out.classes.insert(class_name.clone(), class_out);
+            self.manifest_out
+                .classes
+                .insert(class_name.clone(), class_out);
 
             for (fname, sf) in layout {
-                self.storage_fields.insert(format!("{}.{}", class_name, fname), sf);
+                self.storage_fields
+                    .insert(format!("{}.{}", class_name, fname), sf);
             }
         }
         Ok(())
@@ -294,7 +342,8 @@ impl<'a> LayoutEngine<'a> {
         committed: &ClassLayout,
         append: &mut usize,
     ) -> Result<HashMap<String, StorageField>, String> {
-        let current: std::collections::HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        let current: std::collections::HashSet<&str> =
+            fields.iter().map(|f| f.name.as_str()).collect();
         for fname in committed.fields.keys() {
             if !current.contains(fname.as_str()) {
                 return Err(format!(
@@ -318,10 +367,22 @@ impl<'a> LayoutEngine<'a> {
                             class_name, f.name, fl.size, w
                         ));
                     }
-                    layout.insert(f.name.clone(), StorageField { slot: fl.slot, offset_in_slot: fl.offset, size: fl.size, is_transient: false });
+                    layout.insert(
+                        f.name.clone(),
+                        StorageField {
+                            slot: fl.slot,
+                            offset_in_slot: fl.offset,
+                            size: fl.size,
+                            is_transient: false,
+                        },
+                    );
                     let spanned = ((fl.offset + fl.size + 31) / 32).max(1);
                     for i in 0..spanned {
-                        let used = if i + 1 == spanned { (fl.offset + fl.size) - i * 32 } else { 32 };
+                        let used = if i + 1 == spanned {
+                            (fl.offset + fl.size) - i * 32
+                        } else {
+                            32
+                        };
                         let e = high_water.entry(fl.slot + i).or_insert(0);
                         *e = (*e).max(used.min(32));
                     }
@@ -331,17 +392,31 @@ impl<'a> LayoutEngine<'a> {
         }
 
         newcomers.sort_by(|a, b| {
-            self.field_byte_width(&b.type_def).cmp(&self.field_byte_width(&a.type_def)).then(a.name.cmp(&b.name))
+            self.field_byte_width(&b.type_def)
+                .cmp(&self.field_byte_width(&a.type_def))
+                .then(a.name.cmp(&b.name))
         });
         for f in newcomers {
             let w = self.field_byte_width(&f.type_def);
             if w > 32 {
                 let slot = *append;
                 *append += (w + 31) / 32;
-                layout.insert(f.name.clone(), StorageField { slot, offset_in_slot: 0, size: w, is_transient: false });
+                layout.insert(
+                    f.name.clone(),
+                    StorageField {
+                        slot,
+                        offset_in_slot: 0,
+                        size: w,
+                        is_transient: false,
+                    },
+                );
                 continue;
             }
-            let gap_slot = high_water.iter().filter(|(_, hw)| 32 - **hw >= w).map(|(s, _)| *s).min();
+            let gap_slot = high_water
+                .iter()
+                .filter(|(_, hw)| 32 - **hw >= w)
+                .map(|(s, _)| *s)
+                .min();
             let (slot, offset) = match gap_slot {
                 Some(s) => (s, high_water[&s]),
                 None => {
@@ -350,7 +425,15 @@ impl<'a> LayoutEngine<'a> {
                     (s, 0)
                 }
             };
-            layout.insert(f.name.clone(), StorageField { slot, offset_in_slot: offset, size: w, is_transient: false });
+            layout.insert(
+                f.name.clone(),
+                StorageField {
+                    slot,
+                    offset_in_slot: offset,
+                    size: w,
+                    is_transient: false,
+                },
+            );
             *high_water.entry(slot).or_insert(0) = offset + w;
         }
 
@@ -375,30 +458,34 @@ impl<'a> LayoutEngine<'a> {
                 } else if self.type_checker.loaded_enums.contains_key(name) {
                     // A payload-free enum is a tag and nothing else, so it is one byte, exactly as Solidity lays an enum out. Saying 64 here was the root of a family of bugs: it burned two storage slots instead of one byte, displaced every field after it, and made the mapping/log paths write the memory pointer instead of the value.
                     // A payload-carrying enum keeps the [tag][payload] pair, which only exists in memory; it is rejected anywhere that needs a size, so this number is never used to lay one out.
-                    if self.type_checker.enum_has_payload(name) { 64 } else { 1 }
+                    if self.type_checker.enum_has_payload(name) {
+                        64
+                    } else {
+                        1
+                    }
                 } else {
                     32
                 }
             }
-            Type::FixedArray(inner, size) => {
-                self.size_of(inner) * size
-            }
+            Type::FixedArray(inner, size) => self.size_of(inner) * size,
             Type::Array(_) => {
                 // dynamic arrays are a 32-byte pointer
                 32
             }
-            Type::Generic { .. } => {
-                32
-            }
+            Type::Generic { .. } => 32,
         }
     }
 
     pub fn storage_field(&self, class_name: &str, property: &str) -> Option<StorageField> {
-        self.storage_fields.get(&format!("{}.{}", class_name, property)).copied()
+        self.storage_fields
+            .get(&format!("{}.{}", class_name, property))
+            .copied()
     }
 
     pub fn memory_field(&self, class_name: &str, property: &str) -> Option<MemoryField> {
-        self.memory_fields.get(&format!("{}.{}", class_name, property)).copied()
+        self.memory_fields
+            .get(&format!("{}.{}", class_name, property))
+            .copied()
     }
 
     // The type of class_name.property if it is an immutable field.
@@ -436,7 +523,10 @@ impl<'a> LayoutEngine<'a> {
     // The compile-time value of a const field, when the constructor gives it
     pub fn const_field_value(&self, class_name: &str, field: &str) -> Option<String> {
         let class = self.type_checker.loaded_classes.get(class_name)?;
-        let f = class.fields.iter().find(|f| f.is_const && f.name == field)?;
+        let f = class
+            .fields
+            .iter()
+            .find(|f| f.is_const && f.name == field)?;
         let ctor = class.methods.iter().find(|m| m.name == "new")?;
 
         let assignments = count_assignments(&ctor.body, class_name, field);
@@ -444,7 +534,9 @@ impl<'a> LayoutEngine<'a> {
             return None;
         }
         let value = ctor.body.iter().find_map(|s| match &s.node {
-            Statement::Assignment { target, value } if targets(target, class_name, field) => Some(value),
+            Statement::Assignment { target, value } if targets(target, class_name, field) => {
+                Some(value)
+            }
             _ => None,
         })?;
 
@@ -484,16 +576,21 @@ fn count_assignments(body: &[Spanned<Statement>], class_name: &str, field: &str)
     body.iter()
         .map(|s| match &s.node {
             Statement::Assignment { target, .. } if targets(target, class_name, field) => 1,
-            Statement::IfElse { if_body, else_body, .. } => {
+            Statement::IfElse {
+                if_body, else_body, ..
+            } => {
                 count_assignments(if_body, class_name, field)
-                    + else_body.as_ref().map_or(0, |b| count_assignments(b, class_name, field))
+                    + else_body
+                        .as_ref()
+                        .map_or(0, |b| count_assignments(b, class_name, field))
             }
             Statement::WhileLoop { body, .. } | Statement::ForLoop { body, .. } => {
                 count_assignments(body, class_name, field)
             }
-            Statement::Match { arms, .. } => {
-                arms.iter().map(|a| count_assignments(&a.body, class_name, field)).sum()
-            }
+            Statement::Match { arms, .. } => arms
+                .iter()
+                .map(|a| count_assignments(&a.body, class_name, field))
+                .sum(),
             _ => 0,
         })
         .sum()

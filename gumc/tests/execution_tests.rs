@@ -4821,7 +4821,7 @@ fn fuzz_random_storage_layout_matches_solidity() {
         ("Account", "address", false),
     ];
 
-    for seed in 0..24u64 {
+    for seed in 0..48u64 {
         let mut rng = Rng(0xf022_0000 ^ seed);
         let nfields = 3 + (rng.next_u64() % 6) as usize; // 3..=8 fields
         let fields: Vec<(&str, &str, bool)> =
@@ -4837,6 +4837,10 @@ fn fuzz_random_storage_layout_matches_solidity() {
             gum.push_str(&format!("\n    export fn g{i}() -> {g}:\n        return C.f{i}\n", i = i, g = g));
             if *arith {
                 gum.push_str(&format!("\n    export fn a{i}({g} v):\n        C.f{i} = C.f{i} + v\n", i = i, g = g));
+                gum.push_str(&format!("\n    export fn b{i}({g} v):\n        C.f{i} = C.f{i} - v\n", i = i, g = g));
+                // Multiply by a left-position literal, so the overflow bound must
+                // come from the field type, not the literal default u256.
+                gum.push_str(&format!("\n    export fn m{i}():\n        C.f{i} = 3 * C.f{i}\n", i = i));
             }
         }
 
@@ -4849,6 +4853,8 @@ fn fuzz_random_storage_layout_matches_solidity() {
             sol.push_str(&format!("    function g{i}() external view returns ({s}) {{ return f{i}; }}\n", i = i, s = s));
             if *arith {
                 sol.push_str(&format!("    function a{i}({s} v) external {{ f{i} = f{i} + v; }}\n", i = i, s = s));
+                sol.push_str(&format!("    function b{i}({s} v) external {{ f{i} = f{i} - v; }}\n", i = i, s = s));
+                sol.push_str(&format!("    function m{i}() external {{ f{i} = 3 * f{i}; }}\n", i = i));
             }
         }
         sol.push_str("}\n");
@@ -4907,17 +4913,37 @@ fn fuzz_random_storage_layout_matches_solidity() {
         for _ in 0..140 {
             let k = (rng.next_u64() as usize) % fields.len();
             let (g, s, arith) = fields[k];
-            let is_add = arith && rng.next_u64() % 2 == 0;
-            let (op, tyname) = if is_add { ("a", s) } else { ("s", s) };
-            let sig = format!("{}{}({})", op, k, tyname);
-            let arg = encode_arg(&mut rng, g);
-            let data = encode_words(&sig, &[arg]);
+            // set, add, sub, or mul-by-literal (the last three only for numeric
+            // fields). mul takes no argument; the rest take one field-typed word.
+            let choice = if arith { rng.next_u64() % 4 } else { 0 };
+            let (sig, data) = match choice {
+                1 => {
+                    let sig = format!("a{}({})", k, s);
+                    let d = encode_words(&sig, &[encode_arg(&mut rng, g)]);
+                    (sig, d)
+                }
+                2 => {
+                    let sig = format!("b{}({})", k, s);
+                    let d = encode_words(&sig, &[encode_arg(&mut rng, g)]);
+                    (sig, d)
+                }
+                3 => {
+                    let sig = format!("m{}()", k);
+                    let d = selector(&sig).to_vec();
+                    (sig, d)
+                }
+                _ => {
+                    let sig = format!("s{}({})", k, s);
+                    let d = encode_words(&sig, &[encode_arg(&mut rng, g)]);
+                    (sig, d)
+                }
+            };
             let g = call(&mut gdb, ga, data.clone());
             let s2 = call(&mut sdb, sa, data);
             assert_eq!(
                 g.success, s2.success,
-                "seed {}: {} success mismatch (arg {})\ngum:\n{}",
-                seed, sig, hex::encode(arg), gum
+                "seed {}: {} success mismatch\ngum:\n{}",
+                seed, sig, gum
             );
             if g.success {
                 // The touched field must read back identically on both sides.
@@ -4929,6 +4955,197 @@ fn fuzz_random_storage_layout_matches_solidity() {
         // Final full sweep: every field must still agree (catches a write to one
         // field silently corrupting a packed slot-mate).
         getters_match(&mut gdb, &mut sdb);
+    }
+}
+
+// Random checked arithmetic with the literal in either operand position. For each
+// numeric type this builds three twins per operator: literal-left, literal-right,
+// and variable-variable. A narrow overflow must revert regardless of whether the
+// literal sits left or right, so any success/value divergence from Solidity is a
+// gum bug in operand-type inference or the checked-arithmetic bound. This is the
+// bug class the by-hand literal-position test locked down; the fuzzer generalizes
+// it across every width, sign and operator.
+#[test]
+fn fuzz_literal_position_arithmetic_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping fuzz: no solc");
+            return;
+        }
+    };
+
+    // (gum type, solidity type, bit width)
+    let types: &[(&str, &str, usize)] = &[
+        ("u8", "uint8", 8),
+        ("u16", "uint16", 16),
+        ("u32", "uint32", 32),
+        ("u64", "uint64", 64),
+        ("u128", "uint128", 128),
+        ("u256", "uint256", 256),
+        ("i8", "int8", 8),
+        ("i32", "int32", 32),
+        ("i128", "int128", 128),
+        ("i256", "int256", 256),
+    ];
+    let ops = ["+", "-", "*"];
+
+    let encode_arg = |rng: &mut Rng, ty: &str, bits: usize| -> [u8; 32] {
+        let signed = ty.starts_with('i');
+        let raw = rng.next_u256(true);
+        let val = if bits >= 256 {
+            raw
+        } else {
+            let mask = (U256::from(1u64) << bits) - U256::from(1u64);
+            let low = raw & mask;
+            if signed && ((low >> (bits - 1)) & U256::from(1u64)) == U256::from(1u64) {
+                low | !mask
+            } else {
+                low
+            }
+        };
+        val.to_be_bytes::<32>()
+    };
+
+    for &(g, s, bits) in types {
+        // A small literal that still reaches overflow when multiplied near max.
+        let mut gum = String::from("contract C:\n");
+        let mut sol = String::from("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract C {\n");
+        for (oi, op) in ops.iter().enumerate() {
+            let c = 3;
+            // literal-left, literal-right, variable-variable
+            gum.push_str(&format!("    export fn ll{oi}({g} v) -> {g}:\n        return {c} {op} v\n", oi = oi, g = g, c = c, op = op));
+            gum.push_str(&format!("    export fn lr{oi}({g} v) -> {g}:\n        return v {op} {c}\n", oi = oi, g = g, c = c, op = op));
+            gum.push_str(&format!("    export fn vv{oi}({g} v, {g} w) -> {g}:\n        return v {op} w\n", oi = oi, g = g, op = op));
+            sol.push_str(&format!("  function ll{oi}({s} v) external pure returns ({s}) {{ return {c} {op} v; }}\n", oi = oi, s = s, c = c, op = op));
+            sol.push_str(&format!("  function lr{oi}({s} v) external pure returns ({s}) {{ return v {op} {c}; }}\n", oi = oi, s = s, c = c, op = op));
+            sol.push_str(&format!("  function vv{oi}({s} v, {s} w) external pure returns ({s}) {{ return v {op} w; }}\n", oi = oi, s = s, op = op));
+        }
+        sol.push_str("}\n");
+
+        let mut gdb: Db = CacheDB::new(EmptyDB::default());
+        let mut sdb: Db = CacheDB::new(EmptyDB::default());
+        let ga = deploy(&mut gdb, gum_creation_bytecode(&gum, &solc, false));
+        let sa = deploy(&mut sdb, sol_creation_bytecode(&sol, &solc));
+
+        let mut rng = Rng(0x1117_0000 ^ (bits as u64));
+        for _ in 0..600 {
+            let oi = (rng.next_u64() as usize) % ops.len();
+            let form = rng.next_u64() % 3;
+            let (sig, data) = match form {
+                0 => {
+                    let sig = format!("ll{}({})", oi, s);
+                    (sig.clone(), encode_words(&sig, &[encode_arg(&mut rng, g, bits)]))
+                }
+                1 => {
+                    let sig = format!("lr{}({})", oi, s);
+                    (sig.clone(), encode_words(&sig, &[encode_arg(&mut rng, g, bits)]))
+                }
+                _ => {
+                    let sig = format!("vv{}({},{})", oi, s, s);
+                    (sig.clone(), encode_words(&sig, &[encode_arg(&mut rng, g, bits), encode_arg(&mut rng, g, bits)]))
+                }
+            };
+            let gr = call(&mut gdb, ga, data.clone());
+            let sr = call(&mut sdb, sa, data);
+            assert_eq!(gr.success, sr.success, "{}: success mismatch\ngum:\n{}", sig, gum);
+            if gr.success {
+                assert_eq!(gr.output, sr.output, "{}: value diverged\ngum:\n{}", sig, gum);
+            }
+        }
+    }
+}
+
+// Random values pushed through the dynamic ABI codecs: a (uint256,string) struct
+// echo and a uint256[][] echo. The values, lengths and nesting shapes are fuzzed
+// so the head/tail offset math is exercised across empty, short, word-boundary and
+// multi-word payloads, diffing gum's encode+decode against Solidity's byte for byte.
+#[test]
+fn fuzz_dynamic_abi_roundtrip_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping fuzz: no solc");
+            return;
+        }
+    };
+
+    // (uint256,string) struct echo.
+    {
+        let mut gdb: Db = CacheDB::new(EmptyDB::default());
+        let mut sdb: Db = CacheDB::new(EmptyDB::default());
+        let ga = deploy(&mut gdb, gum_creation_bytecode(include_str!("fixtures/gum_dyn_struct.gum"), &solc, false));
+        let sa = deploy(&mut sdb, sol_creation_bytecode(include_str!("fixtures/sol_dyn_struct.sol"), &solc));
+
+        let encode = |id: U256, name: &[u8]| -> Vec<u8> {
+            let mut data = selector("echo((uint256,string))").to_vec();
+            data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+            data.extend_from_slice(&id.to_be_bytes::<32>());
+            data.extend_from_slice(&U256::from(64u64).to_be_bytes::<32>());
+            data.extend_from_slice(&U256::from(name.len()).to_be_bytes::<32>());
+            let mut nb = name.to_vec();
+            let pad = (32 - (name.len() % 32)) % 32;
+            nb.extend(std::iter::repeat(0u8).take(pad));
+            data.extend_from_slice(&nb);
+            data
+        };
+
+        let mut rng = Rng(0x2229_0000);
+        for _ in 0..300 {
+            let id = rng.next_u256(true);
+            let len = (rng.next_u64() % 130) as usize;
+            let name: Vec<u8> = (0..len).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+            let data = encode(id, &name);
+            let g = call(&mut gdb, ga, data.clone());
+            let s = call(&mut sdb, sa, data);
+            assert_eq!(g.success, s.success, "struct echo success (len {})", len);
+            assert_eq!(g.output, s.output, "struct echo output (len {})", len);
+        }
+    }
+
+    // uint256[][] echo.
+    {
+        let mut gdb: Db = CacheDB::new(EmptyDB::default());
+        let mut sdb: Db = CacheDB::new(EmptyDB::default());
+        let ga = deploy(&mut gdb, gum_creation_bytecode_for(include_str!("fixtures/gum_nest_abi.gum"), &solc, false, "N"));
+        let sa = deploy(&mut sdb, sol_creation_bytecode_for(include_str!("fixtures/sol_nest_abi.sol"), &solc, "N"));
+
+        // Encode a uint256[][] as an echo argument: outer offset, outer length,
+        // one offset per row (relative to the row-offset block), then each row.
+        let encode = |rows: &[Vec<U256>]| -> Vec<u8> {
+            let mut data = selector("echo(uint256[][])").to_vec();
+            data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>()); // offset to outer array
+            data.extend_from_slice(&U256::from(rows.len()).to_be_bytes::<32>());
+            // Row offsets are measured from the start of the offset table.
+            let mut off = 32u64 * rows.len() as u64;
+            let mut tail: Vec<u8> = Vec::new();
+            for row in rows {
+                data.extend_from_slice(&U256::from(off).to_be_bytes::<32>());
+                tail.extend_from_slice(&U256::from(row.len()).to_be_bytes::<32>());
+                for v in row {
+                    tail.extend_from_slice(&v.to_be_bytes::<32>());
+                }
+                off += 32 + 32 * row.len() as u64;
+            }
+            data.extend_from_slice(&tail);
+            data
+        };
+
+        let mut rng = Rng(0x333a_0000);
+        for _ in 0..300 {
+            let nrows = (rng.next_u64() % 5) as usize;
+            let rows: Vec<Vec<U256>> = (0..nrows)
+                .map(|_| {
+                    let cols = (rng.next_u64() % 5) as usize;
+                    (0..cols).map(|_| rng.next_u256(true)).collect()
+                })
+                .collect();
+            let data = encode(&rows);
+            let g = call(&mut gdb, ga, data.clone());
+            let s = call(&mut sdb, sa, data);
+            assert_eq!(g.success, s.success, "nested echo success ({} rows)", nrows);
+            assert_eq!(g.output, s.output, "nested echo output ({} rows)", nrows);
+        }
     }
 }
 
@@ -6951,28 +7168,54 @@ fn test_nested_try_catches_at_each_level() {
     assert_eq!(U256::from_be_slice(&r.output), U256::from(2), "inner catch path");
 }
 
+// A number literal is u256 by default, so it must not set the arithmetic width
+// when the other operand is narrower: 2 * v on a u8 has to use a u8 overflow
+// bound, not a 256-bit one, or it wraps instead of reverting. Regression for a
+// bug where the literal's position (left vs right) changed the overflow check.
 #[test]
-fn tmp_literal_operand_probe() {
-    let solc = match solc_path() { Some(p) => p, None => return };
-    // u256 (the asked case) plus u8 overflow with the literal in each position.
-    let gum = "contract C:\n    u256 a\n    export fn seta(u256 v):\n        C.a = v\n    export fn a_lit() -> u256:\n        return C.a * 2\n    export fn a_var(u256 b) -> u256:\n        return C.a * b\n    export fn u8_lit_r(u8 v) -> u8:\n        return v * 2\n    export fn u8_lit_l(u8 v) -> u8:\n        return 2 * v\n    export fn u8_var(u8 v, u8 w) -> u8:\n        return v * w\n";
-    let sol = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract C {\n  uint256 a;\n  function seta(uint256 v) external { a=v; }\n  function a_lit() external view returns (uint256){ return a*2; }\n  function a_var(uint256 b) external view returns (uint256){ return a*b; }\n  function u8_lit_r(uint8 v) external pure returns (uint8){ return v*2; }\n  function u8_lit_l(uint8 v) external pure returns (uint8){ return 2*v; }\n  function u8_var(uint8 v, uint8 w) external pure returns (uint8){ return v*w; }\n}\n";
+fn narrow_arithmetic_overflow_is_independent_of_literal_position() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let gum = gum_creation_bytecode(include_str!("fixtures/gum_arith_literal_pos.gum"), &solc, false);
+    let sol = sol_creation_bytecode(include_str!("fixtures/sol_arith_literal_pos.sol"), &solc);
     let mut gdb: Db = CacheDB::new(EmptyDB::default());
     let mut sdb: Db = CacheDB::new(EmptyDB::default());
-    let ga = deploy(&mut gdb, gum_creation_bytecode(gum, &solc, false));
-    let sa = deploy(&mut sdb, sol_creation_bytecode(sol, &solc));
-    let w = |v: u64| { let mut b=[0u8;32]; b[24..32].copy_from_slice(&v.to_be_bytes()); b };
-    // a = 10: a*2 vs a*b(=2)
-    call(&mut gdb, ga, encode_words("seta(uint256)", &[w(10)])); call(&mut sdb, sa, encode_words("seta(uint256)", &[w(10)]));
-    for (label, sig, args) in [
-        ("a_lit", "a_lit()", vec![]),
-        ("a_var", "a_var(uint256)", vec![w(2)]),
-        ("u8_lit_r(v=200)", "u8_lit_r(uint8)", vec![w(200)]),
-        ("u8_lit_l(v=200)", "u8_lit_l(uint8)", vec![w(200)]),
-        ("u8_var(200,2)", "u8_var(uint8,uint8)", vec![w(200), w(2)]),
+    let ga = deploy(&mut gdb, gum);
+    let sa = deploy(&mut sdb, sol);
+    let w = |v: u64| {
+        let mut b = [0u8; 32];
+        b[24..32].copy_from_slice(&v.to_be_bytes());
+        b
+    };
+
+    // The u256 case (the plain one): a * 2 and a * b both give 20, no revert.
+    assert!(call(&mut gdb, ga, encode_words("seta(uint256)", &[w(10)])).success);
+    assert!(call(&mut sdb, sa, encode_words("seta(uint256)", &[w(10)])).success);
+    for sig in ["a_lit()", "a_var(uint256)"] {
+        let args = if sig == "a_lit()" { vec![] } else { vec![w(2)] };
+        let g = call(&mut gdb, ga, encode_words(sig, &args));
+        let s = call(&mut sdb, sa, encode_words(sig, &args));
+        assert!(g.success && s.success, "{} reverted", sig);
+        assert_eq!(g.output, s.output, "{} differs", sig);
+        assert_eq!(U256::from_be_slice(&g.output), U256::from(20u64), "{} wrong", sig);
+    }
+
+    // Narrow overflow (u8: 200*2=400, i8: 100*2=200) must revert in every operand
+    // position, exactly as Solidity does, regardless of where the literal sits or
+    // whether the type is signed.
+    for (sig, args) in [
+        ("u8_lit_r(uint8)", vec![w(200)]),
+        ("u8_lit_l(uint8)", vec![w(200)]),
+        ("u8_var(uint8,uint8)", vec![w(200), w(2)]),
+        ("i8_lit_r(int8)", vec![w(100)]),
+        ("i8_lit_l(int8)", vec![w(100)]),
+        ("i8_var(int8,int8)", vec![w(100), w(2)]),
     ] {
         let g = call(&mut gdb, ga, encode_words(sig, &args));
         let s = call(&mut sdb, sa, encode_words(sig, &args));
-        eprintln!("{}: gum(ok={} out={}) sol(ok={} out={}) MATCH={}", label, g.success, hex::encode(&g.output), s.success, hex::encode(&s.output), g.success==s.success && g.output==s.output);
+        assert_eq!(g.success, s.success, "{}: revert must agree with Solidity", sig);
+        assert!(!g.success, "{}: narrow overflow must revert", sig);
     }
 }

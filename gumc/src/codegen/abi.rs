@@ -19,7 +19,12 @@ pub struct AbiInput {
 
 impl AbiInput {
     pub fn plain(name: String, type_name: String, components: Vec<AbiInput>) -> Self {
-        Self { name, type_name, components, indexed: None }
+        Self {
+            name,
+            type_name,
+            components,
+            indexed: None,
+        }
     }
 }
 
@@ -30,13 +35,13 @@ pub struct AbiEntry {
     pub entry_type: String,
     pub name: String,
     pub inputs: Vec<AbiInput>,
-    // Option rather than always emitted, so an event or error omits these keys entirely.
+    // Option rather than always emitted, so an event omits these keys
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<AbiInput>>,
     #[serde(rename = "stateMutability", skip_serializing_if = "Option::is_none")]
     // "nonpayable", "view", "pure", "payable"
     pub state_mutability: Option<String>,
-    // Events only, and always Some(false): gum has no anonymous event syntax, but the key is required for the entry to be well formed.
+    // Events only, and always Some(false): gum has no anonymous event syntax, but the key is required for the entry to be well formed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
 }
@@ -50,22 +55,28 @@ impl<'a> AbiGenerator<'a> {
         Self { type_checker }
     }
 
-    // Account maps to address rather than a tuple, because its u256 field is only a storage convenience and codegen masks it to 160 bits.
-    // As a tuple the signature would read (uint256) and no standard caller could compute the selector.
+    // Account maps to address, the u256 field is only a storage convenience and gets masked to 160 bits
     pub fn map_type(&self, type_def: &Type) -> String {
         match type_def {
             Type::Primitive(name) => {
                 match name.as_str() {
-                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => format!("uint{}", name[1..].to_string()),
-                    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => format!("int{}", name[1..].to_string()),
+                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => {
+                        format!("uint{}", name[1..].to_string())
+                    }
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => {
+                        format!("int{}", name[1..].to_string())
+                    }
                     "Address" | "Account" => "address".to_string(),
                     "bool" => "bool".to_string(),
-                    // fixed-point maps to int256; Message/Block are removed by ABI filtering
+                    // fp types are turned to i256 for WAD ops and ABI comp
                     "f32" | "f64" => "int256".to_string(),
                     "Message" => "Message".to_string(),
                     "Block" => "Block".to_string(),
                     _ if crate::codegen::translator::byte_width(name).is_some() => {
-                        format!("bytes{}", crate::codegen::translator::byte_width(name).unwrap())
+                        format!(
+                            "bytes{}",
+                            crate::codegen::translator::byte_width(name).unwrap()
+                        )
                     }
                     _ => {
                         if name == "String" {
@@ -88,9 +99,7 @@ impl<'a> AbiGenerator<'a> {
         }
     }
 
-    // The type as it appears in a function signature, where a struct is spelled out as its component tuple.
-    // map_type gives the JSON ABI spelling, which keeps the word "tuple" and moves the fields into a components list; a selector needs the expanded form or no standard caller could compute it.
-    // Recursive rather than a special case for a bare tuple, since the element of an array can be one too and (uint128,uint256)[] is not the same string as tuple[].
+    // The type as it appears in a function signature -> structs are spelled out as their component tuple
     pub fn signature_type(&self, type_def: &Type) -> String {
         match type_def {
             Type::Array(inner) => format!("{}[]", self.signature_type(inner)),
@@ -113,11 +122,12 @@ impl<'a> AbiGenerator<'a> {
         }
     }
 
-    // Unwraps to the element type first, so an array of structs still reports the struct's fields; the JSON for tuple[] carries the same components as tuple.
+    // Unwraps to the element type first so an array of structs still reports the struct's fields
     pub fn generate_components(&self, type_def: &Type) -> Vec<AbiInput> {
         if let Type::Array(inner) | Type::FixedArray(inner, _) = type_def {
             return self.generate_components(inner);
         }
+
         if let Type::Primitive(name) = type_def {
             if name == "String" || name == "Bytes" {
                 return Vec::new();
@@ -149,7 +159,7 @@ impl<'a> AbiGenerator<'a> {
                 if type_name == "Message" || type_name == "Block" {
                     continue;
                 }
-                
+
                 inputs.push(AbiInput::plain(
                     param.name.clone(),
                     type_name.clone(),
@@ -159,7 +169,7 @@ impl<'a> AbiGenerator<'a> {
 
             entries.push(AbiEntry {
                 entry_type: "constructor".to_string(),
-                // constructors do not have a name in ABI
+                // constructors do not have a name in the ABI
                 name: "".to_string(),
                 inputs,
                 outputs: Some(Vec::new()),
@@ -170,50 +180,50 @@ impl<'a> AbiGenerator<'a> {
 
         for f in &class.methods {
             if !f.modifiers.iter().any(|m| m == "export") {
-                    continue;
-                }
-                if f.name == "receive" || f.name == "fallback" {
-                    entries.push(AbiEntry {
-                        entry_type: f.name.clone(),
-                        name: String::new(),
-                        inputs: Vec::new(),
-                        outputs: Some(Vec::new()),
-                        state_mutability: Some(state_mutability(f, &muts).to_string()),
-                        anonymous: None,
-                    });
-                    continue;
-                }
-                let mut inputs = Vec::new();
-                for param in &f.parameters {
-                    let type_name = self.map_type(&param.type_def);
-                    if type_name == "Message" || type_name == "Block" {
-                        continue;
-                    }
-                    
-                    inputs.push(AbiInput::plain(
-                        param.name.clone(),
-                        type_name.clone(),
-                        self.generate_components(&param.type_def),
-                    ));
-                }
-
-                let mut outputs = Vec::new();
-                if let Some(ret_type) = &f.return_type {
-                    outputs.push(AbiInput::plain(
-                        "".to_string(),
-                        self.map_type(ret_type),
-                        self.generate_components(ret_type),
-                    ));
-                }
-
+                continue;
+            }
+            if f.name == "receive" || f.name == "fallback" {
                 entries.push(AbiEntry {
-                    entry_type: "function".to_string(),
-                    name: f.name.clone(),
-                    inputs,
-                    outputs: Some(outputs),
+                    entry_type: f.name.clone(),
+                    name: String::new(),
+                    inputs: Vec::new(),
+                    outputs: Some(Vec::new()),
                     state_mutability: Some(state_mutability(f, &muts).to_string()),
                     anonymous: None,
                 });
+                continue;
+            }
+            let mut inputs = Vec::new();
+            for param in &f.parameters {
+                let type_name = self.map_type(&param.type_def);
+                if type_name == "Message" || type_name == "Block" {
+                    continue;
+                }
+
+                inputs.push(AbiInput::plain(
+                    param.name.clone(),
+                    type_name.clone(),
+                    self.generate_components(&param.type_def),
+                ));
+            }
+
+            let mut outputs = Vec::new();
+            if let Some(ret_type) = &f.return_type {
+                outputs.push(AbiInput::plain(
+                    "".to_string(),
+                    self.map_type(ret_type),
+                    self.generate_components(ret_type),
+                ));
+            }
+
+            entries.push(AbiEntry {
+                entry_type: "function".to_string(),
+                name: f.name.clone(),
+                inputs,
+                outputs: Some(outputs),
+                state_mutability: Some(state_mutability(f, &muts).to_string()),
+                anonymous: None,
+            });
         }
 
         for decl in &program.declarations {
@@ -245,8 +255,7 @@ impl<'a> AbiGenerator<'a> {
     }
 
     // Builds the ABI entry for one event, from the schema the translator
-    // recorded at its log() site. Kept here so every ABI shape decision
-    // lives in one file, but the contents come from codegen, see
+    // recorded at its log() site
     pub fn event_entry(name: &str, inputs: Vec<AbiInput>) -> AbiEntry {
         AbiEntry {
             entry_type: "event".to_string(),
@@ -262,14 +271,18 @@ impl<'a> AbiGenerator<'a> {
     pub fn calculate_selector(&self, f: &FnDecl) -> String {
         let mut sig = format!("{}(", f.name);
 
-        let param_types: Vec<String> = f.parameters.iter().filter_map(|p| {
-            let base_type = self.map_type(&p.type_def);
-            if base_type == "Message" || base_type == "Block" {
-                return None;
-            }
-            Some(self.signature_type(&p.type_def))
-        }).collect();
-        
+        let param_types: Vec<String> = f
+            .parameters
+            .iter()
+            .filter_map(|p| {
+                let base_type = self.map_type(&p.type_def);
+                if base_type == "Message" || base_type == "Block" {
+                    return None;
+                }
+                Some(self.signature_type(&p.type_def))
+            })
+            .collect();
+
         sig.push_str(&param_types.join(","));
         sig.push(')');
 
@@ -278,16 +291,21 @@ impl<'a> AbiGenerator<'a> {
         keccak.update(sig.as_bytes());
         keccak.finalize(&mut output);
 
-        format!("0x{:02x}{:02x}{:02x}{:02x}", output[0], output[1], output[2], output[3])
+        format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            output[0], output[1], output[2], output[3]
+        )
     }
 
     pub fn calculate_error_selector(&self, variant: &crate::ast::EnumVariant) -> String {
         let mut sig = format!("{}(", variant.name);
-        
-        let param_types: Vec<String> = variant.parameters.iter()
+
+        let param_types: Vec<String> = variant
+            .parameters
+            .iter()
             .map(|p| self.signature_type(&p.type_def))
             .collect();
-        
+
         sig.push_str(&param_types.join(","));
         sig.push(')');
 
@@ -296,6 +314,9 @@ impl<'a> AbiGenerator<'a> {
         keccak.update(sig.as_bytes());
         keccak.finalize(&mut output);
 
-        format!("0x{:02x}{:02x}{:02x}{:02x}", output[0], output[1], output[2], output[3])
+        format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            output[0], output[1], output[2], output[3]
+        )
     }
 }

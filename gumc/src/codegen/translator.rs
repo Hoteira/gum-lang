@@ -3704,14 +3704,20 @@ impl<'a> Translator<'a> {
     }
 
     fn binary_op_meta(&self, left: &Expr, right: &Expr, ctx: &Ctx) -> Option<(usize, bool)> {
-        if let Type::Primitive(name) = self.static_type(left, ctx) {
-            if let Some(m) = numeric_meta(&name) {
-                return Some(m);
-            }
-        }
-        if let Type::Primitive(name) = self.static_type(right, ctx) {
-            if let Some(m) = numeric_meta(&name) {
-                return Some(m);
+        // A number literal is u256 by default, so it must not set the width when
+        // the other operand carries a narrower concrete type. Consult the
+        // non-literal side first, or 2 * v on a u8 would use a 256-bit overflow
+        // bound and wrap instead of reverting.
+        let order: [&Expr; 2] = if matches!(left, Expr::Number(_)) && !matches!(right, Expr::Number(_)) {
+            [right, left]
+        } else {
+            [left, right]
+        };
+        for e in order {
+            if let Type::Primitive(name) = self.static_type(e, ctx) {
+                if let Some(m) = numeric_meta(&name) {
+                    return Some(m);
+                }
             }
         }
         None

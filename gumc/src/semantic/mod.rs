@@ -2112,7 +2112,17 @@ impl TypeChecker {
                 }
 
                 let _ = self.check_fixed_point_math(expr);
-                Ok(left_type)
+                // A number literal defaults to u256, so it must not set the result
+                // width when the other operand is a concrete narrower type. Mirrors
+                // binary_op_meta in codegen, so 2 * v and v * 2 agree on the type.
+                let result_type = if matches!(left.as_ref(), Expr::Number(_))
+                    && !matches!(right.as_ref(), Expr::Number(_))
+                {
+                    right_type
+                } else {
+                    left_type
+                };
+                Ok(result_type)
             }
             Expr::FString(segments) => {
                 for seg in segments {

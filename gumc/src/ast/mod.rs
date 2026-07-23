@@ -42,7 +42,6 @@ pub struct GenericParam {
     pub name: String,
 }
 
-// is_const: fixed at deploy, no storage slot. Assigned once in fn new.
 #[derive(Debug, Clone)]
 pub struct ClassField {
     pub is_const: bool,
@@ -72,7 +71,7 @@ pub struct Spanned<T> {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub modifiers: Vec<String>,
-    // Bracketed attributes above the fn, like [Test]. Currently only the
+    // attributes over the fn body, es. [Test]
     pub attributes: Vec<String>,
     pub name: String,
     pub parameters: Vec<Parameter>,
@@ -89,24 +88,58 @@ pub struct Parameter {
 
 #[derive(Debug, Clone)]
 pub enum Statement {
-    VarDecl { is_mut: bool, is_const: bool, type_def: Type, name: String, value: Option<Expr> },
-    Assignment { target: Expr, value: Expr },
-    // Syntax sugar
-    BitwiseFlip { name: String, index: Expr, value: Expr },
-    // assert(cond) or assert(cond, msg), where msg is a string (-> the
-    Assert { condition: Expr, message: Option<Expr> },
-    Revert { error: Expr },
-    // delete x, reset an lvalue to its type's zero value. For most types
-    Delete { target: Expr },
-    // return expr in a value-returning function; bare return (value: None)
-    Return { value: Option<Expr> },
-    IfElse { condition: Expr, if_body: Vec<Spanned<Statement>>, else_body: Option<Vec<Spanned<Statement>>> },
-    ForLoop { iterator: String, iterable: Expr, body: Vec<Spanned<Statement>> },
-    WhileLoop { condition: Expr, body: Vec<Spanned<Statement>> },
-    TryCatch { try_body: Vec<Spanned<Statement>>, catch_body: Vec<Spanned<Statement>> },
-    // Produced by the codegen try-hoisting pass. The try body runs as a guarded
-    // self-call so any revert is caught and rolled back before catch. args marshal
-    // captured locals in; propagate_return and writeback carry a value back out.
+    VarDecl {
+        is_mut: bool,
+        is_const: bool,
+        type_def: Type,
+        name: String,
+        value: Option<Expr>,
+    },
+    Assignment {
+        target: Expr,
+        value: Expr,
+    },
+
+    BitwiseFlip {
+        name: String,
+        index: Expr,
+        value: Expr,
+    },
+
+    Assert {
+        condition: Expr,
+        message: Option<Expr>,
+    },
+    Revert {
+        error: Expr,
+    },
+
+    Delete {
+        target: Expr,
+    },
+
+    Return {
+        value: Option<Expr>,
+    },
+    IfElse {
+        condition: Expr,
+        if_body: Vec<Spanned<Statement>>,
+        else_body: Option<Vec<Spanned<Statement>>>,
+    },
+    ForLoop {
+        iterator: String,
+        iterable: Expr,
+        body: Vec<Spanned<Statement>>,
+    },
+    WhileLoop {
+        condition: Expr,
+        body: Vec<Spanned<Statement>>,
+    },
+    TryCatch {
+        try_body: Vec<Spanned<Statement>>,
+        catch_body: Vec<Spanned<Statement>>,
+    },
+
     ScopedTryCall {
         thunk: String,
         args: Vec<(String, Type)>,
@@ -114,10 +147,16 @@ pub enum Statement {
         writeback: Option<(String, Type)>,
         catch_body: Vec<Spanned<Statement>>,
     },
-    Match { expr: Expr, arms: Vec<MatchArm> },
+    Match {
+        expr: Expr,
+        arms: Vec<MatchArm>,
+    },
     Expression(Expr),
-    // Low-level external contract call, e.g. call target(args)
-    Call { target: String, args: Vec<Expr> },
+
+    Call {
+        target: String,
+        args: Vec<Expr>,
+    },
     UnsafeBlock(String),
 }
 
@@ -133,12 +172,32 @@ pub enum Expr {
     Number(String),
     StringLiteral(String),
     Identifier(String),
-    FnCall { name: String, args: Vec<Expr> },
-    Instantiation { type_def: Type, args: Vec<Expr> },
-    PropertyAccess { base: Box<Expr>, property: String },
-    MethodCall { base: Box<Expr>, method: String, args: Vec<Expr> },
-    IndexAccess { base: Box<Expr>, index: Box<Expr> },
-    BinaryOp { left: Box<Expr>, operator: String, right: Box<Expr> },
+    FnCall {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Instantiation {
+        type_def: Type,
+        args: Vec<Expr>,
+    },
+    PropertyAccess {
+        base: Box<Expr>,
+        property: String,
+    },
+    MethodCall {
+        base: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
+    IndexAccess {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    BinaryOp {
+        left: Box<Expr>,
+        operator: String,
+        right: Box<Expr>,
+    },
     FString(Vec<FStringSegment>),
     Neg(Box<Expr>),
     Not(Box<Expr>),

@@ -1,22 +1,26 @@
+pub mod abi;
 pub mod layout;
 pub mod mutability;
 pub mod translator;
-pub mod abi;
 
 use crate::ast::*;
 use crate::semantic::TypeChecker;
-use layout::{immutable_key, LayoutEngine};
-use translator::{immutable_deploy_local, immutable_local, is_enum_type, is_str_type, is_struct_type, Ctx, SelfCtx, Translator};
 use abi::AbiGenerator;
+use layout::{LayoutEngine, immutable_key};
 use std::collections::{HashMap, HashSet};
+use translator::{
+    Ctx, SelfCtx, Translator, immutable_deploy_local, immutable_local, is_enum_type, is_str_type,
+    is_struct_type,
+};
 
 pub trait Backend {
-    fn generate(&mut self, program: &Program, type_checker: &TypeChecker) -> Result<Vec<(String, String, String)>, String>;
+    fn generate(
+        &mut self,
+        program: &Program,
+        type_checker: &TypeChecker,
+    ) -> Result<Vec<(String, String, String)>, String>;
 }
 
-// Whether a type is an EVM address (160-bit) for masking purposes. Account is
-// the stdlib's address type; its single u256 address field is a storage
-// convenience, but on-chain it names a 20-byte account, so it's masked to 160
 pub(crate) fn is_address_type(t: &Type) -> bool {
     matches!(t, Type::Primitive(name) if name == "Account")
 }
@@ -34,9 +38,7 @@ fn hash_slot(key: &str) -> String {
     s
 }
 
-// Storage slot for a once function's has-run flag. Derived from keccak of the
-// function name so it can never collide with a normal field's slot (0, 1, 2, ...)
-// the same trick namespaced storage uses.
+// same trick namespaced storage uses
 fn once_flag_slot(fn_name: &str) -> String {
     hash_slot(&format!("gum.once:{}", fn_name))
 }
@@ -62,8 +64,7 @@ pub fn generic_suffix(args: &[Type]) -> String {
 }
 
 // Replaces occurrences of a generic class's own parameter names (e.g. Vec's
-// T, HashMap's K/V) with the concrete types from one specific
-// instantiation. Only applied to a method's parameter/return types, method
+// T, HashMap's K/V) with the concrete types from one specific instantiation.
 fn substitute_type(t: &Type, subst: &HashMap<String, Type>) -> Type {
     match t {
         Type::Primitive(name) => subst.get(name).cloned().unwrap_or_else(|| t.clone()),
@@ -81,11 +82,15 @@ fn substitute_method(m: &FnDecl, subst: &HashMap<String, Type>) -> FnDecl {
         modifiers: m.modifiers.clone(),
         attributes: m.attributes.clone(),
         name: m.name.clone(),
-        parameters: m.parameters.iter().map(|p| Parameter {
-            is_mut: p.is_mut,
-            type_def: substitute_type(&p.type_def, subst),
-            name: p.name.clone(),
-        }).collect(),
+        parameters: m
+            .parameters
+            .iter()
+            .map(|p| Parameter {
+                is_mut: p.is_mut,
+                type_def: substitute_type(&p.type_def, subst),
+                name: p.name.clone(),
+            })
+            .collect(),
         return_type: m.return_type.as_ref().map(|t| substitute_type(t, subst)),
         body: m.body.clone(),
     }
@@ -108,11 +113,16 @@ fn note_generic(t: &Type, found: &mut HashMap<String, Vec<Vec<Type>>>) {
     }
 }
 
-fn scan_stmts_for_generics(stmts: &[Spanned<Statement>], found: &mut HashMap<String, Vec<Vec<Type>>>) {
+fn scan_stmts_for_generics(
+    stmts: &[Spanned<Statement>],
+    found: &mut HashMap<String, Vec<Vec<Type>>>,
+) {
     for s in stmts {
         match &s.node {
             Statement::VarDecl { type_def, .. } => note_generic(type_def, found),
-            Statement::IfElse { if_body, else_body, .. } => {
+            Statement::IfElse {
+                if_body, else_body, ..
+            } => {
                 scan_stmts_for_generics(if_body, found);
                 if let Some(eb) = else_body {
                     scan_stmts_for_generics(eb, found);
@@ -130,10 +140,11 @@ fn scan_stmts_for_generics(stmts: &[Spanned<Statement>], found: &mut HashMap<Str
     }
 }
 
-// Finds every concrete instantiation of every generic class actually used in
-// the program (class fields, function/method signatures, and var_decls in
-// any body, including nested blocks) so each one can get its own compiled
-fn collect_generic_instantiations(program: &Program, type_checker: &TypeChecker) -> HashMap<String, Vec<Vec<Type>>> {
+// Finds every concrete instantiation of every generic class actually used in the program
+fn collect_generic_instantiations(
+    program: &Program,
+    type_checker: &TypeChecker,
+) -> HashMap<String, Vec<Vec<Type>>> {
     let mut found: HashMap<String, Vec<Vec<Type>>> = HashMap::new();
     for class_decl in type_checker.loaded_classes.values() {
         for f in &class_decl.fields {
@@ -166,7 +177,11 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
         match e {
             Expr::Instantiation { type_def, args } => {
                 if let Type::Primitive(n) = type_def {
-                    let is_contract = tc.loaded_classes.get(n).map(|c| c.is_global).unwrap_or(false);
+                    let is_contract = tc
+                        .loaded_classes
+                        .get(n)
+                        .map(|c| c.is_global)
+                        .unwrap_or(false);
                     if is_contract && !out.iter().any(|x| x == n) {
                         out.push(n.clone());
                     }
@@ -228,14 +243,20 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
                     expr(v, tc, out)
                 }
             }
-            Statement::IfElse { condition, if_body, else_body } => {
+            Statement::IfElse {
+                condition,
+                if_body,
+                else_body,
+            } => {
                 expr(condition, tc, out);
                 body(if_body, out);
                 if let Some(eb) = else_body {
                     body(eb, out)
                 }
             }
-            Statement::ForLoop { iterable, body: b, .. } => {
+            Statement::ForLoop {
+                iterable, body: b, ..
+            } => {
                 expr(iterable, tc, out);
                 body(b, out);
             }
@@ -256,7 +277,10 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
                 expr(value, tc, out);
             }
             Statement::UnsafeBlock(_) => {}
-            Statement::TryCatch { try_body, catch_body } => {
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+            } => {
                 body(try_body, out);
                 body(catch_body, out);
             }
@@ -350,7 +374,13 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
             is_entry: is_selector_entry(m),
             local_types,
         };
-        hoist_in_body(&mut m.body, &base_locals, &enclosing, &mut thunks, &mut counter);
+        hoist_in_body(
+            &mut m.body,
+            &base_locals,
+            &enclosing,
+            &mut thunks,
+            &mut counter,
+        );
     }
     class.methods.extend(thunks);
     class
@@ -408,7 +438,11 @@ fn plan_capture(
         .params
         .iter()
         .filter(|p| captured.contains(&p.name))
-        .map(|p| Parameter { is_mut: false, type_def: p.type_def.clone(), name: p.name.clone() })
+        .map(|p| Parameter {
+            is_mut: false,
+            type_def: p.type_def.clone(),
+            name: p.name.clone(),
+        })
         .collect();
     let mut local_caps: Vec<Parameter> = Vec::new();
     for name in &captured {
@@ -432,8 +466,10 @@ fn plan_capture(
     // variable; anything else stays on the old inline path for now.
     let mut assigned: HashSet<String> = HashSet::new();
     collect_assigned_idents(try_body, &mut assigned);
-    let mutated: Vec<&Parameter> =
-        captures.iter().filter(|c| assigned.contains(&c.name)).collect();
+    let mutated: Vec<&Parameter> = captures
+        .iter()
+        .filter(|c| assigned.contains(&c.name))
+        .collect();
     let has_ret = body_has_return(try_body);
     let writeback: Option<(String, Type)> = match mutated.as_slice() {
         [] => None,
@@ -455,7 +491,11 @@ fn plan_capture(
         return None;
     }
 
-    Some(Capture { captures, has_ret, writeback })
+    Some(Capture {
+        captures,
+        has_ret,
+        writeback,
+    })
 }
 
 // The outcome of planning a try body's capture: which variables to marshal in
@@ -475,7 +515,9 @@ fn hoist_in_stmt(
     counter: &mut usize,
 ) {
     match stmt {
-        Statement::IfElse { if_body, else_body, .. } => {
+        Statement::IfElse {
+            if_body, else_body, ..
+        } => {
             hoist_in_body(if_body, base_locals, enclosing, thunks, counter);
             if let Some(e) = else_body {
                 hoist_in_body(e, base_locals, enclosing, thunks, counter);
@@ -489,16 +531,22 @@ fn hoist_in_stmt(
                 hoist_in_body(&mut a.body, base_locals, enclosing, thunks, counter);
             }
         }
-        Statement::TryCatch { try_body, catch_body } => {
+        Statement::TryCatch {
+            try_body,
+            catch_body,
+        } => {
             // Hoist any nested trys in both branches first.
             hoist_in_body(try_body, base_locals, enclosing, thunks, counter);
             hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
-            let Capture { captures, has_ret, writeback } =
-                match plan_capture(try_body, base_locals, enclosing) {
-                    Some(p) => p,
-                    // leave on the existing path
-                    None => return,
-                };
+            let Capture {
+                captures,
+                has_ret,
+                writeback,
+            } = match plan_capture(try_body, base_locals, enclosing) {
+                Some(p) => p,
+                // leave on the existing path
+                None => return,
+            };
             let id = *counter;
             *counter += 1;
             let thunk_name = format!("__try_thunk_{}", id);
@@ -507,20 +555,27 @@ fn hoist_in_stmt(
                 "{{\nif iszero(tload({slot})) {{ revert(0, 0) }}\ntstore({slot}, 0)\n}}",
                 slot = TRY_CAPABILITY_SLOT
             );
-            let mut thunk_body: Vec<Spanned<Statement>> =
-                vec![Spanned { node: Statement::UnsafeBlock(guard), line: 0, col: 0 }];
+            let mut thunk_body: Vec<Spanned<Statement>> = vec![Spanned {
+                node: Statement::UnsafeBlock(guard),
+                line: 0,
+                col: 0,
+            }];
             thunk_body.append(try_body);
             // For write-back, the thunk returns the mutated variable so the site
             // can assign it back; append that return after the (non-returning) body.
             if let Some((name, _)) = &writeback {
                 thunk_body.push(Spanned {
-                    node: Statement::Return { value: Some(Expr::Identifier(name.clone())) },
+                    node: Statement::Return {
+                        value: Some(Expr::Identifier(name.clone())),
+                    },
                     line: 0,
                     col: 0,
                 });
             }
-            let args: Vec<(String, Type)> =
-                captures.iter().map(|p| (p.name.clone(), p.type_def.clone())).collect();
+            let args: Vec<(String, Type)> = captures
+                .iter()
+                .map(|p| (p.name.clone(), p.type_def.clone()))
+                .collect();
             // A returning body encodes through the enclosing return type; a
             // write-back encodes through the mutated variable's type.
             let thunk_ret = if has_ret {
@@ -534,7 +589,11 @@ fn hoist_in_stmt(
                 name: thunk_name.clone(),
                 parameters: captures
                     .iter()
-                    .map(|p| Parameter { is_mut: false, type_def: p.type_def.clone(), name: p.name.clone() })
+                    .map(|p| Parameter {
+                        is_mut: false,
+                        type_def: p.type_def.clone(),
+                        name: p.name.clone(),
+                    })
                     .collect(),
                 return_type: thunk_ret,
                 body: thunk_body,
@@ -562,7 +621,8 @@ fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type
     for s in body {
         match &s.node {
             Statement::VarDecl { name, type_def, .. } => {
-                let unknown = matches!(type_def, Type::Primitive(n) if n == "_infer" || n == "unknown");
+                let unknown =
+                    matches!(type_def, Type::Primitive(n) if n == "_infer" || n == "unknown");
                 if !unknown {
                     out.insert(name.clone(), type_def.clone());
                 }
@@ -570,7 +630,9 @@ fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type
             Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => {
                 collect_var_types(body, out)
             }
-            Statement::IfElse { if_body, else_body, .. } => {
+            Statement::IfElse {
+                if_body, else_body, ..
+            } => {
                 collect_var_types(if_body, out);
                 if let Some(e) = else_body {
                     collect_var_types(e, out);
@@ -581,7 +643,10 @@ fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type
                     collect_var_types(&a.body, out);
                 }
             }
-            Statement::TryCatch { try_body, catch_body } => {
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+            } => {
                 collect_var_types(try_body, out);
                 collect_var_types(catch_body, out);
             }
@@ -603,7 +668,9 @@ fn collect_var_decls(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
                 collect_var_decls(body, out);
             }
             Statement::WhileLoop { body, .. } => collect_var_decls(body, out),
-            Statement::IfElse { if_body, else_body, .. } => {
+            Statement::IfElse {
+                if_body, else_body, ..
+            } => {
                 collect_var_decls(if_body, out);
                 if let Some(e) = else_body {
                     collect_var_decls(e, out);
@@ -617,7 +684,10 @@ fn collect_var_decls(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
                     collect_var_decls(&a.body, out);
                 }
             }
-            Statement::TryCatch { try_body, catch_body } => {
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+            } => {
                 collect_var_decls(try_body, out);
                 collect_var_decls(catch_body, out);
             }
@@ -633,13 +703,18 @@ fn collect_var_decls(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
 fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
     for s in body {
         match &s.node {
-            Statement::Assignment { target: Expr::Identifier(n), .. } => {
+            Statement::Assignment {
+                target: Expr::Identifier(n),
+                ..
+            } => {
                 out.insert(n.clone());
             }
             Statement::BitwiseFlip { name, .. } => {
                 out.insert(name.clone());
             }
-            Statement::IfElse { if_body, else_body, .. } => {
+            Statement::IfElse {
+                if_body, else_body, ..
+            } => {
                 collect_assigned_idents(if_body, out);
                 if let Some(e) = else_body {
                     collect_assigned_idents(e, out);
@@ -653,13 +728,20 @@ fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String
                     collect_assigned_idents(&a.body, out);
                 }
             }
-            Statement::TryCatch { try_body, catch_body } => {
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+            } => {
                 collect_assigned_idents(try_body, out);
                 collect_assigned_idents(catch_body, out);
             }
             // A hoisted inner try writes its mutated variable back into this
             // frame, so it counts as an assignment here too.
-            Statement::ScopedTryCall { writeback, catch_body, .. } => {
+            Statement::ScopedTryCall {
+                writeback,
+                catch_body,
+                ..
+            } => {
                 if let Some((n, _)) = writeback {
                     out.insert(n.clone());
                 }
@@ -674,19 +756,24 @@ fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String
 fn body_has_return(body: &[Spanned<Statement>]) -> bool {
     body.iter().any(|s| match &s.node {
         Statement::Return { .. } => true,
-        Statement::IfElse { if_body, else_body, .. } => {
-            body_has_return(if_body) || else_body.as_ref().is_some_and(|e| body_has_return(e))
+        Statement::IfElse {
+            if_body, else_body, ..
+        } => body_has_return(if_body) || else_body.as_ref().is_some_and(|e| body_has_return(e)),
+        Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => {
+            body_has_return(body)
         }
-        Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => body_has_return(body),
         Statement::Match { arms, .. } => arms.iter().any(|a| body_has_return(&a.body)),
-        Statement::TryCatch { try_body, catch_body } => {
-            body_has_return(try_body) || body_has_return(catch_body)
-        }
+        Statement::TryCatch {
+            try_body,
+            catch_body,
+        } => body_has_return(try_body) || body_has_return(catch_body),
         // A hoisted inner try that propagates a return forwards it out of this
         // frame too, so the enclosing try must treat its body as returning.
-        Statement::ScopedTryCall { propagate_return, catch_body, .. } => {
-            *propagate_return || body_has_return(catch_body)
-        }
+        Statement::ScopedTryCall {
+            propagate_return,
+            catch_body,
+            ..
+        } => *propagate_return || body_has_return(catch_body),
         _ => false,
     })
 }
@@ -730,7 +817,11 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
                 e(v, out)
             }
         }
-        Statement::IfElse { condition, if_body, else_body } => {
+        Statement::IfElse {
+            condition,
+            if_body,
+            else_body,
+        } => {
             e(condition, out);
             body_idents(if_body, out);
             if let Some(b) = else_body {
@@ -753,7 +844,10 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
         }
         Statement::Expression(x) => e(x, out),
         Statement::Call { args, .. } => args.iter().for_each(|a| e(a, out)),
-        Statement::TryCatch { try_body, catch_body } => {
+        Statement::TryCatch {
+            try_body,
+            catch_body,
+        } => {
             body_idents(try_body, out);
             body_idents(catch_body, out);
         }
@@ -761,7 +855,12 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
         // variable in the enclosing frame, so an outer try around it must capture
         // those names too, otherwise the outer thunk references a variable it was
         // never handed. (The inner body itself is gone into its own thunk.)
-        Statement::ScopedTryCall { args, writeback, catch_body, .. } => {
+        Statement::ScopedTryCall {
+            args,
+            writeback,
+            catch_body,
+            ..
+        } => {
             for (n, _) in args {
                 out.insert(n.clone());
             }
@@ -814,7 +913,6 @@ fn is_context_param(t: &Type) -> bool {
     matches!(t, Type::Primitive(n) if n == "Message" || n == "Block")
 }
 
-
 fn compile_class_methods(
     yul: &mut String,
     translator: &Translator,
@@ -824,7 +922,10 @@ fn compile_class_methods(
     methods: &[FnDecl],
 ) {
     for method in methods {
-        let self_ctx = SelfCtx { class_name: class_name.to_string(), is_global };
+        let self_ctx = SelfCtx {
+            class_name: class_name.to_string(),
+            is_global,
+        };
         let is_ctor = is_global && method.name == "new";
         let method_ctx = Ctx::helper(Some(&self_ctx))
             .with_return_type(method.return_type.clone())
@@ -860,7 +961,12 @@ fn compile_class_methods(
         let signature = if rets.is_empty() {
             format!("function {}({}) {{\n", fn_name, params.join(", "))
         } else {
-            format!("function {}({}) -> {} {{\n", fn_name, params.join(", "), rets.join(", "))
+            format!(
+                "function {}({}) -> {} {{\n",
+                fn_name,
+                params.join(", "),
+                rets.join(", ")
+            )
         };
         yul.push_str(&format!("      {}", signature));
 
@@ -881,16 +987,26 @@ pub struct EvmYulBackend {
 
 impl EvmYulBackend {
     pub fn new(rich_reverts: bool) -> Self {
-        Self { rich_reverts, lock_path: None }
+        Self {
+            rich_reverts,
+            lock_path: None,
+        }
     }
 
     pub fn with_lock(rich_reverts: bool, lock_path: Option<String>) -> Self {
-        Self { rich_reverts, lock_path }
+        Self {
+            rich_reverts,
+            lock_path,
+        }
     }
 }
 
 impl Backend for EvmYulBackend {
-    fn generate(&mut self, program: &Program, type_checker: &TypeChecker) -> Result<Vec<(String, String, String)>, String> {
+    fn generate(
+        &mut self,
+        program: &Program,
+        type_checker: &TypeChecker,
+    ) -> Result<Vec<(String, String, String)>, String> {
         println!("--> [Codegen] Generating EVM Yul...");
         let lock_in = match &self.lock_path {
             Some(p) => layout::StorageManifest::load(p)?,
@@ -901,21 +1017,37 @@ impl Backend for EvmYulBackend {
         if let Some(p) = &self.lock_path {
             layout_engine.manifest_out.save(p)?;
             if had_lock {
-                println!("    [Storage Lock] Honored committed layout from {} (existing fields pinned).", p);
+                println!(
+                    "    [Storage Lock] Honored committed layout from {} (existing fields pinned).",
+                    p
+                );
             } else {
-                println!("    [Storage Lock] Wrote new storage lock to {}, commit it; future compiles will keep this layout.", p);
+                println!(
+                    "    [Storage Lock] Wrote new storage lock to {}, commit it; future compiles will keep this layout.",
+                    p
+                );
             }
         }
         let abi_gen = AbiGenerator::new(type_checker);
 
-        let global_classes: Vec<ClassDecl> = program.declarations.iter().filter_map(|d| {
-            if let Declaration::Class(c) = d {
-                if c.is_global && c.name != "Message" && c.name != "Block" {
-                    return Some(type_checker.loaded_classes.get(&c.name).unwrap_or(c).clone());
+        let global_classes: Vec<ClassDecl> = program
+            .declarations
+            .iter()
+            .filter_map(|d| {
+                if let Declaration::Class(c) = d {
+                    if c.is_global && c.name != "Message" && c.name != "Block" {
+                        return Some(
+                            type_checker
+                                .loaded_classes
+                                .get(&c.name)
+                                .unwrap_or(c)
+                                .clone(),
+                        );
+                    }
                 }
-            }
-            None
-        }).collect();
+                None
+            })
+            .collect();
 
         let mut compiled_contracts = Vec::new();
 
@@ -972,8 +1104,14 @@ impl EvmYulBackend {
                     .get(child_name)
                     .ok_or_else(|| format!("new {}(...): no such contract", child_name))?
                     .clone();
-                let (child_yul, _) =
-                    self.build_contract_object(&child, program, type_checker, layout_engine, abi_gen, stack)?;
+                let (child_yul, _) = self.build_contract_object(
+                    &child,
+                    program,
+                    type_checker,
+                    layout_engine,
+                    abi_gen,
+                    stack,
+                )?;
                 for line in child_yul.lines() {
                     if line.is_empty() {
                         nested_objects.push('\n');
@@ -984,568 +1122,752 @@ impl EvmYulBackend {
                     }
                 }
             }
-            
-            let top_level_fns: HashSet<String> = global_class.methods.iter()
+
+            let top_level_fns: HashSet<String> = global_class
+                .methods
+                .iter()
                 .map(|f| f.name.clone())
                 .collect();
 
-            let mut yul = format!("object \"{}\" {{
-", global_class_name);
-            yul.push_str("  code {
-");
-            yul.push_str("    // --- Deployment Code ---
-");
-            
-            let translator = Translator::new(&layout_engine, &abi_gen, &top_level_fns, self.rich_reverts);
-            
+            let mut yul = format!(
+                "object \"{}\" {{
+",
+                global_class_name
+            );
+            yul.push_str(
+                "  code {
+",
+            );
+            yul.push_str(
+                "    // --- Deployment Code ---
+",
+            );
+
+            let translator =
+                Translator::new(&layout_engine, &abi_gen, &top_level_fns, self.rich_reverts);
+
             let constructor_decl = global_class
                 .methods
                 .iter()
                 .find(|m| m.name == "new")
                 .cloned();
 
-        if let Some(constructor) = &constructor_decl {
-            let head_bytes: usize = constructor.parameters.iter()
-                .filter(|p| !is_context_param(&p.type_def))
-                .map(|p| translator.abi_head_bytes(&p.type_def))
-                .sum();
+            if let Some(constructor) = &constructor_decl {
+                let head_bytes: usize = constructor
+                    .parameters
+                    .iter()
+                    .filter(|p| !is_context_param(&p.type_def))
+                    .map(|p| translator.abi_head_bytes(&p.type_def))
+                    .sum();
 
-            if head_bytes > 0 {
-                yul.push_str("    // --- Constructor Arguments ---\n");
-                yul.push_str(&format!("    let _prog := datasize(\"{}\")\n", global_class_name));
-                yul.push_str("    let _args_len := sub(codesize(), _prog)\n");
-                yul.push_str(&format!("    if lt(_args_len, {}) {{ revert(0, 0) }}\n", head_bytes));
-                yul.push_str("    let args_mem := allocate_memory(_args_len)\n");
-                yul.push_str("    codecopy(args_mem, _prog, _args_len)\n");
-            }
-
-            let mut arg_names = Vec::new();
-            let mut offset = 0;
-            for p in &constructor.parameters {
-                let mut is_context = false;
-                let arg_name = format!("param_{}", p.name);
-                arg_names.push(arg_name.clone());
-
-                if let Type::Primitive(name) = &p.type_def {
-                    if name == "Message" {
-                        yul.push_str(&format!("    let {} := allocate_memory(64)\n", arg_name));
-                        yul.push_str(&format!("    mstore({}, caller())\n", arg_name));
-                        yul.push_str(&format!("    mstore(add({}, 32), callvalue())\n", arg_name));
-                        is_context = true;
-                    } else if name == "Block" {
-                        yul.push_str(&format!("    let {} := allocate_memory(64)\n", arg_name));
-                        yul.push_str(&format!("    mstore({}, timestamp())\n", arg_name));
-                        yul.push_str(&format!("    mstore(add({}, 32), number())\n", arg_name));
-                        is_context = true;
-                    }
-                }
-
-                if !is_context {
-                    if is_str_type(&p.type_def) {
-                        yul.push_str(&format!("    let {}_head := mload(add(args_mem, {}))\n", arg_name, offset));
-                        yul.push_str(&format!("    if gt(add({}_head, 32), _args_len) {{ revert(0, 0) }}\n", arg_name));
-                        yul.push_str(&format!("    let {}_len := mload(add(args_mem, {}_head))\n", arg_name, arg_name));
-                        yul.push_str(&format!("    if gt(add(add({}_head, 32), {}_len), _args_len) {{ revert(0, 0) }}\n", arg_name, arg_name));
-                        yul.push_str(&format!("    let {} := allocate_memory(add(32, {}_len))\n", arg_name, arg_name));
-                        yul.push_str(&format!("    mstore({}, shl(192, {}_len))\n", arg_name, arg_name));
-                        yul.push_str(&format!(
-                            "    gum_memory_copy(add(add(args_mem, {}_head), 32), add({}, 32), {}_len)\n",
-                            arg_name, arg_name, arg_name
-                        ));
-                        offset += 32;
-                        continue;
-                    }
-                    // Same as the dispatcher: one wire word holding the tag, rebuilt into the [tag][payload] pair the body expects.
-                    if is_enum_type(layout_engine.type_checker, &p.type_def) {
-                        yul.push_str(&format!(
-                            "    let {} := and(mload(add(args_mem, {})), 0xff)\n",
-                            arg_name, offset
-                        ));
-                        offset += 32;
-                        continue;
-                    }
-                    if let Type::Primitive(name) = &p.type_def {
-                        if is_struct_type(layout_engine.type_checker, &p.type_def) {
-                            // A dynamic struct constructor arg sits behind an offset
-                            // word, like a dynamic array; a static one is inline.
-                            if translator.abi_is_dynamic(&p.type_def) {
-                                if let Some(helper) = translator.ensure_abi_dyn_struct_mem(name) {
-                                    yul.push_str(&format!(
-                                        "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
-                                        arg_name, helper, offset
-                                    ));
-                                    offset += 32;
-                                    continue;
-                                }
-                            }
-                            if let Some((helper, wire)) = translator.ensure_abi_struct_mem(name) {
-                                yul.push_str(&format!(
-                                    "    let {} := {}(args_mem, {}, _args_len)\n",
-                                    arg_name, helper, offset
-                                ));
-                                offset += wire;
-                                continue;
-                            }
-                        }
-                    }
-                    // The dispatcher's array path, reading the blob the creation code appended instead of calldata.
-                    if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
-                        if let Some(helper) = translator.ensure_abi_mem(&p.type_def) {
-                            if translator.abi_is_dynamic(&p.type_def) {
-                                yul.push_str(&format!(
-                                    "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
-                                    arg_name, helper, offset
-                                ));
-                                offset += 32;
-                            } else {
-                                yul.push_str(&format!(
-                                    "    let {} := {}(args_mem, {}, _args_len)\n",
-                                    arg_name, helper, offset
-                                ));
-                                offset += translator.abi_head_bytes(&p.type_def);
-                            }
-                            continue;
-                        }
-                    }
-                    let size = layout_engine.size_of(&p.type_def);
-                    if size <= 32 {
-                        let loaded = format!("mload(add(args_mem, {}))", offset);
-                        let mut masked = translator.mask_for_type(&loaded, &p.type_def);
-                        if is_address_type(&p.type_def) {
-                            masked = format!("and({}, 0xffffffffffffffffffffffffffffffffffffffff)", masked);
-                        }
-                        yul.push_str(&format!("    let {} := {}\n", arg_name, masked));
-                        offset += 32;
-                    } else {
-                        yul.push_str(&format!("    let {} := add(args_mem, {})\n", arg_name, offset));
-                        offset += size;
-                    }
-                }
-            }
-
-            let imm_names: Vec<String> = layout_engine
-                .patched_immutables(&global_class_name)
-                .iter()
-                .map(|f| immutable_deploy_local(f))
-                .collect();
-            let binding = if imm_names.is_empty() {
-                String::new()
-            } else {
-                format!("let {} := ", imm_names.join(", "))
-            };
-            yul.push_str(&format!(
-                "    {}{}_new({})\n",
-                binding,
-                global_class_name,
-                arg_names.join(", ")
-            ));
-        }
-
-        let runtime_obj = format!("{}_runtime", global_class_name);
-
-        yul.push_str("    // Copy runtime code to memory and return it\n");
-        yul.push_str(&format!(
-            "    datacopy(0, dataoffset(\"{r}\"), datasize(\"{r}\"))\n",
-            r = runtime_obj
-        ));
-        for f in layout_engine.patched_immutables(&global_class_name) {
-            yul.push_str(&format!(
-                "    setimmutable(0, \"{}\", {})\n",
-                immutable_key(&global_class_name, &f),
-                immutable_deploy_local(&f)
-            ));
-        }
-        yul.push_str(&format!("    return(0, datasize(\"{r}\"))\n", r = runtime_obj));
-
-        // End of deployment block
-        yul.push_str("  }\n");
-
-        yul.push_str(&format!("  object \"{}\" {{\n", runtime_obj));
-        yul.push_str("    code {\n");
-
-        yul.push_str("      // --- Function Dispatcher ---\n");
-
-        let has_ext = type_checker.has_external_calls.get();
-        let muts = mutability::analyze_class(type_checker, global_class);
-        // Per-function refinement of has_ext: a state-changing entry point that never hands control away cannot be re-entered, so it needs no lock. Gated behind the contract-wide flag, so a guard is only ever dropped, never added.
-        let ext = mutability::analyze_external_calls(type_checker, global_class);
-
-        let find_fn = |pred: fn(&FnDecl) -> bool| -> Option<&FnDecl> {
-            global_class.methods.iter().find(|f| pred(f))
-        };
-        let receive_fn = find_fn(is_receive);
-        let fallback_fn = find_fn(is_fallback);
-
-        let any_payable = global_class.methods.iter().any(|f| is_exported(f) && is_payable(f));
-
-        let invoke_bare = |yul: &mut String, f: &FnDecl, indent: &str| {
-            let guarded = has_ext
-                && mutability::makes_external_call(f, &ext)
-                && !is_unsafe(f)
-                && !mutability::is_read_only(f, &muts);
-            if guarded {
-                yul.push_str(&format!("{}if tload({}) {{ revert(0, 0) }}\n", indent, reentrancy_lock_slot()));
-                yul.push_str(&format!("{}tstore({}, 1)\n", indent, reentrancy_lock_slot()));
-            }
-            if any_payable && !is_payable(f) {
-                yul.push_str(&format!("{}if callvalue() {{ revert(0, 0) }}\n", indent));
-            }
-            yul.push_str(&format!("{}{}_impl()\n", indent, f.name));
-            if guarded {
-                yul.push_str(&format!("{}tstore({}, 0)\n", indent, reentrancy_lock_slot()));
-            }
-            yul.push_str(&format!("{}return(0, 0)\n", indent));
-        };
-
-        let empty_target = receive_fn.or(fallback_fn);
-        if let Some(f) = empty_target {
-            yul.push_str("      if iszero(calldatasize()) {\n");
-            invoke_bare(&mut yul, f, "          ");
-            yul.push_str("      }\n");
-        }
-
-        match fallback_fn {
-            Some(f) => {
-                yul.push_str("      if lt(calldatasize(), 4) {\n");
-                invoke_bare(&mut yul, f, "          ");
-                yul.push_str("      }\n");
-            }
-            None => yul.push_str("      if lt(calldatasize(), 4) { revert(0, 0) }\n"),
-        }
-
-        yul.push_str("      let selector := shr(224, calldataload(0))\n");
-
-        if !any_payable {
-            yul.push_str("      if callvalue() { revert(0, 0) }\n");
-        }
-
-        yul.push_str("      switch selector\n");
-
-        for f in &global_class.methods {
-            if true {
-                if !is_selector_entry(f) { continue; }
-                let selector = abi_gen.calculate_selector(f);
-                yul.push_str(&format!("      case {} /* {} */ {{\n", selector, f.name));
-
-                // A read-only function gets no guard, for two reasons that agree.
-                // It cannot be harmed by reentrancy, since it writes nothing. And the ABI calls it view, which invites callers to use eth_call: the guard's tstore would revert inside that STATICCALL, making the getter uncallable.
-                // A try thunk is entered only via a self-call from a site that
-                // already holds the reentrancy lock, so re-checking it here would
-                // make the self-call revert. Its capability guard is its gate.
-                let requires_guard = has_ext
-                    && mutability::makes_external_call(f, &ext)
-                    && !is_unsafe(f)
-                    && !mutability::is_read_only(f, &muts)
-                    && !is_try_thunk(f);
-                if requires_guard {
-                    yul.push_str(&format!("          if tload({}) {{ revert(0, 0) }}\n", reentrancy_lock_slot()));
-                    yul.push_str(&format!("          tstore({}, 1)\n", reentrancy_lock_slot()));
-                }
-
-                if any_payable && !is_payable(f) {
-                    yul.push_str("          if callvalue() { revert(0, 0) }\n");
-                }
-
-                let mut expected_cd: usize = 4;
-                for p in &f.parameters {
-                    if is_context_param(&p.type_def) {
-                        continue;
-                    }
-                    expected_cd += translator.abi_head_bytes(&p.type_def);
-                }
-                if expected_cd > 4 {
-                    yul.push_str(&format!("          if lt(calldatasize(), {}) {{ revert(0, 0) }}\n", expected_cd));
+                if head_bytes > 0 {
+                    yul.push_str("    // --- Constructor Arguments ---\n");
+                    yul.push_str(&format!(
+                        "    let _prog := datasize(\"{}\")\n",
+                        global_class_name
+                    ));
+                    yul.push_str("    let _args_len := sub(codesize(), _prog)\n");
+                    yul.push_str(&format!(
+                        "    if lt(_args_len, {}) {{ revert(0, 0) }}\n",
+                        head_bytes
+                    ));
+                    yul.push_str("    let args_mem := allocate_memory(_args_len)\n");
+                    yul.push_str("    codecopy(args_mem, _prog, _args_len)\n");
                 }
 
                 let mut arg_names = Vec::new();
-                let mut offset = 4;
-                for p in &f.parameters {
+                let mut offset = 0;
+                for p in &constructor.parameters {
                     let mut is_context = false;
                     let arg_name = format!("param_{}", p.name);
                     arg_names.push(arg_name.clone());
 
                     if let Type::Primitive(name) = &p.type_def {
                         if name == "Message" {
-                            yul.push_str(&format!("          let {} := allocate_memory(64)\n", arg_name));
-                            yul.push_str(&format!("          mstore({}, caller())\n", arg_name));
-                            yul.push_str(&format!("          mstore(add({}, 32), callvalue())\n", arg_name));
+                            yul.push_str(&format!("    let {} := allocate_memory(64)\n", arg_name));
+                            yul.push_str(&format!("    mstore({}, caller())\n", arg_name));
+                            yul.push_str(&format!(
+                                "    mstore(add({}, 32), callvalue())\n",
+                                arg_name
+                            ));
                             is_context = true;
                         } else if name == "Block" {
-                            yul.push_str(&format!("          let {} := allocate_memory(64)\n", arg_name));
-                            yul.push_str(&format!("          mstore({}, timestamp())\n", arg_name));
-                            yul.push_str(&format!("          mstore(add({}, 32), number())\n", arg_name));
+                            yul.push_str(&format!("    let {} := allocate_memory(64)\n", arg_name));
+                            yul.push_str(&format!("    mstore({}, timestamp())\n", arg_name));
+                            yul.push_str(&format!("    mstore(add({}, 32), number())\n", arg_name));
                             is_context = true;
                         }
                     }
 
                     if !is_context {
-                        if let Type::Primitive(name) = &p.type_def {
-                            if name == "String" || name == "Bytes" {
-                                yul.push_str(&format!("          let {}_head := calldataload({})\n", arg_name, offset));
-                                yul.push_str(&format!("          let {}_data_offset := add(4, {}_head)\n", arg_name, arg_name));
-                                yul.push_str(&format!("          let {}_len := calldataload({}_data_offset)\n", arg_name, arg_name));
-                                yul.push_str(&format!("          let {} := allocate_memory(add(32, {}_len))\n", arg_name, arg_name));
-                                yul.push_str(&format!("          mstore({}, shl(192, {}_len))\n", arg_name, arg_name));
-                                yul.push_str(&format!("          calldatacopy(add({}, 32), add({}_data_offset, 32), {}_len)\n", arg_name, arg_name, arg_name));
-                                offset += 32;
-                                continue;
-                            }
+                        if is_str_type(&p.type_def) {
+                            yul.push_str(&format!(
+                                "    let {}_head := mload(add(args_mem, {}))\n",
+                                arg_name, offset
+                            ));
+                            yul.push_str(&format!(
+                                "    if gt(add({}_head, 32), _args_len) {{ revert(0, 0) }}\n",
+                                arg_name
+                            ));
+                            yul.push_str(&format!(
+                                "    let {}_len := mload(add(args_mem, {}_head))\n",
+                                arg_name, arg_name
+                            ));
+                            yul.push_str(&format!("    if gt(add(add({}_head, 32), {}_len), _args_len) {{ revert(0, 0) }}\n", arg_name, arg_name));
+                            yul.push_str(&format!(
+                                "    let {} := allocate_memory(add(32, {}_len))\n",
+                                arg_name, arg_name
+                            ));
+                            yul.push_str(&format!(
+                                "    mstore({}, shl(192, {}_len))\n",
+                                arg_name, arg_name
+                            ));
+                            yul.push_str(&format!(
+                            "    gum_memory_copy(add(add(args_mem, {}_head), 32), add({}, 32), {}_len)\n",
+                            arg_name, arg_name, arg_name
+                        ));
+                            offset += 32;
+                            continue;
                         }
-
-                        // An enum is one uint8 word on the wire holding the tag, but a pointer to [tag][payload] in memory, so it is rebuilt rather than copied.
-                        // Copying size_of(enum) = 64 bytes instead read the next argument as the payload and then read every later one past the end of calldata as zero.
+                        // Same as the dispatcher: one wire word holding the tag, rebuilt into the [tag][payload] pair the body expects.
                         if is_enum_type(layout_engine.type_checker, &p.type_def) {
                             yul.push_str(&format!(
-                                "          let {} := and(calldataload({}), 0xff)\n",
+                                "    let {} := and(mload(add(args_mem, {})), 0xff)\n",
                                 arg_name, offset
                             ));
                             offset += 32;
                             continue;
                         }
-
-                        // A static struct is inline in the head, so it advances the cursor by its whole wire width rather than the one word an offset would take.
                         if let Type::Primitive(name) = &p.type_def {
                             if is_struct_type(layout_engine.type_checker, &p.type_def) {
-                                // A dynamic struct (a struct with a String/Bytes/array
-                                // field) sits behind an offset word like a dynamic
-                                // array, decoded at add(4, that offset).
+                                // A dynamic struct constructor arg sits behind an offset
+                                // word, like a dynamic array; a static one is inline.
                                 if translator.abi_is_dynamic(&p.type_def) {
-                                    if let Some(helper) = translator.ensure_abi_dyn_struct_cd(name) {
+                                    if let Some(helper) = translator.ensure_abi_dyn_struct_mem(name)
+                                    {
                                         yul.push_str(&format!(
-                                            "          let {} := {}(add(4, calldataload({})))\n",
-                                            arg_name, helper, offset
-                                        ));
+                                        "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
+                                        arg_name, helper, offset
+                                    ));
                                         offset += 32;
                                         continue;
                                     }
                                 }
-                                if let Some((helper, wire)) = translator.ensure_abi_struct_cd(name) {
-                                    yul.push_str(&format!("          let {} := {}({})\n", arg_name, helper, offset));
+                                if let Some((helper, wire)) = translator.ensure_abi_struct_mem(name)
+                                {
+                                    yul.push_str(&format!(
+                                        "    let {} := {}(args_mem, {}, _args_len)\n",
+                                        arg_name, helper, offset
+                                    ));
                                     offset += wire;
                                     continue;
                                 }
                             }
                         }
-
-                        // Every array shape resolves through one codec lookup, which recurses into its element, so a nested array decodes by the same path a flat one does.
-                        // A dynamic value sits behind an offset word and is decoded at add(4, that offset); a static one is inline and is decoded where the cursor already points.
+                        // The dispatcher's array path, reading the blob the creation code appended instead of calldata.
                         if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
-                            if let Some(helper) = translator.ensure_abi_cd(&p.type_def) {
+                            if let Some(helper) = translator.ensure_abi_mem(&p.type_def) {
                                 if translator.abi_is_dynamic(&p.type_def) {
                                     yul.push_str(&format!(
-                                        "          let {} := {}(add(4, calldataload({})))\n",
-                                        arg_name, helper, offset
-                                    ));
+                                    "    let {} := {}(args_mem, mload(add(args_mem, {})), _args_len)\n",
+                                    arg_name, helper, offset
+                                ));
                                     offset += 32;
                                 } else {
-                                    yul.push_str(&format!("          let {} := {}({})\n", arg_name, helper, offset));
+                                    yul.push_str(&format!(
+                                        "    let {} := {}(args_mem, {}, _args_len)\n",
+                                        arg_name, helper, offset
+                                    ));
                                     offset += translator.abi_head_bytes(&p.type_def);
                                 }
                                 continue;
                             }
                         }
-
                         let size = layout_engine.size_of(&p.type_def);
                         if size <= 32 {
-                            let loaded = format!("calldataload({})", offset);
+                            let loaded = format!("mload(add(args_mem, {}))", offset);
                             let mut masked = translator.mask_for_type(&loaded, &p.type_def);
                             if is_address_type(&p.type_def) {
-                                masked = format!("and({}, 0xffffffffffffffffffffffffffffffffffffffff)", masked);
+                                masked = format!(
+                                    "and({}, 0xffffffffffffffffffffffffffffffffffffffff)",
+                                    masked
+                                );
                             }
-                            yul.push_str(&format!("          let {} := {}\n", arg_name, masked));
+                            yul.push_str(&format!("    let {} := {}\n", arg_name, masked));
                             offset += 32;
                         } else {
-                            yul.push_str(&format!("          let {} := allocate_memory({})\n", arg_name, size));
-                            yul.push_str(&format!("          calldatacopy({}, {}, {})\n", arg_name, offset, size));
+                            yul.push_str(&format!(
+                                "    let {} := add(args_mem, {})\n",
+                                arg_name, offset
+                            ));
                             offset += size;
                         }
                     }
                 }
 
-                if arg_names.is_empty() {
-                    yul.push_str(&format!("          {}_impl()\n", f.name));
+                let imm_names: Vec<String> = layout_engine
+                    .patched_immutables(&global_class_name)
+                    .iter()
+                    .map(|f| immutable_deploy_local(f))
+                    .collect();
+                let binding = if imm_names.is_empty() {
+                    String::new()
                 } else {
-                    yul.push_str(&format!("          {}_impl({})\n", f.name, arg_names.join(", ")));
-                }
-
-                if requires_guard {
-                    yul.push_str(&format!("          tstore({}, 0)\n", reentrancy_lock_slot()));
-                }
-                yul.push_str("          return(0, 0)\n");
-
-                yul.push_str("      }\n");
+                    format!("let {} := ", imm_names.join(", "))
+                };
+                yul.push_str(&format!(
+                    "    {}{}_new({})\n",
+                    binding,
+                    global_class_name,
+                    arg_names.join(", ")
+                ));
             }
-        }
 
-        match fallback_fn {
-            Some(f) => {
-                yul.push_str("      default {\n");
-                invoke_bare(&mut yul, f, "          ");
-                yul.push_str("      }\n\n");
+            let runtime_obj = format!("{}_runtime", global_class_name);
+
+            yul.push_str("    // Copy runtime code to memory and return it\n");
+            yul.push_str(&format!(
+                "    datacopy(0, dataoffset(\"{r}\"), datasize(\"{r}\"))\n",
+                r = runtime_obj
+            ));
+            for f in layout_engine.patched_immutables(&global_class_name) {
+                yul.push_str(&format!(
+                    "    setimmutable(0, \"{}\", {})\n",
+                    immutable_key(&global_class_name, &f),
+                    immutable_deploy_local(&f)
+                ));
             }
-            None => yul.push_str("      default { revert(0, 0) }\n\n"),
-        }
+            yul.push_str(&format!(
+                "    return(0, datasize(\"{r}\"))\n",
+                r = runtime_obj
+            ));
 
-        yul.push_str("    }\n");
-        // End of runtime object
-        yul.push_str("  }\n");
-        
-        
-        let mut shared_functions = String::new();
+            // End of deployment block
+            yul.push_str("  }\n");
 
-        let entry_self = SelfCtx { class_name: global_class_name.clone(), is_global: true };
+            yul.push_str(&format!("  object \"{}\" {{\n", runtime_obj));
+            yul.push_str("    code {\n");
 
-        for f in &global_class.methods {
-            if f.name == "new" {
-                continue;
-            }
-            {
-                // Must agree with the dispatcher's guard decision above: this is the other half of the same lock, the clear on the return path.
-                // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its view invites.
-                // A try thunk never owns the lock: it runs inside a site that
-                // already holds it, so touching it here would double-manage it.
-                let requires_guard = has_ext
+            yul.push_str("      // --- Function Dispatcher ---\n");
+
+            let has_ext = type_checker.has_external_calls.get();
+            let muts = mutability::analyze_class(type_checker, global_class);
+            // Per-function refinement of has_ext: a state-changing entry point that never hands control away cannot be re-entered, so it needs no lock. Gated behind the contract-wide flag, so a guard is only ever dropped, never added.
+            let ext = mutability::analyze_external_calls(type_checker, global_class);
+
+            let find_fn = |pred: fn(&FnDecl) -> bool| -> Option<&FnDecl> {
+                global_class.methods.iter().find(|f| pred(f))
+            };
+            let receive_fn = find_fn(is_receive);
+            let fallback_fn = find_fn(is_fallback);
+
+            let any_payable = global_class
+                .methods
+                .iter()
+                .any(|f| is_exported(f) && is_payable(f));
+
+            let invoke_bare = |yul: &mut String, f: &FnDecl, indent: &str| {
+                let guarded = has_ext
                     && mutability::makes_external_call(f, &ext)
                     && !is_unsafe(f)
-                    && is_exported(f)
-                    && !mutability::is_read_only(f, &muts)
-                    && !is_try_thunk(f);
-                let lock_slot = if requires_guard { Some(reentrancy_lock_slot()) } else { None };
-
-                let entry_ctx = Ctx::entry(lock_slot)
-                    .with_self(Some(&entry_self))
-                    .with_return_type(f.return_type.clone());
-                for p in &f.parameters {
-                    entry_ctx.declare(&p.name, &p.type_def);
+                    && !mutability::is_read_only(f, &muts);
+                if guarded {
+                    yul.push_str(&format!(
+                        "{}if tload({}) {{ revert(0, 0) }}\n",
+                        indent,
+                        reentrancy_lock_slot()
+                    ));
+                    yul.push_str(&format!(
+                        "{}tstore({}, 1)\n",
+                        indent,
+                        reentrancy_lock_slot()
+                    ));
                 }
-
-                let param_names: Vec<String> = f.parameters.iter().map(|p| p.name.clone()).collect();
-                if param_names.is_empty() {
-                    shared_functions.push_str(&format!("      function {}_impl() {{\n", f.name));
-                } else {
-                    shared_functions.push_str(&format!("      function {}_impl({}) {{\n", f.name, param_names.join(", ")));
+                if any_payable && !is_payable(f) {
+                    yul.push_str(&format!("{}if callvalue() {{ revert(0, 0) }}\n", indent));
                 }
-
-                if f.modifiers.iter().any(|m| m == "once") {
-                    let slot = once_flag_slot(&f.name);
-                    shared_functions.push_str(&format!("          if sload({}) {{ revert(0, 0) }}\n", slot));
-                    shared_functions.push_str(&format!("          sstore({}, 1)\n", slot));
+                yul.push_str(&format!("{}{}_impl()\n", indent, f.name));
+                if guarded {
+                    yul.push_str(&format!(
+                        "{}tstore({}, 0)\n",
+                        indent,
+                        reentrancy_lock_slot()
+                    ));
                 }
+                yul.push_str(&format!("{}return(0, 0)\n", indent));
+            };
 
-                for stmt in &f.body {
-                    let stmt_code = translator.translate_statement(&stmt.node, &entry_ctx);
-                    for line in stmt_code.lines() {
-                        shared_functions.push_str(&format!("          {}\n", line));
+            let empty_target = receive_fn.or(fallback_fn);
+            if let Some(f) = empty_target {
+                yul.push_str("      if iszero(calldatasize()) {\n");
+                invoke_bare(&mut yul, f, "          ");
+                yul.push_str("      }\n");
+            }
+
+            match fallback_fn {
+                Some(f) => {
+                    yul.push_str("      if lt(calldatasize(), 4) {\n");
+                    invoke_bare(&mut yul, f, "          ");
+                    yul.push_str("      }\n");
+                }
+                None => yul.push_str("      if lt(calldatasize(), 4) { revert(0, 0) }\n"),
+            }
+
+            yul.push_str("      let selector := shr(224, calldataload(0))\n");
+
+            if !any_payable {
+                yul.push_str("      if callvalue() { revert(0, 0) }\n");
+            }
+
+            yul.push_str("      switch selector\n");
+
+            for f in &global_class.methods {
+                if true {
+                    if !is_selector_entry(f) {
+                        continue;
                     }
-                }
-                shared_functions.push_str("      }\n\n");
-            }
-        }
+                    let selector = abi_gen.calculate_selector(f);
+                    yul.push_str(&format!("      case {} /* {} */ {{\n", selector, f.name));
 
-        shared_functions.push_str("      function Message_sender() -> ret {\n          ret := caller()\n      }\n\n");
-        shared_functions.push_str("      function Message_value() -> ret {\n          ret := callvalue()\n      }\n\n");
-        shared_functions.push_str("      function Message_address() -> ret {\n          ret := address()\n      }\n\n");
-        shared_functions.push_str("      function Block_timestamp() -> ret {\n          ret := timestamp()\n      }\n\n");
-        shared_functions.push_str("      function Block_number() -> ret {\n          ret := number()\n      }\n\n");
+                    // A read-only function gets no guard, for two reasons that agree.
+                    // It cannot be harmed by reentrancy, since it writes nothing. And the ABI calls it view, which invites callers to use eth_call: the guard's tstore would revert inside that STATICCALL, making the getter uncallable.
+                    // A try thunk is entered only via a self-call from a site that
+                    // already holds the reentrancy lock, so re-checking it here would
+                    // make the self-call revert. Its capability guard is its gate.
+                    let requires_guard = has_ext
+                        && mutability::makes_external_call(f, &ext)
+                        && !is_unsafe(f)
+                        && !mutability::is_read_only(f, &muts)
+                        && !is_try_thunk(f);
+                    if requires_guard {
+                        yul.push_str(&format!(
+                            "          if tload({}) {{ revert(0, 0) }}\n",
+                            reentrancy_lock_slot()
+                        ));
+                        yul.push_str(&format!(
+                            "          tstore({}, 1)\n",
+                            reentrancy_lock_slot()
+                        ));
+                    }
 
-        let instantiations = collect_generic_instantiations(program, type_checker);
-        // Walk class_order, the order classes were registered in, rather than loaded_classes directly.
-        // loaded_classes is a HashMap and Rust randomizes its iteration per process, so iterating it here emitted these functions in a different order on every run: same source, different (equivalent) bytecode, and no way to verify a deployed contract against its source.
-        // layout.rs already walks class_order for the same reason; this is the other half of it.
-        let ordered: Vec<(&String, &ClassDecl)> = type_checker
-            .class_order
-            .iter()
-            .filter_map(|n| type_checker.loaded_classes.get(n).map(|c| (n, c)))
-            .collect();
-        for (class_name, class_decl) in ordered {
-            if type_checker.loaded_interfaces.contains(class_name) || class_name == "Message" || class_name == "Block" {
-                continue;
-            }
-            if class_decl.is_global && class_name != &global_class_name {
-                continue;
-            }
+                    if any_payable && !is_payable(f) {
+                        yul.push_str("          if callvalue() { revert(0, 0) }\n");
+                    }
 
-            if class_decl.generic_params.is_empty() {
-                compile_class_methods(&mut shared_functions, &translator, class_name, "", class_decl.is_global, &class_decl.methods);
-            } else if let Some(insts) = instantiations.get(class_name) {
-                for args in insts {
-                    let mut subst = HashMap::new();
-                    for (i, gp) in class_decl.generic_params.iter().enumerate() {
-                        if let Some(a) = args.get(i) {
-                            subst.insert(gp.name.clone(), a.clone());
+                    let mut expected_cd: usize = 4;
+                    for p in &f.parameters {
+                        if is_context_param(&p.type_def) {
+                            continue;
+                        }
+                        expected_cd += translator.abi_head_bytes(&p.type_def);
+                    }
+                    if expected_cd > 4 {
+                        yul.push_str(&format!(
+                            "          if lt(calldatasize(), {}) {{ revert(0, 0) }}\n",
+                            expected_cd
+                        ));
+                    }
+
+                    let mut arg_names = Vec::new();
+                    let mut offset = 4;
+                    for p in &f.parameters {
+                        let mut is_context = false;
+                        let arg_name = format!("param_{}", p.name);
+                        arg_names.push(arg_name.clone());
+
+                        if let Type::Primitive(name) = &p.type_def {
+                            if name == "Message" {
+                                yul.push_str(&format!(
+                                    "          let {} := allocate_memory(64)\n",
+                                    arg_name
+                                ));
+                                yul.push_str(&format!(
+                                    "          mstore({}, caller())\n",
+                                    arg_name
+                                ));
+                                yul.push_str(&format!(
+                                    "          mstore(add({}, 32), callvalue())\n",
+                                    arg_name
+                                ));
+                                is_context = true;
+                            } else if name == "Block" {
+                                yul.push_str(&format!(
+                                    "          let {} := allocate_memory(64)\n",
+                                    arg_name
+                                ));
+                                yul.push_str(&format!(
+                                    "          mstore({}, timestamp())\n",
+                                    arg_name
+                                ));
+                                yul.push_str(&format!(
+                                    "          mstore(add({}, 32), number())\n",
+                                    arg_name
+                                ));
+                                is_context = true;
+                            }
+                        }
+
+                        if !is_context {
+                            if let Type::Primitive(name) = &p.type_def {
+                                if name == "String" || name == "Bytes" {
+                                    yul.push_str(&format!(
+                                        "          let {}_head := calldataload({})\n",
+                                        arg_name, offset
+                                    ));
+                                    yul.push_str(&format!(
+                                        "          let {}_data_offset := add(4, {}_head)\n",
+                                        arg_name, arg_name
+                                    ));
+                                    yul.push_str(&format!(
+                                        "          let {}_len := calldataload({}_data_offset)\n",
+                                        arg_name, arg_name
+                                    ));
+                                    yul.push_str(&format!(
+                                        "          let {} := allocate_memory(add(32, {}_len))\n",
+                                        arg_name, arg_name
+                                    ));
+                                    yul.push_str(&format!(
+                                        "          mstore({}, shl(192, {}_len))\n",
+                                        arg_name, arg_name
+                                    ));
+                                    yul.push_str(&format!("          calldatacopy(add({}, 32), add({}_data_offset, 32), {}_len)\n", arg_name, arg_name, arg_name));
+                                    offset += 32;
+                                    continue;
+                                }
+                            }
+
+                            // An enum is one uint8 word on the wire holding the tag, but a pointer to [tag][payload] in memory, so it is rebuilt rather than copied.
+                            // Copying size_of(enum) = 64 bytes instead read the next argument as the payload and then read every later one past the end of calldata as zero.
+                            if is_enum_type(layout_engine.type_checker, &p.type_def) {
+                                yul.push_str(&format!(
+                                    "          let {} := and(calldataload({}), 0xff)\n",
+                                    arg_name, offset
+                                ));
+                                offset += 32;
+                                continue;
+                            }
+
+                            // A static struct is inline in the head, so it advances the cursor by its whole wire width rather than the one word an offset would take.
+                            if let Type::Primitive(name) = &p.type_def {
+                                if is_struct_type(layout_engine.type_checker, &p.type_def) {
+                                    // A dynamic struct (a struct with a String/Bytes/array
+                                    // field) sits behind an offset word like a dynamic
+                                    // array, decoded at add(4, that offset).
+                                    if translator.abi_is_dynamic(&p.type_def) {
+                                        if let Some(helper) =
+                                            translator.ensure_abi_dyn_struct_cd(name)
+                                        {
+                                            yul.push_str(&format!(
+                                            "          let {} := {}(add(4, calldataload({})))\n",
+                                            arg_name, helper, offset
+                                        ));
+                                            offset += 32;
+                                            continue;
+                                        }
+                                    }
+                                    if let Some((helper, wire)) =
+                                        translator.ensure_abi_struct_cd(name)
+                                    {
+                                        yul.push_str(&format!(
+                                            "          let {} := {}({})\n",
+                                            arg_name, helper, offset
+                                        ));
+                                        offset += wire;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // Every array shape resolves through one codec lookup, which recurses into its element, so a nested array decodes by the same path a flat one does.
+                            // A dynamic value sits behind an offset word and is decoded at add(4, that offset); a static one is inline and is decoded where the cursor already points.
+                            if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
+                                if let Some(helper) = translator.ensure_abi_cd(&p.type_def) {
+                                    if translator.abi_is_dynamic(&p.type_def) {
+                                        yul.push_str(&format!(
+                                            "          let {} := {}(add(4, calldataload({})))\n",
+                                            arg_name, helper, offset
+                                        ));
+                                        offset += 32;
+                                    } else {
+                                        yul.push_str(&format!(
+                                            "          let {} := {}({})\n",
+                                            arg_name, helper, offset
+                                        ));
+                                        offset += translator.abi_head_bytes(&p.type_def);
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            let size = layout_engine.size_of(&p.type_def);
+                            if size <= 32 {
+                                let loaded = format!("calldataload({})", offset);
+                                let mut masked = translator.mask_for_type(&loaded, &p.type_def);
+                                if is_address_type(&p.type_def) {
+                                    masked = format!(
+                                        "and({}, 0xffffffffffffffffffffffffffffffffffffffff)",
+                                        masked
+                                    );
+                                }
+                                yul.push_str(&format!(
+                                    "          let {} := {}\n",
+                                    arg_name, masked
+                                ));
+                                offset += 32;
+                            } else {
+                                yul.push_str(&format!(
+                                    "          let {} := allocate_memory({})\n",
+                                    arg_name, size
+                                ));
+                                yul.push_str(&format!(
+                                    "          calldatacopy({}, {}, {})\n",
+                                    arg_name, offset, size
+                                ));
+                                offset += size;
+                            }
                         }
                     }
-                    let specialized: Vec<FnDecl> = class_decl.methods.iter().map(|m| substitute_method(m, &subst)).collect();
-                    let suffix = generic_suffix(args);
-                    compile_class_methods(&mut shared_functions, &translator, class_name, &suffix, class_decl.is_global, &specialized);
+
+                    if arg_names.is_empty() {
+                        yul.push_str(&format!("          {}_impl()\n", f.name));
+                    } else {
+                        yul.push_str(&format!(
+                            "          {}_impl({})\n",
+                            f.name,
+                            arg_names.join(", ")
+                        ));
+                    }
+
+                    if requires_guard {
+                        yul.push_str(&format!(
+                            "          tstore({}, 0)\n",
+                            reentrancy_lock_slot()
+                        ));
+                    }
+                    yul.push_str("          return(0, 0)\n");
+
+                    yul.push_str("      }\n");
                 }
             }
 
-            if class_decl.parents.iter().any(|p| p == "Serializable") {
-                let total_size = layout_engine.size_of(&Type::Primitive(class_name.clone()));
-                translator.require_bytes_copy();
-                shared_functions.push_str(&format!("      function {}_serialize(self) -> ptr {{\n", class_name));
-                shared_functions.push_str(&format!("          ptr := allocate_memory({})\n", 32 + total_size));
-                shared_functions.push_str(&format!("          mstore(ptr, {})\n", total_size));
-                shared_functions.push_str(&format!("          bytes_copy(add(ptr, 32), self, {})\n", total_size));
-                shared_functions.push_str("      }\n\n");
+            match fallback_fn {
+                Some(f) => {
+                    yul.push_str("      default {\n");
+                    invoke_bare(&mut yul, f, "          ");
+                    yul.push_str("      }\n\n");
+                }
+                None => yul.push_str("      default { revert(0, 0) }\n\n"),
             }
-        }
 
-        for thunk in translator.drain_helper_thunks() {
-            for line in thunk.lines() {
-                shared_functions.push_str(&format!("      {}\n", line));
+            yul.push_str("    }\n");
+            // End of runtime object
+            yul.push_str("  }\n");
+
+            let mut shared_functions = String::new();
+
+            let entry_self = SelfCtx {
+                class_name: global_class_name.clone(),
+                is_global: true,
+            };
+
+            for f in &global_class.methods {
+                if f.name == "new" {
+                    continue;
+                }
+                {
+                    // Must agree with the dispatcher's guard decision above: this is the other half of the same lock, the clear on the return path.
+                    // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its view invites.
+                    // A try thunk never owns the lock: it runs inside a site that
+                    // already holds it, so touching it here would double-manage it.
+                    let requires_guard = has_ext
+                        && mutability::makes_external_call(f, &ext)
+                        && !is_unsafe(f)
+                        && is_exported(f)
+                        && !mutability::is_read_only(f, &muts)
+                        && !is_try_thunk(f);
+                    let lock_slot = if requires_guard {
+                        Some(reentrancy_lock_slot())
+                    } else {
+                        None
+                    };
+
+                    let entry_ctx = Ctx::entry(lock_slot)
+                        .with_self(Some(&entry_self))
+                        .with_return_type(f.return_type.clone());
+                    for p in &f.parameters {
+                        entry_ctx.declare(&p.name, &p.type_def);
+                    }
+
+                    let param_names: Vec<String> =
+                        f.parameters.iter().map(|p| p.name.clone()).collect();
+                    if param_names.is_empty() {
+                        shared_functions
+                            .push_str(&format!("      function {}_impl() {{\n", f.name));
+                    } else {
+                        shared_functions.push_str(&format!(
+                            "      function {}_impl({}) {{\n",
+                            f.name,
+                            param_names.join(", ")
+                        ));
+                    }
+
+                    if f.modifiers.iter().any(|m| m == "once") {
+                        let slot = once_flag_slot(&f.name);
+                        shared_functions.push_str(&format!(
+                            "          if sload({}) {{ revert(0, 0) }}\n",
+                            slot
+                        ));
+                        shared_functions.push_str(&format!("          sstore({}, 1)\n", slot));
+                    }
+
+                    for stmt in &f.body {
+                        let stmt_code = translator.translate_statement(&stmt.node, &entry_ctx);
+                        for line in stmt_code.lines() {
+                            shared_functions.push_str(&format!("          {}\n", line));
+                        }
+                    }
+                    shared_functions.push_str("      }\n\n");
+                }
             }
-        }
 
-        shared_functions.push_str("      function allocate_memory(size) -> ptr {\n");
-        shared_functions.push_str("          ptr := mload(0x40)\n");
-        shared_functions.push_str("          if iszero(ptr) { ptr := 0x80 }\n");
-        shared_functions.push_str("          mstore(0x40, add(ptr, size))\n");
-        shared_functions.push_str("      }\n\n");
-        shared_functions.push_str("      function gum_hash_slot(key, slot) -> hash_ptr {\n");
-        shared_functions.push_str("          mstore(0x00, key)\n");
-        shared_functions.push_str("          mstore(0x20, slot)\n");
-        shared_functions.push_str("          hash_ptr := keccak256(0x00, 0x40)\n");
-        shared_functions.push_str("      }\n\n");
-        shared_functions.push_str("      function gum_memory_copy(src, dst, size) {\n");
-        shared_functions.push_str("          mcopy(dst, src, size)\n");
-        shared_functions.push_str("      }\n");
-        
-        let end_of_deployment = yul.find("    // Copy runtime code").unwrap();
-        let mut ultra_final_yul = yul[..end_of_deployment].to_string();
-        ultra_final_yul.push_str(&shared_functions);
-        
-        let runtime_part = &yul[end_of_deployment..];
-        let stripped_runtime = runtime_part.strip_suffix("    }\n  }\n").unwrap();
-        
-        let runtime_marker = format!("  object \"{}\" {{\n", runtime_obj);
-        match stripped_runtime.find(&runtime_marker) {
-            Some(i) => {
-                ultra_final_yul.push_str(&stripped_runtime[..i]);
-                ultra_final_yul.push_str(&nested_objects);
-                ultra_final_yul.push_str(&stripped_runtime[i..]);
+            shared_functions.push_str(
+                "      function Message_sender() -> ret {\n          ret := caller()\n      }\n\n",
+            );
+            shared_functions.push_str("      function Message_value() -> ret {\n          ret := callvalue()\n      }\n\n");
+            shared_functions.push_str("      function Message_address() -> ret {\n          ret := address()\n      }\n\n");
+            shared_functions.push_str("      function Block_timestamp() -> ret {\n          ret := timestamp()\n      }\n\n");
+            shared_functions.push_str(
+                "      function Block_number() -> ret {\n          ret := number()\n      }\n\n",
+            );
+
+            let instantiations = collect_generic_instantiations(program, type_checker);
+            // Walk class_order, the order classes were registered in, rather than loaded_classes directly.
+            // loaded_classes is a HashMap and Rust randomizes its iteration per process, so iterating it here emitted these functions in a different order on every run: same source, different (equivalent) bytecode, and no way to verify a deployed contract against its source.
+            // layout.rs already walks class_order for the same reason; this is the other half of it.
+            let ordered: Vec<(&String, &ClassDecl)> = type_checker
+                .class_order
+                .iter()
+                .filter_map(|n| type_checker.loaded_classes.get(n).map(|c| (n, c)))
+                .collect();
+            for (class_name, class_decl) in ordered {
+                if type_checker.loaded_interfaces.contains(class_name)
+                    || class_name == "Message"
+                    || class_name == "Block"
+                {
+                    continue;
+                }
+                if class_decl.is_global && class_name != &global_class_name {
+                    continue;
+                }
+
+                if class_decl.generic_params.is_empty() {
+                    compile_class_methods(
+                        &mut shared_functions,
+                        &translator,
+                        class_name,
+                        "",
+                        class_decl.is_global,
+                        &class_decl.methods,
+                    );
+                } else if let Some(insts) = instantiations.get(class_name) {
+                    for args in insts {
+                        let mut subst = HashMap::new();
+                        for (i, gp) in class_decl.generic_params.iter().enumerate() {
+                            if let Some(a) = args.get(i) {
+                                subst.insert(gp.name.clone(), a.clone());
+                            }
+                        }
+                        let specialized: Vec<FnDecl> = class_decl
+                            .methods
+                            .iter()
+                            .map(|m| substitute_method(m, &subst))
+                            .collect();
+                        let suffix = generic_suffix(args);
+                        compile_class_methods(
+                            &mut shared_functions,
+                            &translator,
+                            class_name,
+                            &suffix,
+                            class_decl.is_global,
+                            &specialized,
+                        );
+                    }
+                }
+
+                if class_decl.parents.iter().any(|p| p == "Serializable") {
+                    let total_size = layout_engine.size_of(&Type::Primitive(class_name.clone()));
+                    translator.require_bytes_copy();
+                    shared_functions.push_str(&format!(
+                        "      function {}_serialize(self) -> ptr {{\n",
+                        class_name
+                    ));
+                    shared_functions.push_str(&format!(
+                        "          ptr := allocate_memory({})\n",
+                        32 + total_size
+                    ));
+                    shared_functions.push_str(&format!("          mstore(ptr, {})\n", total_size));
+                    shared_functions.push_str(&format!(
+                        "          bytes_copy(add(ptr, 32), self, {})\n",
+                        total_size
+                    ));
+                    shared_functions.push_str("      }\n\n");
+                }
             }
-            None => ultra_final_yul.push_str(stripped_runtime),
-        }
-        ultra_final_yul.push_str(&shared_functions);
-        ultra_final_yul.push_str("    }\n");
-        ultra_final_yul.push_str(&nested_objects);
-        ultra_final_yul.push_str("  }\n}\n");
 
-        let errors = translator.take_errors();
-        if !errors.is_empty() {
-            return Err(errors.join("\n"));
-        }
+            for thunk in translator.drain_helper_thunks() {
+                for line in thunk.lines() {
+                    shared_functions.push_str(&format!("      {}\n", line));
+                }
+            }
 
-        let mut abi_entries = abi_gen.generate_abi(program, global_class);
-        for (name, schema) in translator.recorded_events() {
-            abi_entries.push(AbiGenerator::event_entry(&name, schema.inputs));
-        }
-        let abi_json = serde_json::to_string_pretty(&abi_entries).unwrap();
+            shared_functions.push_str("      function allocate_memory(size) -> ptr {\n");
+            shared_functions.push_str("          ptr := mload(0x40)\n");
+            shared_functions.push_str("          if iszero(ptr) { ptr := 0x80 }\n");
+            shared_functions.push_str("          mstore(0x40, add(ptr, size))\n");
+            shared_functions.push_str("      }\n\n");
+            shared_functions.push_str("      function gum_hash_slot(key, slot) -> hash_ptr {\n");
+            shared_functions.push_str("          mstore(0x00, key)\n");
+            shared_functions.push_str("          mstore(0x20, slot)\n");
+            shared_functions.push_str("          hash_ptr := keccak256(0x00, 0x40)\n");
+            shared_functions.push_str("      }\n\n");
+            shared_functions.push_str("      function gum_memory_copy(src, dst, size) {\n");
+            shared_functions.push_str("          mcopy(dst, src, size)\n");
+            shared_functions.push_str("      }\n");
 
-        stack.pop();
-        Ok((ultra_final_yul, abi_json))
+            let end_of_deployment = yul.find("    // Copy runtime code").unwrap();
+            let mut ultra_final_yul = yul[..end_of_deployment].to_string();
+            ultra_final_yul.push_str(&shared_functions);
+
+            let runtime_part = &yul[end_of_deployment..];
+            let stripped_runtime = runtime_part.strip_suffix("    }\n  }\n").unwrap();
+
+            let runtime_marker = format!("  object \"{}\" {{\n", runtime_obj);
+            match stripped_runtime.find(&runtime_marker) {
+                Some(i) => {
+                    ultra_final_yul.push_str(&stripped_runtime[..i]);
+                    ultra_final_yul.push_str(&nested_objects);
+                    ultra_final_yul.push_str(&stripped_runtime[i..]);
+                }
+                None => ultra_final_yul.push_str(stripped_runtime),
+            }
+            ultra_final_yul.push_str(&shared_functions);
+            ultra_final_yul.push_str("    }\n");
+            ultra_final_yul.push_str(&nested_objects);
+            ultra_final_yul.push_str("  }\n}\n");
+
+            let errors = translator.take_errors();
+            if !errors.is_empty() {
+                return Err(errors.join("\n"));
+            }
+
+            let mut abi_entries = abi_gen.generate_abi(program, global_class);
+            for (name, schema) in translator.recorded_events() {
+                abi_entries.push(AbiGenerator::event_entry(&name, schema.inputs));
+            }
+            let abi_json = serde_json::to_string_pretty(&abi_entries).unwrap();
+
+            stack.pop();
+            Ok((ultra_final_yul, abi_json))
         }
     }
 }

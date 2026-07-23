@@ -1,0 +1,21 @@
+contract C:
+    u256 a
+
+    export fn seta(u256 v):
+        C.a = v
+    export fn a_lit() -> u256:
+        return C.a * 2
+    export fn a_var(u256 b) -> u256:
+        return C.a * b
+    export fn u8_lit_r(u8 v) -> u8:
+        return v * 2
+    export fn u8_lit_l(u8 v) -> u8:
+        return 2 * v
+    export fn u8_var(u8 v, u8 w) -> u8:
+        return v * w
+    export fn i8_lit_r(i8 v) -> i8:
+        return v * 2
+    export fn i8_lit_l(i8 v) -> i8:
+        return 2 * v
+    export fn i8_var(i8 v, i8 w) -> i8:
+        return v * w
