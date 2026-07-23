@@ -1286,8 +1286,24 @@ impl EvmYulBackend {
                         // Same as the dispatcher: one wire word holding the tag, rebuilt into the [tag][payload] pair the body expects.
                         if is_enum_type(layout_engine.type_checker, &p.type_def) {
                             yul.push_str(&format!(
-                                "    let {} := and(mload(add(args_mem, {})), 0xff)\n",
+                                "    let {}_raw := mload(add(args_mem, {}))\n",
                                 arg_name, offset
+                            ));
+                            // Reject an out-of-range tag, matching Solidity's enum bounds check.
+                            if let Type::Primitive(enum_name) = &p.type_def {
+                                if let Some(ed) =
+                                    layout_engine.type_checker.loaded_enums.get(enum_name)
+                                {
+                                    yul.push_str(&format!(
+                                        "    if iszero(lt({}_raw, {})) {{ revert(0, 0) }}\n",
+                                        arg_name,
+                                        ed.variants.len()
+                                    ));
+                                }
+                            }
+                            yul.push_str(&format!(
+                                "    let {} := and({}_raw, 0xff)\n",
+                                arg_name, arg_name
                             ));
                             offset += 32;
                             continue;
@@ -1594,8 +1610,25 @@ impl EvmYulBackend {
                             // Copying size_of(enum) = 64 bytes instead read the next argument as the payload and then read every later one past the end of calldata as zero.
                             if is_enum_type(layout_engine.type_checker, &p.type_def) {
                                 yul.push_str(&format!(
-                                    "          let {} := and(calldataload({}), 0xff)\n",
+                                    "          let {}_raw := calldataload({})\n",
                                     arg_name, offset
+                                ));
+                                // Reject an out-of-range tag on the full word, matching Solidity's
+                                // enum bounds check, so no invalid variant can enter from calldata.
+                                if let Type::Primitive(enum_name) = &p.type_def {
+                                    if let Some(ed) =
+                                        layout_engine.type_checker.loaded_enums.get(enum_name)
+                                    {
+                                        yul.push_str(&format!(
+                                            "          if iszero(lt({}_raw, {})) {{ revert(0, 0) }}\n",
+                                            arg_name,
+                                            ed.variants.len()
+                                        ));
+                                    }
+                                }
+                                yul.push_str(&format!(
+                                    "          let {} := and({}_raw, 0xff)\n",
+                                    arg_name, arg_name
                                 ));
                                 offset += 32;
                                 continue;

@@ -1,0 +1,33 @@
+use gum.defaults.Account
+use gum.defaults.Message
+
+interface ISink:
+    fn hit() -> u256
+
+interface IG:
+    fn run(Account s) -> u256
+
+contract G:
+    u256 total
+
+    export fn run(Account s) -> u256:
+        G.total = G.total + 1
+        return ISink(s).hit()
+
+    export fn run_try(Account s) -> u256:
+        G.total = G.total + 1
+        try:
+            return ISink(s).hit()
+        catch:
+            return 42
+
+    export fn get_total() -> u256:
+        return G.total
+
+contract BenignSink:
+    export fn hit() -> u256:
+        return 7
+
+contract ReSink:
+    export fn hit() -> u256:
+        return IG(Message.sender()).run(Message.address())

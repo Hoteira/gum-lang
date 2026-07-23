@@ -2126,10 +2126,15 @@ fn a_payload_enum_has_no_storage_layout() {
 
 #[test]
 fn an_enum_param_decodes_from_one_word() {
-    // A payload-free enum is a plain u8 tag: one word in, masked, and used as a value throughout. No pointer, no allocation.
+    // A payload-free enum is a plain u8 tag: one word in, bounds-checked against the
+    // variant count (like Solidity), masked, and used as a value throughout. No
+    // pointer, no allocation.
     // It used to copy size_of(enum) = 64 bytes, which ate the next argument as a phantom payload and left every later one reading past calldata as zero.
     let src = "enum S:\n    A\n    B\n\ncontract C:\n    export fn f(S s, u256 x) -> u256:\n        return x\n";
-    assert_output_contains(src, "let param_s := and(calldataload(4), 0xff)");
+    assert_output_contains(src, "let param_s_raw := calldataload(4)");
+    // Two variants, so any tag >= 2 reverts before it can enter the contract.
+    assert_output_contains(src, "if iszero(lt(param_s_raw, 2)) { revert(0, 0) }");
+    assert_output_contains(src, "let param_s := and(param_s_raw, 0xff)");
     assert_output_contains(src, "let param_x := calldataload(36)");
 }
 

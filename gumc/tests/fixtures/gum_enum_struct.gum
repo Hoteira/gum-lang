@@ -1,0 +1,22 @@
+enum E:
+    A
+    B
+    C
+
+class S:
+    u256 x
+    E tag
+
+contract C:
+    export fn get_x(S s) -> u256:
+        return s.x
+
+    export fn get_tag(S s) -> u256:
+        match s.tag:
+            A:
+                return 10
+            B:
+                return 20
+            C:
+                return 30
+        return 99

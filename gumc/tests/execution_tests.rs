@@ -201,6 +201,24 @@ fn deploy(db: &mut Db, creation: Vec<u8>) -> Address {
     deploy_with_gas(db, creation).0
 }
 
+// Deploys, returning None if the creation transaction reverts (e.g. a constructor
+// argument check fails) rather than panicking.
+fn try_deploy(db: &mut Db, creation: Vec<u8>) -> Option<Address> {
+    let mut evm = evm_for!(db);
+    let tx = TxEnv::builder()
+        .caller(deployer())
+        .kind(TxKind::Create)
+        .data(creation.into())
+        .value(U256::ZERO)
+        .gas_limit(TX_GAS_LIMIT)
+        .build()
+        .expect("bad deploy tx");
+    match evm.transact_commit(tx).expect("deploy tx failed") {
+        ExecutionResult::Success { output: Output::Create(_, Some(addr)), .. } => Some(addr),
+        _ => None,
+    }
+}
+
 // Deploys and also returns the gas the deployment transaction consumed.
 fn deploy_with_gas(db: &mut Db, creation: Vec<u8>) -> (Address, u64) {
     let mut evm = evm_for!(db);
@@ -5149,6 +5167,373 @@ fn fuzz_dynamic_abi_roundtrip_matches_solidity() {
     }
 }
 
+// Random match-on-enum dispatch diffed against Solidity. A C-like gum enum is a
+// uint8 on the wire, so a Solidity twin using an if-else chain over the same enum
+// is an exact reference. This fuzzes a scalar match (tag) and a match inside a
+// for-each over an enum array (fold), so any wrong arm selection, fallthrough, or
+// per-variant value shows up as a divergence. Enum values stay in range, isolating
+// the match logic from any argument bounds-checking difference.
+#[test]
+fn fuzz_enum_match_matches_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping fuzz: no solc");
+            return;
+        }
+    };
+
+    for prog in 0..40u64 {
+        let mut rng = Rng(0x5a7c_0000 ^ prog);
+        let nvar = 3 + (rng.next_u64() % 3) as usize; // 3..=5 variants
+        let consts: Vec<u64> = (0..nvar).map(|_| rng.next_u64() % 1000).collect();
+
+        let mut gum = String::from("enum E:\n");
+        for i in 0..nvar {
+            gum.push_str(&format!("    V{}\n", i));
+        }
+        gum.push_str("\ncontract C:\n    export fn tag(E s) -> u256:\n        match s:\n");
+        for i in 0..nvar {
+            gum.push_str(&format!("            V{}:\n                return {}\n", i, consts[i]));
+        }
+        gum.push_str("        return 0\n\n    export fn fold([E] xs) -> u256:\n        mut u256 acc = 0\n        for x in xs:\n            match x:\n");
+        for i in 0..nvar {
+            gum.push_str(&format!("                V{}:\n                    acc = acc + {}\n", i, consts[i]));
+        }
+        gum.push_str("        return acc\n");
+
+        let mut sol = String::from("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract C {\n    enum E { ");
+        sol.push_str(&(0..nvar).map(|i| format!("V{}", i)).collect::<Vec<_>>().join(", "));
+        sol.push_str(" }\n    function tag(E s) external pure returns (uint256) {\n");
+        for i in 0..nvar {
+            sol.push_str(&format!("        if (s == E.V{}) return {};\n", i, consts[i]));
+        }
+        sol.push_str("        return 0;\n    }\n    function fold(E[] calldata xs) external pure returns (uint256) {\n        uint256 acc = 0;\n        for (uint256 i = 0; i < xs.length; i++) {\n");
+        for i in 0..nvar {
+            sol.push_str(&format!("            if (xs[i] == E.V{}) acc += {};\n", i, consts[i]));
+        }
+        sol.push_str("        }\n        return acc;\n    }\n}\n");
+
+        let mut gdb: Db = CacheDB::new(EmptyDB::default());
+        let mut sdb: Db = CacheDB::new(EmptyDB::default());
+        let ga = deploy(&mut gdb, gum_creation_bytecode(&gum, &solc, false));
+        let sa = deploy(&mut sdb, sol_creation_bytecode(&sol, &solc));
+
+        // Scalar match across every variant, plus out-of-range tags that both
+        // compilers must reject (Solidity's enum bounds check, gum's new one).
+        for v in 0..(nvar as u64 + 4) {
+            let mut w = [0u8; 32];
+            w[31] = v as u8;
+            let data = encode_words("tag(uint8)", &[w]);
+            let g = call(&mut gdb, ga, data.clone());
+            let s = call(&mut sdb, sa, data);
+            assert_eq!(g.success, s.success, "prog {}: tag({}) success\ngum:\n{}", prog, v, gum);
+            assert_eq!(g.output, s.output, "prog {}: tag({}) value\ngum:\n{}", prog, v, gum);
+        }
+
+        // Match inside a loop over a random enum array, occasionally with an
+        // out-of-range element that both compilers must reject on decode.
+        for _ in 0..12 {
+            let n = (rng.next_u64() % 8) as usize;
+            let span = if rng.next_u64() % 3 == 0 { nvar as u64 + 3 } else { nvar as u64 };
+            let elems: Vec<u8> = (0..n).map(|_| (rng.next_u64() % span) as u8).collect();
+            let mut data = selector("fold(uint8[])").to_vec();
+            data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+            data.extend_from_slice(&U256::from(n).to_be_bytes::<32>());
+            for e in &elems {
+                let mut w = [0u8; 32];
+                w[31] = *e;
+                data.extend_from_slice(&w);
+            }
+            let g = call(&mut gdb, ga, data.clone());
+            let s = call(&mut sdb, sa, data);
+            assert_eq!(g.success, s.success, "prog {}: fold success ({:?})\ngum:\n{}", prog, elems, gum);
+            assert_eq!(g.output, s.output, "prog {}: fold value ({:?})\ngum:\n{}", prog, elems, gum);
+        }
+    }
+}
+
+// An enum field inside a struct must cross the ABI as a standard 32-byte word,
+// byte-identical to Solidity, and its tag must be bounds-checked on decode. Before
+// this fix a struct with an enum field fell back to a raw packed copy that was
+// wire-incompatible with Solidity and never validated the tag.
+#[test]
+fn enum_field_in_struct_matches_solidity_and_is_bounds_checked() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let gum = include_str!("fixtures/gum_enum_struct.gum");
+    let sol = include_str!("fixtures/sol_enum_struct.sol");
+    let mut gdb: Db = CacheDB::new(EmptyDB::default());
+    let mut sdb: Db = CacheDB::new(EmptyDB::default());
+    let ga = deploy(&mut gdb, gum_creation_bytecode(gum, &solc, false));
+    let sa = deploy(&mut sdb, sol_creation_bytecode(sol, &solc));
+
+    let encode = |sig: &str, x: u64, tag: u8| -> Vec<u8> {
+        let mut d = selector(sig).to_vec();
+        d.extend_from_slice(&U256::from(x).to_be_bytes::<32>());
+        let mut tw = [0u8; 32];
+        tw[31] = tag;
+        d.extend_from_slice(&tw);
+        d
+    };
+
+    // In-range tags: gum and Solidity agree byte-for-byte on both functions,
+    // proving the enum field crosses the ABI as a standard word.
+    for (x, tag) in [(0u64, 0u8), (7, 1), (99, 2)] {
+        for sig in ["get_x((uint256,uint8))", "get_tag((uint256,uint8))"] {
+            let g = call(&mut gdb, ga, encode(sig, x, tag));
+            let s = call(&mut sdb, sa, encode(sig, x, tag));
+            assert!(g.success && s.success, "{} should succeed (x={} tag={})", sig, x, tag);
+            assert_eq!(g.output, s.output, "{} output (x={} tag={})", sig, x, tag);
+        }
+    }
+
+    // Out-of-range tags (>= 3): get_tag reads the tag, so Solidity validates it on
+    // access and both revert. get_x never reads the tag, so Solidity accepts it
+    // lazily; gum decodes the struct eagerly and rejects it up front. gum is
+    // strictly safer here (it never accepts an invalid variant), so we assert gum
+    // reverts rather than requiring it to match Solidity's lazy pass.
+    for tag in [3u8, 200, 255] {
+        let g = call(&mut gdb, ga, encode("get_tag((uint256,uint8))", 5, tag));
+        let s = call(&mut sdb, sa, encode("get_tag((uint256,uint8))", 5, tag));
+        assert_eq!(g.success, s.success, "get_tag out-of-range must agree (tag={})", tag);
+        assert!(!g.success, "get_tag(tag={}) must revert", tag);
+
+        let g = call(&mut gdb, ga, encode("get_x((uint256,uint8))", 5, tag));
+        assert!(!g.success, "gum eagerly rejects an out-of-range enum field (tag={})", tag);
+    }
+}
+
+// An enum passed to a constructor must be bounds-checked too: deploying with an
+// out-of-range tag reverts, matching Solidity's enum validation.
+#[test]
+fn enum_constructor_arg_is_bounds_checked() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = "enum E:\n    A\n    B\n\ncontract C:\n    const E kind\n    u256 v\n\n    fn new(E k):\n        C.kind = k\n        C.v = 1\n\n    export fn get() -> u256:\n        return C.v\n";
+    let base = gum_creation_bytecode(src, &solc, false);
+
+    // A valid tag (< 2) deploys; an out-of-range tag reverts in the constructor.
+    for (tag, ok) in [(0u64, true), (1, true), (2, false), (200, false)] {
+        let mut code = base.clone();
+        code.extend_from_slice(&U256::from(tag).to_be_bytes::<32>());
+        let mut db: Db = CacheDB::new(EmptyDB::default());
+        let r = try_deploy(&mut db, code);
+        assert_eq!(r.is_some(), ok, "constructor tag={} expected deploy_ok={}", tag, ok);
+    }
+}
+
+// The reentrancy guard must hold across a try/catch. A guarded entry (state change
+// plus an external call) that reenters through that call has the reentry blocked by
+// the lock; with the call inside a try the blocked-reentry revert is caught, and
+// without a try the whole call reverts. Crucially the lock is neither left stuck nor
+// bypassed: a later call still works, and the reentrant frame never runs (no double
+// increment). Covers the try self-call (capability lock) vs reentrancy lock split.
+#[test]
+fn reentrancy_guard_holds_across_try_catch() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = include_str!("fixtures/gum_reentrancy_try.gum");
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let g = deploy(&mut db, gum_creation_bytecode_for(src, &solc, false, "G"));
+    let benign = deploy(&mut db, gum_creation_bytecode_for(src, &solc, false, "BenignSink"));
+    let resink = deploy(&mut db, gum_creation_bytecode_for(src, &solc, false, "ReSink"));
+
+    let run = |db: &mut Db, sig: &str, sink: Address| {
+        call(db, g, encode_words(sig, &[word_addr(sink)]))
+    };
+    let total = |db: &mut Db| -> U256 {
+        U256::from_be_slice(&call(db, g, selector("get_total()").to_vec()).output)
+    };
+
+    // Benign external call: run succeeds, returns the sink's value, total = 1.
+    let r = run(&mut db, "run(address)", benign);
+    assert!(r.success, "benign run should succeed");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(7u64));
+    assert_eq!(total(&mut db), U256::from(1u64));
+
+    // Reentering sink with no try: the reentry is blocked by the guard and the
+    // whole call reverts, so total stays 1 (the increment rolled back).
+    let r = run(&mut db, "run(address)", resink);
+    assert!(!r.success, "reentrant run must revert (guard blocks reentry)");
+    assert_eq!(total(&mut db), U256::from(1u64), "reverted run must not change total");
+
+    // Reentering sink inside a try: the guard blocks the reentry, that revert is
+    // caught, run_try returns 42. The outer increment persists (total = 2) but the
+    // reentrant frame never ran, so it is exactly 2, not 3.
+    let r = run(&mut db, "run_try(address)", resink);
+    assert!(r.success, "run_try should catch the blocked reentry");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(42u64), "catch value");
+    assert_eq!(total(&mut db), U256::from(2u64), "exactly one increment, no reentrant double-count");
+
+    // The lock was not left stuck: a normal call still works afterwards.
+    let r = run(&mut db, "run_try(address)", benign);
+    assert!(r.success, "lock must not be stuck after a caught reentry");
+    assert_eq!(U256::from_be_slice(&r.output), U256::from(7u64));
+    assert_eq!(total(&mut db), U256::from(3u64));
+}
+
+// One statement inside a generated loop body. AddElem folds in the current
+// element, Bump/Scale mutate the accumulator, CondAdd folds the element only when
+// the accumulator is past a threshold, InnerFor nests another loop over the array.
+#[derive(Clone)]
+enum LBody {
+    AddElem,
+    Bump(u64),
+    Scale(u64),
+    CondAdd(u64),
+    InnerFor(Vec<LBody>),
+}
+
+// One statement of a generated loop program: a bare accumulator mutation, a
+// for-each over the storage array, or a counted while over its length.
+#[derive(Clone)]
+enum LUnit {
+    Bump(u64),
+    Scale(u64),
+    ForEach(Vec<LBody>),
+    While(Vec<LBody>),
+}
+
+fn gen_lbody(rng: &mut Rng, depth: u32) -> Vec<LBody> {
+    let n = 1 + (rng.next_u64() % 3) as usize;
+    (0..n)
+        .map(|_| match rng.next_u64() % 5 {
+            0 => LBody::AddElem,
+            1 => LBody::Bump(1 + rng.next_u64() % 5),
+            2 => LBody::Scale(1 + rng.next_u64() % 3),
+            3 if depth > 0 => LBody::InnerFor(gen_lbody(rng, depth - 1)),
+            _ => LBody::CondAdd(rng.next_u64() % 50),
+        })
+        .collect()
+}
+
+fn gen_loop_program(rng: &mut Rng) -> Vec<LUnit> {
+    let n = 1 + (rng.next_u64() % 4) as usize;
+    (0..n)
+        .map(|_| match rng.next_u64() % 4 {
+            0 => LUnit::Bump(1 + rng.next_u64() % 5),
+            1 => LUnit::Scale(1 + rng.next_u64() % 3),
+            2 => LUnit::ForEach(gen_lbody(rng, 1)),
+            _ => LUnit::While(gen_lbody(rng, 1)),
+        })
+        .collect()
+}
+
+// Render a loop body. `elem` is the element expression (an iteration variable for
+// for-each, an indexed access for while), `idx` hands out fresh nested-loop
+// variables, and `gum` picks gum vs Solidity syntax.
+fn render_lbody(body: &[LBody], elem: &str, idx: &mut usize, level: usize, gum: bool, out: &mut String) {
+    let ind = "    ".repeat(level);
+    for b in body {
+        match b {
+            LBody::AddElem => out.push_str(&format!("{ind}acc = acc + {elem}{}\n", if gum { "" } else { ";" })),
+            LBody::Bump(c) => out.push_str(&format!("{ind}acc = acc + {c}{}\n", if gum { "" } else { ";" })),
+            LBody::Scale(c) => out.push_str(&format!("{ind}acc = acc * {c}{}\n", if gum { "" } else { ";" })),
+            LBody::CondAdd(k) => {
+                if gum {
+                    out.push_str(&format!("{ind}if acc > {k}:\n{ind}    acc = acc + {elem}\n"));
+                } else {
+                    out.push_str(&format!("{ind}if (acc > {k}) {{ acc = acc + {elem}; }}\n"));
+                }
+            }
+            LBody::InnerFor(inner) => {
+                let j = *idx;
+                *idx += 1;
+                if gum {
+                    out.push_str(&format!("{ind}for e{j} in C.xs:\n"));
+                    render_lbody(inner, &format!("e{j}"), idx, level + 1, true, out);
+                } else {
+                    out.push_str(&format!("{ind}for (uint256 e{j} = 0; e{j} < xs.length; e{j}++) {{\n"));
+                    render_lbody(inner, &format!("xs[e{j}]"), idx, level + 1, false, out);
+                    out.push_str(&format!("{ind}}}\n"));
+                }
+            }
+        }
+    }
+}
+
+// Render a loop program to gum or Solidity. `idx` hands out fresh loop-variable
+// names so nested counters never collide.
+fn render_units(units: &[LUnit], idx: &mut usize, level: usize, gum: bool, out: &mut String) {
+    let ind = "    ".repeat(level);
+    for u in units {
+        match u {
+            LUnit::Bump(c) => out.push_str(&format!("{ind}acc = acc + {c}{}\n", if gum { "" } else { ";" })),
+            LUnit::Scale(c) => out.push_str(&format!("{ind}acc = acc * {c}{}\n", if gum { "" } else { ";" })),
+            LUnit::ForEach(body) => {
+                let j = *idx;
+                *idx += 1;
+                if gum {
+                    out.push_str(&format!("{ind}for e{j} in C.xs:\n"));
+                    render_lbody(body, &format!("e{j}"), idx, level + 1, true, out);
+                } else {
+                    out.push_str(&format!("{ind}for (uint256 e{j} = 0; e{j} < xs.length; e{j}++) {{\n"));
+                    render_lbody(body, &format!("xs[e{j}]"), idx, level + 1, false, out);
+                    out.push_str(&format!("{ind}}}\n"));
+                }
+            }
+            LUnit::While(body) => {
+                let j = *idx;
+                *idx += 1;
+                if gum {
+                    out.push_str(&format!("{ind}mut u256 i{j} = 0\n{ind}while i{j} < C.xs.length:\n"));
+                    render_lbody(body, &format!("C.xs[i{j}]"), idx, level + 1, true, out);
+                    out.push_str(&format!("{ind}    i{j} = i{j} + 1\n"));
+                } else {
+                    out.push_str(&format!("{ind}uint256 i{j} = 0;\n{ind}while (i{j} < xs.length) {{\n"));
+                    render_lbody(body, &format!("xs[i{j}]"), idx, level + 1, false, out);
+                    out.push_str(&format!("{ind}    i{j} = i{j} + 1;\n{ind}}}\n"));
+                }
+            }
+        }
+    }
+}
+
+// Fold a loop program over an array of values into an accumulator, reverting on
+// overflow just as both compilers' checked arithmetic does. None means it reverts.
+fn eval_loop_body(body: &[LBody], elem: U256, xs: &[U256], acc: &mut U256) -> Option<()> {
+    for b in body {
+        match b {
+            LBody::AddElem => *acc = acc.checked_add(elem)?,
+            LBody::Bump(c) => *acc = acc.checked_add(U256::from(*c))?,
+            LBody::Scale(c) => *acc = acc.checked_mul(U256::from(*c))?,
+            LBody::CondAdd(k) => {
+                if *acc > U256::from(*k) {
+                    *acc = acc.checked_add(elem)?;
+                }
+            }
+            LBody::InnerFor(inner) => {
+                for &e in xs {
+                    eval_loop_body(inner, e, xs, acc)?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+fn eval_loop_program(units: &[LUnit], xs: &[U256], acc: &mut U256) -> Option<()> {
+    for u in units {
+        match u {
+            LUnit::Bump(c) => *acc = acc.checked_add(U256::from(*c))?,
+            LUnit::Scale(c) => *acc = acc.checked_mul(U256::from(*c))?,
+            LUnit::ForEach(body) | LUnit::While(body) => {
+                for &e in xs {
+                    eval_loop_body(body, e, xs, acc)?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
 // Number of accumulator variables the control-flow fuzzer works with. A try body
 // that mutates several of them writes them all back as one ABI tuple, so keeping
 // this above one exercises the multi-field write-back path.
@@ -5308,6 +5693,69 @@ fn fuzz_try_catch_control_flow_matches_reference() {
             };
             assert!(r.success, "prog {}: a={} expected {} got revert\nsrc:\n{}", prog, a, expected, src);
             assert_eq!(U256::from_be_slice(&r.output), expected, "prog {}: a={} value diverged\nsrc:\n{}", prog, a, src);
+        }
+    }
+}
+
+// Random for-each and counted-while loops over a storage array, diffed against a
+// Solidity twin. Both compilers use identical checked arithmetic, so an overflow
+// reverts on both and any success/value divergence is a real gum loop bug: wrong
+// iteration count, storage-element read, or accumulator handling. A Rust oracle
+// cross-checks the value whenever both compilers succeed.
+#[test]
+fn fuzz_storage_loops_match_solidity() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping fuzz: no solc");
+            return;
+        }
+    };
+
+    for prog in 0..40u64 {
+        let mut rng = Rng(0x100b_0000 ^ prog);
+        let units = gen_loop_program(&mut rng);
+
+        let mut gum = String::from("contract C:\n    [u256] xs\n\n    export fn push(u256 v):\n        C.xs.push(v)\n\n    export fn run(u256 seed) -> u256:\n        mut u256 acc = seed\n");
+        let mut gidx = 0usize;
+        render_units(&units, &mut gidx, 2, true, &mut gum);
+        gum.push_str("        return acc\n");
+
+        let mut sol = String::from("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\ncontract C {\n    uint256[] xs;\n    function push(uint256 v) external { xs.push(v); }\n    function run(uint256 seed) external view returns (uint256) {\n        uint256 acc = seed;\n");
+        let mut sidx = 0usize;
+        render_units(&units, &mut sidx, 2, false, &mut sol);
+        sol.push_str("        return acc;\n    }\n}\n");
+
+        let mut gdb: Db = CacheDB::new(EmptyDB::default());
+        let mut sdb: Db = CacheDB::new(EmptyDB::default());
+        let ga = deploy(&mut gdb, gum_creation_bytecode(&gum, &solc, false));
+        let sa = deploy(&mut sdb, sol_creation_bytecode(&sol, &solc));
+
+        // Push a random array, mirrored on both sides.
+        let n = (rng.next_u64() % 8) as usize;
+        let mut xs: Vec<U256> = Vec::new();
+        for _ in 0..n {
+            let v = rng.next_u256(true);
+            xs.push(v);
+            let data = encode_words("push(uint256)", &[v.to_be_bytes::<32>()]);
+            assert!(call(&mut gdb, ga, data.clone()).success);
+            assert!(call(&mut sdb, sa, data).success);
+        }
+
+        for _ in 0..12 {
+            let seed = rng.next_u256(true);
+            let data = encode_words("run(uint256)", &[seed.to_be_bytes::<32>()]);
+            let g = call(&mut gdb, ga, data.clone());
+            let s = call(&mut sdb, sa, data);
+            assert_eq!(g.success, s.success, "prog {}: run success mismatch\ngum:\n{}", prog, gum);
+            if g.success {
+                assert_eq!(g.output, s.output, "prog {}: run value diverged\ngum:\n{}", prog, gum);
+                // Cross-check the shared value against the Rust oracle.
+                let mut acc = seed;
+                if let Some(()) = eval_loop_program(&units, &xs, &mut acc) {
+                    assert_eq!(U256::from_be_slice(&g.output), acc, "prog {}: oracle disagrees\ngum:\n{}", prog, gum);
+                }
+            }
         }
     }
 }

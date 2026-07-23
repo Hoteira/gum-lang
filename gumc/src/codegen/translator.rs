@@ -633,6 +633,9 @@ pub struct AbiStructField {
     mem_offset: usize,
     width: usize,
     is_addr: bool,
+    // Variant count when this field is a scalar enum, so its tag is bounds-checked
+    // on decode; None for a non-enum field.
+    enum_variants: Option<usize>,
 }
 
 // One field of a struct that crosses the ABI as a dynamic tuple: carries its
@@ -646,6 +649,7 @@ struct AbiDynField {
     width: usize,
     is_addr: bool,
     is_dynamic: bool,
+    enum_variants: Option<usize>,
 }
 
 // A stable, unique suffix naming one type's codecs, so two functions taking the same type share a decoder and two different types never collide on one.
@@ -671,6 +675,12 @@ pub fn is_abi_scalar(t: &Type) -> bool {
 
 // Moves one wire word into its packed memory field. Split out because the calldata and memory decoders differ only in how they fetch the word.
 fn abi_st_field_store(raw: &str, f: &AbiStructField) -> String {
+    let mut out = String::new();
+    // An enum field's tag is bounds-checked against the variant count, like
+    // Solidity, before it is packed into the struct.
+    if let Some(nvar) = f.enum_variants {
+        out.push_str(&format!("    if iszero(lt({}, {})) {{ revert(0, 0) }}\n", raw, nvar));
+    }
     let v = if f.is_addr {
         format!("and({}, 0xffffffffffffffffffffffffffffffffffffffff)", raw)
     } else {
@@ -678,11 +688,12 @@ fn abi_st_field_store(raw: &str, f: &AbiStructField) -> String {
     };
     let addr = format!("add(ptr, {})", f.mem_offset);
     if f.width >= 32 {
-        format!("    mstore({}, {})\n", addr, v)
+        out.push_str(&format!("    mstore({}, {})\n", addr, v));
     } else {
         let merged = write_packed(&format!("mload({})", addr), 0, f.width, &v);
-        format!("    mstore({}, {})\n", addr, merged)
+        out.push_str(&format!("    mstore({}, {})\n", addr, merged));
     }
+    out
 }
 
 // Calldata -> packed memory struct: one wire word per field in declaration order, scattered into a layout that is widest-first and tightly packed.
@@ -756,7 +767,7 @@ fn build_dyn_struct_cd(fname: &str, fields: &[AbiDynField], sub: &[Option<String
             b.push_str(&format!("    if gt(eo{i}, calldatasize()) {{ revert(0, 0) }}\n", i = i));
             b.push_str(&format!("    mstore(add(ptr, {mo}), {cd}(add(off, eo{i})))\n", mo = f.mem_offset, cd = cd, i = i));
         } else {
-            let asf = AbiStructField { mem_offset: f.mem_offset, width: f.width, is_addr: f.is_addr };
+            let asf = AbiStructField { mem_offset: f.mem_offset, width: f.width, is_addr: f.is_addr, enum_variants: f.enum_variants };
             b.push_str(&abi_st_field_store(&format!("calldataload(add(off, {}))", i * 32), &asf));
         }
     }
@@ -776,7 +787,7 @@ fn build_dyn_struct_mem(fname: &str, fields: &[AbiDynField], sub: &[Option<Strin
             b.push_str(&format!("    if gt(eo{i}, limit) {{ revert(0, 0) }}\n", i = i));
             b.push_str(&format!("    mstore(add(ptr, {mo}), {mem}(base, add(off, eo{i}), limit))\n", mo = f.mem_offset, mem = mem, i = i));
         } else {
-            let asf = AbiStructField { mem_offset: f.mem_offset, width: f.width, is_addr: f.is_addr };
+            let asf = AbiStructField { mem_offset: f.mem_offset, width: f.width, is_addr: f.is_addr, enum_variants: f.enum_variants };
             b.push_str(&abi_st_field_store(&format!("mload(add(base, add(off, {})))", i * 32), &asf));
         }
     }
@@ -1890,7 +1901,8 @@ impl<'a> Translator<'a> {
         let class = self.type_checker().loaded_classes.get(name)?;
         let mut out = Vec::new();
         for f in &class.fields {
-            if !is_abi_scalar(&f.type_def) {
+            let is_enum = self.type_checker().is_scalar_enum(&f.type_def);
+            if !is_abi_scalar(&f.type_def) && !is_enum {
                 return None;
             }
             let mf = self.layout_engine.memory_field(name, &f.name)?;
@@ -1898,6 +1910,7 @@ impl<'a> Translator<'a> {
                 mem_offset: mf.offset,
                 width: mf.size,
                 is_addr: crate::codegen::is_address_type(&f.type_def),
+                enum_variants: if is_enum { Some(self.enum_variant_count(&f.type_def)) } else { None },
             });
         }
         if out.is_empty() {
@@ -1934,6 +1947,11 @@ impl<'a> Translator<'a> {
                 width: mf.size,
                 is_addr: crate::codegen::is_address_type(&f.type_def),
                 is_dynamic,
+                enum_variants: if self.type_checker().is_scalar_enum(&f.type_def) {
+                    Some(self.enum_variant_count(&f.type_def))
+                } else {
+                    None
+                },
             });
         }
         if !any_dynamic || out.is_empty() {
@@ -2130,6 +2148,16 @@ impl<'a> Translator<'a> {
     }
 
     // The four ensure_abi_ below give every ABI type the same four codec signatures: cd(off), mem(base, off, limit), put(dst, ptr) -> written, size(ptr).
+    // Number of variants of a scalar enum type, for the calldata bounds check.
+    fn enum_variant_count(&self, t: &Type) -> usize {
+        if let Type::Primitive(name) = t {
+            if let Some(e) = self.type_checker().loaded_enums.get(name) {
+                return e.variants.len();
+            }
+        }
+        0
+    }
+
     pub fn ensure_abi_cd(&self, t: &Type) -> Option<String> {
         if is_str_type(t) {
             self.ensure_helper("gum_abi_str_cd", gum_abi_str_cd_helper_src);
@@ -2147,7 +2175,25 @@ impl<'a> Translator<'a> {
                 if self.abi_is_dynamic(inner) {
                     let ic = self.ensure_abi_cd(inner)?;
                     abi_dynarr_cd_helper_src(&fname, &ic)
-                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                } else if self.type_checker().is_scalar_enum(inner) {
+                    // Validate every tag is in range (like Solidity), then delegate
+                    // the packing to the proven scalar-array codec.
+                    self.ensure_abi_arr_cd();
+                    let esz = self.layout_engine.size_of(inner);
+                    let nvar = self.enum_variant_count(inner);
+                    format!(
+                        "function {f}(off) -> ptr {{\n\
+                         \x20   if lt(calldatasize(), add(off, 32)) {{ revert(0, 0) }}\n\
+                         \x20   let n := calldataload(off)\n\
+                         \x20   if gt(n, div(sub(calldatasize(), add(off, 32)), 32)) {{ revert(0, 0) }}\n\
+                         \x20   for {{ let i := 0 }} lt(i, n) {{ i := add(i, 1) }} {{\n\
+                         \x20       if iszero(lt(calldataload(add(add(off, 32), mul(i, 32))), {nv})) {{ revert(0, 0) }}\n\
+                         \x20   }}\n\
+                         \x20   ptr := gum_abi_arr_cd(off, {esz})\n\
+                         }}\n",
+                        f = fname, nv = nvar, esz = esz
+                    )
+                } else if is_abi_scalar(inner) {
                     self.ensure_abi_arr_cd();
                     let esz = self.layout_engine.size_of(inner);
                     format!(
@@ -2170,7 +2216,20 @@ impl<'a> Translator<'a> {
                     let (st, wire) = self.ensure_abi_struct_cd(&sn)?;
                     let packed = self.abi_struct_packed(&sn);
                     abi_statfarr_cd_helper_src(&fname, &st, *n, wire, packed)
-                } else if is_abi_scalar(inner) || self.type_checker().is_scalar_enum(inner) {
+                } else if self.type_checker().is_scalar_enum(inner) {
+                    self.ensure_abi_farr_cd();
+                    let esz = self.layout_engine.size_of(inner);
+                    let nvar = self.enum_variant_count(inner);
+                    format!(
+                        "function {f}(off) -> ptr {{\n\
+                         \x20   for {{ let i := 0 }} lt(i, {n}) {{ i := add(i, 1) }} {{\n\
+                         \x20       if iszero(lt(calldataload(add(off, mul(i, 32))), {nv})) {{ revert(0, 0) }}\n\
+                         \x20   }}\n\
+                         \x20   ptr := gum_abi_farr_cd(off, {n}, {esz})\n\
+                         }}\n",
+                        f = fname, n = n, nv = nvar, esz = esz
+                    )
+                } else if is_abi_scalar(inner) {
                     self.ensure_abi_farr_cd();
                     let esz = self.layout_engine.size_of(inner);
                     format!(
