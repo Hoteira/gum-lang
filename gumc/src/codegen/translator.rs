@@ -2825,6 +2825,22 @@ impl<'a> Translator<'a> {
             Statement::ScopedTryCall { thunk, args, propagate_return, writeback, catch_body } => {
                 self.translate_scoped_try(thunk, args, *propagate_return, writeback, catch_body, ctx)
             }
+            Statement::ReturnCaptures(fields) => {
+                // Encode the captured variables as one ABI tuple and return it, the
+                // fall-through payload the site decodes with returndata_tuple_to_vars.
+                let types: Vec<Type> = fields.iter().map(|(_, t)| t.clone()).collect();
+                let (size_src, write_src) = self.abi_arg_blob_src(&types);
+                let mut b = String::from("{\n");
+                for (i, (name, _)) in fields.iter().enumerate() {
+                    b.push_str(&format!("    let a{} := {}\n", i, name));
+                }
+                b.push_str(&size_src);
+                b.push_str("    let blob := allocate_memory(alen)\n");
+                b.push_str(&write_src);
+                b.push_str("    return(blob, alen)\n");
+                b.push_str("}\n");
+                b
+            }
             Statement::ForLoop {
                 iterator,
                 iterable,
@@ -5214,7 +5230,7 @@ impl<'a> Translator<'a> {
         thunk: &str,
         args: &[(String, Type)],
         propagate_return: bool,
-        writeback: &Option<(String, Type)>,
+        writeback: &[(String, Type)],
         catch_body: &[Spanned<Statement>],
         ctx: &Ctx,
     ) -> String {
@@ -5266,32 +5282,49 @@ impl<'a> Translator<'a> {
         let id = self.next_literal_id();
         let ok = format!("__try_ok_{}", id);
         let mut out = format!("let {} := {}({})\n", ok, helper, arg_vals.join(", "));
-        if propagate_return {
-            // A returning body left its ABI-encoded value in returndata; forward
-            // it verbatim as this function's return (the types match), clearing
-            // the reentrancy lock first exactly as a normal entry return would.
-            out.push_str(&format!("if {} {{\n", ok));
-            out.push_str("    if gt(returndatasize(), 0) {\n");
+
+        // A returning body left its ABI-encoded value in returndata. Always set the
+        // returned flag first, so an enclosing combined thunk reads this as a real
+        // return. An entry forwards the returndata verbatim as its own return (the
+        // types match), clearing the reentrancy lock like a normal entry return; a
+        // non-entry decodes the returndata into its own return slot and leaves.
+        let mut propagate = String::new();
+        propagate.push_str("    if gt(returndatasize(), 0) {\n");
+        propagate.push_str(&format!("        tstore({}, 1)\n", crate::codegen::TRY_RETURNED_SLOT));
+        if ctx.is_entry {
             if let Some(lock) = &ctx.lock_slot {
-                out.push_str(&format!("        tstore({}, 0)\n", lock));
+                propagate.push_str(&format!("        tstore({}, 0)\n", lock));
             }
-            out.push_str("        let __rb := allocate_memory(returndatasize())\n");
-            out.push_str("        returndatacopy(__rb, 0, returndatasize())\n");
-            out.push_str("        return(__rb, returndatasize())\n");
-            out.push_str("    }\n");
-            out.push_str("}\n");
+            propagate.push_str("        let __rb := allocate_memory(returndatasize())\n");
+            propagate.push_str("        returndatacopy(__rb, 0, returndatasize())\n");
+            propagate.push_str("        return(__rb, returndatasize())\n");
+        } else if let Some(rt) = &ctx.return_type {
+            propagate.push_str(&self.returndata_to_var(rt, "ret"));
+            propagate.push_str("        leave\n");
         }
-        // Write-back: on success the thunk returned the mutated variable's new
-        // value in returndata; decode it through its type's codec and assign it
-        // back to the enclosing local. Any type works, a String/Bytes, struct or
-        // array comes back through the same decoder an interface-call return uses,
-        // not just a one-word scalar. (Only reached when the body does not return,
-        // so this is unambiguous.)
-        if let Some((name, ty)) = writeback {
+        propagate.push_str("    }\n");
+
+        // Write-back: the thunk returned the mutated variables as an ABI tuple in
+        // returndata; decode it and assign each back. Any types work, a String,
+        // struct or array comes back through the same decoders an interface-call
+        // return uses.
+        let writeback_src = self.returndata_tuple_to_vars(writeback);
+
+        if propagate_return && !writeback.is_empty() {
+            // Combined: the body may return or fall through with a write-back. The
+            // thunk set the discriminator; a real return propagates, a fall-through
+            // decodes the write-back.
             out.push_str(&format!("if {} {{\n", ok));
-            out.push_str(&self.returndata_to_var(ty, name));
+            out.push_str(&format!("switch tload({})\n", crate::codegen::TRY_RETURNED_SLOT));
+            out.push_str(&format!("case 1 {{\n{}}}\n", propagate));
+            out.push_str(&format!("default {{\n{}}}\n", writeback_src));
             out.push_str("}\n");
+        } else if propagate_return {
+            out.push_str(&format!("if {} {{\n{}}}\n", ok, propagate));
+        } else if !writeback.is_empty() {
+            out.push_str(&format!("if {} {{\n{}}}\n", ok, writeback_src));
         }
+
         out.push_str(&format!("if iszero({}) {{\n", ok));
         for s in catch_body {
             out.push_str(&self.translate_statement(&s.node, ctx));
@@ -5601,6 +5634,64 @@ impl<'a> Translator<'a> {
             dst,
             self.mask_for_type("mload(0)", t)
         )
+    }
+
+    // Decode an ABI tuple in returndata (as encoded by abi_arg_blob_src) and assign
+    // each field to its variable. A single field reuses returndata_to_var, whose
+    // wire form is identical to a one-element tuple.
+    fn returndata_tuple_to_vars(&self, fields: &[(String, Type)]) -> String {
+        if fields.is_empty() {
+            return String::new();
+        }
+        if fields.len() == 1 {
+            return self.returndata_to_var(&fields[0].1, &fields[0].0);
+        }
+        let head_bytes: usize = fields.iter().map(|(_, t)| self.abi_head_bytes(t)).sum();
+        let mut o = format!("    if lt(returndatasize(), {}) {{ revert(0, 0) }}\n", head_bytes);
+        o.push_str("    let __wb := allocate_memory(returndatasize())\n");
+        o.push_str("    returndatacopy(__wb, 0, returndatasize())\n");
+        let mut at = 0usize;
+        for (name, t) in fields {
+            let ho = at;
+            at += self.abi_head_bytes(t);
+            o.push_str(&self.decode_tuple_field(name, t, ho));
+        }
+        o
+    }
+
+    // Decode one field of an ABI tuple held in memory at __wb into `name`. A
+    // dynamic field carries an offset (from the tuple start) in its head word; a
+    // static field sits inline at its head offset.
+    fn decode_tuple_field(&self, name: &str, t: &Type, ho: usize) -> String {
+        if is_str_type(t) {
+            self.ensure_helper("gum_abi_str_mem", gum_abi_str_mem_helper_src);
+            return format!(
+                "    {} := gum_abi_str_mem(__wb, mload(add(__wb, {ho})), returndatasize())\n",
+                name, ho = ho
+            );
+        }
+        if matches!(t, Type::Array(_) | Type::FixedArray(..)) {
+            if let Some(h) = self.ensure_abi_mem(t) {
+                return if self.abi_is_dynamic(t) {
+                    format!("    {} := {h}(__wb, mload(add(__wb, {ho})), returndatasize())\n", name, h = h, ho = ho)
+                } else {
+                    format!("    {} := {h}(__wb, {ho}, returndatasize())\n", name, h = h, ho = ho)
+                };
+            }
+        }
+        if let Type::Primitive(nm) = t {
+            if is_struct_type(self.type_checker(), t) {
+                if self.abi_is_dynamic(t) {
+                    if let Some(h) = self.ensure_abi_dyn_struct_mem(nm) {
+                        return format!("    {} := {h}(__wb, mload(add(__wb, {ho})), returndatasize())\n", name, h = h, ho = ho);
+                    }
+                }
+                if let Some((h, _)) = self.ensure_abi_struct_mem(nm) {
+                    return format!("    {} := {h}(__wb, {ho}, returndatasize())\n", name, h = h, ho = ho);
+                }
+            }
+        }
+        format!("    {} := {}\n", name, self.mask_for_type(&format!("mload(add(__wb, {}))", ho), t))
     }
 
     // An interface call is the same ABI layout problem as a CREATE, only the prefix differs: a 4-byte selector instead of the child's creation code, so it shares abi_arg_blob_src.

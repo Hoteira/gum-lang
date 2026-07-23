@@ -287,6 +287,7 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
             Statement::ScopedTryCall { catch_body, .. } => {
                 body(catch_body, out);
             }
+            Statement::ReturnCaptures(_) => {}
         }
     }
     for m in methods {
@@ -349,6 +350,12 @@ fn is_try_thunk(f: &FnDecl) -> bool {
 pub(crate) const TRY_CAPABILITY_SLOT: &str =
     "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe";
 
+// Transient discriminator for a try body that both returns and writes back a
+// mutated variable. The thunk sets it to 1 on a real return and 0 on a
+// fall-through write-back, so the site can tell the two apart in returndata.
+pub(crate) const TRY_RETURNED_SLOT: &str =
+    "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd";
+
 // Rewrites every try/catch into a guarded self-call: the try body is lifted into
 // a synthesized entry fn and the site becomes a ScopedTryCall run in its own
 // frame, so any revert is caught and its state rolls back before catch runs.
@@ -371,7 +378,6 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
         let enclosing = EnclosingFn {
             params: m.parameters.clone(),
             return_type: m.return_type.clone(),
-            is_entry: is_selector_entry(m),
             local_types,
         };
         hoist_in_body(
@@ -391,7 +397,6 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
 struct EnclosingFn {
     params: Vec<Parameter>,
     return_type: Option<Type>,
-    is_entry: bool,
     local_types: HashMap<String, Type>,
 }
 
@@ -461,33 +466,25 @@ fn plan_capture(
     local_caps.sort_by(|a, b| a.name.cmp(&b.name));
     captures.extend(local_caps);
 
-    // A captured variable the body reassigns has its new value travel back out
-    // of the frame (write-back), supported for exactly one simple value-typed
-    // variable; anything else stays on the old inline path for now.
+    // Every captured variable the body reassigns has its new value travel back out
+    // of the frame. On the fall-through path the thunk returns them all as one ABI
+    // tuple, which the site decodes and reassigns. A return propagates separately (a
+    // transient flag tells the two apart), so a body may both return and write back
+    // any number of variables of any types.
     let mut assigned: HashSet<String> = HashSet::new();
     collect_assigned_idents(try_body, &mut assigned);
-    let mutated: Vec<&Parameter> = captures
+    let writeback: Vec<(String, Type)> = captures
         .iter()
         .filter(|c| assigned.contains(&c.name))
+        .map(|c| (c.name.clone(), c.type_def.clone()))
         .collect();
     let has_ret = body_has_return(try_body);
-    let writeback: Option<(String, Type)> = match mutated.as_slice() {
-        [] => None,
-        // One mutated captured variable of ANY type travels back out of the frame:
-        // the thunk returns it (ABI-encoded through the entry return path, which
-        // already handles String/Bytes/struct/array) and the site decodes it with
-        // that type's codec. A mutation combined with a return, or more than one
-        // mutated variable, still stays on the old inline path (the thunk can carry
-        // one value in returndata, not a returned value plus a write-back, nor a
-        // tuple of several).
-        [c] if !has_ret => Some((c.name.clone(), c.type_def.clone())),
-        _ => return None,
-    };
 
-    // A return inside the try must become the enclosing function's return. That
-    // reuses the entry return-encoding, so it is only supported when the
-    // enclosing function is an entry with a declared return type.
-    if has_ret && !(enclosing.is_entry && enclosing.return_type.is_some()) {
+    // A return inside the try must become the enclosing function's return, so the
+    // enclosing function needs a declared return type to encode/decode through. An
+    // entry propagates the thunk's returndata directly; a non-entry decodes it into
+    // its own return slot (handled at the site), so both are supported.
+    if has_ret && enclosing.return_type.is_none() {
         return None;
     }
 
@@ -504,7 +501,7 @@ fn plan_capture(
 struct Capture {
     captures: Vec<Parameter>,
     has_ret: bool,
-    writeback: Option<(String, Type)>,
+    writeback: Vec<(String, Type)>,
 }
 
 fn hoist_in_stmt(
@@ -560,14 +557,26 @@ fn hoist_in_stmt(
                 line: 0,
                 col: 0,
             }];
+            // When the body both returns and writes back, each real return is
+            // flagged so the site can distinguish it from the fall-through below.
+            let combined = has_ret && !writeback.is_empty();
+            if combined {
+                mark_returns_with_flag(try_body);
+            }
             thunk_body.append(try_body);
-            // For write-back, the thunk returns the mutated variable so the site
-            // can assign it back; append that return after the (non-returning) body.
-            if let Some((name, _)) = &writeback {
+            // Fall-through: return the mutated variables as one ABI tuple so the
+            // site can decode and reassign them. In the combined case, clear the
+            // flag first to mark this as a fall-through rather than a real return.
+            if !writeback.is_empty() {
+                if combined {
+                    thunk_body.push(Spanned {
+                        node: Statement::UnsafeBlock(format!("{{ tstore({}, 0) }}", TRY_RETURNED_SLOT)),
+                        line: 0,
+                        col: 0,
+                    });
+                }
                 thunk_body.push(Spanned {
-                    node: Statement::Return {
-                        value: Some(Expr::Identifier(name.clone())),
-                    },
+                    node: Statement::ReturnCaptures(writeback.clone()),
                     line: 0,
                     col: 0,
                 });
@@ -576,12 +585,12 @@ fn hoist_in_stmt(
                 .iter()
                 .map(|p| (p.name.clone(), p.type_def.clone()))
                 .collect();
-            // A returning body encodes through the enclosing return type; a
-            // write-back encodes through the mutated variable's type.
+            // Only a returning body needs a declared return type (its user returns
+            // encode through it); a write-back returns its tuple explicitly.
             let thunk_ret = if has_ret {
                 enclosing.return_type.clone()
             } else {
-                writeback.as_ref().map(|(_, t)| t.clone())
+                None
             };
             thunks.push(FnDecl {
                 modifiers: vec!["export".to_string()],
@@ -735,14 +744,14 @@ fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String
                 collect_assigned_idents(try_body, out);
                 collect_assigned_idents(catch_body, out);
             }
-            // A hoisted inner try writes its mutated variable back into this
-            // frame, so it counts as an assignment here too.
+            // A hoisted inner try writes its mutated variables back into this
+            // frame, so they count as assignments here too.
             Statement::ScopedTryCall {
                 writeback,
                 catch_body,
                 ..
             } => {
-                if let Some((n, _)) = writeback {
+                for (n, _) in writeback {
                     out.insert(n.clone());
                 }
                 collect_assigned_idents(catch_body, out);
@@ -776,6 +785,50 @@ fn body_has_return(body: &[Spanned<Statement>]) -> bool {
         } => *propagate_return || body_has_return(catch_body),
         _ => false,
     })
+}
+
+// Prefix every direct return in a body with the returned-discriminator flag set
+// to 1, so a combined write-back thunk can tell a real return from a fall-through.
+// Nested trys are already their own frames (ScopedTryCall sets the flag at its own
+// propagate site), so they are left alone here.
+fn mark_returns_with_flag(body: &mut Vec<Spanned<Statement>>) {
+    let mut i = 0;
+    while i < body.len() {
+        match &mut body[i].node {
+            Statement::Return { .. } => {
+                body.insert(
+                    i,
+                    Spanned {
+                        node: Statement::UnsafeBlock(format!("{{ tstore({}, 1) }}", TRY_RETURNED_SLOT)),
+                        line: 0,
+                        col: 0,
+                    },
+                );
+                i += 2;
+                continue;
+            }
+            Statement::IfElse { if_body, else_body, .. } => {
+                mark_returns_with_flag(if_body);
+                if let Some(e) = else_body {
+                    mark_returns_with_flag(e);
+                }
+            }
+            Statement::ForLoop { body, .. } | Statement::WhileLoop { body, .. } => {
+                mark_returns_with_flag(body)
+            }
+            Statement::Match { arms, .. } => {
+                for a in arms.iter_mut() {
+                    mark_returns_with_flag(&mut a.body);
+                }
+            }
+            Statement::TryCatch { try_body, catch_body } => {
+                mark_returns_with_flag(try_body);
+                mark_returns_with_flag(catch_body);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 // Every identifier name read anywhere in a body (including the bases of property
@@ -852,7 +905,7 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
             body_idents(catch_body, out);
         }
         // A hoisted inner try reads its captured args and writes back its mutated
-        // variable in the enclosing frame, so an outer try around it must capture
+        // variables in the enclosing frame, so an outer try around it must capture
         // those names too, otherwise the outer thunk references a variable it was
         // never handed. (The inner body itself is gone into its own thunk.)
         Statement::ScopedTryCall {
@@ -864,11 +917,12 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
             for (n, _) in args {
                 out.insert(n.clone());
             }
-            if let Some((n, _)) = writeback {
+            for (n, _) in writeback {
                 out.insert(n.clone());
             }
             body_idents(catch_body, out);
         }
+        Statement::ReturnCaptures(_) => {}
         Statement::UnsafeBlock(_) => {}
     }
 }
@@ -1761,13 +1815,22 @@ impl EvmYulBackend {
                 }
 
                 if class_decl.generic_params.is_empty() {
+                    // The global contract's methods must come from the hoisted copy,
+                    // so an internally-called method with a try/catch gets the same
+                    // guarded self-call lowering as its entry does, not the inline
+                    // path that cannot catch internal reverts.
+                    let methods = if class_name == &global_class_name {
+                        &global_class.methods
+                    } else {
+                        &class_decl.methods
+                    };
                     compile_class_methods(
                         &mut shared_functions,
                         &translator,
                         class_name,
                         "",
                         class_decl.is_global,
-                        &class_decl.methods,
+                        methods,
                     );
                 } else if let Some(insts) = instantiations.get(class_name) {
                     for args in insts {

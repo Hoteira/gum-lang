@@ -144,9 +144,12 @@ pub enum Statement {
         thunk: String,
         args: Vec<(String, Type)>,
         propagate_return: bool,
-        writeback: Option<(String, Type)>,
+        writeback: Vec<(String, Type)>,
         catch_body: Vec<Spanned<Statement>>,
     },
+    // Synthesized only: return the given captured variables as an ABI tuple, the
+    // fall-through payload of a try thunk that writes variables back to its caller.
+    ReturnCaptures(Vec<(String, Type)>),
     Match {
         expr: Expr,
         arms: Vec<MatchArm>,

@@ -1555,6 +1555,7 @@ impl TypeChecker {
             // Only the codegen try-hoisting pre-pass produces this, well after
             // semantic analysis, so it is never seen here.
             Statement::ScopedTryCall { .. } => {}
+            Statement::ReturnCaptures(_) => {}
             Statement::Match { expr, arms } => {
                 let match_type = self.eval_type(expr)?;
                 if let Type::Primitive(enum_name) = &match_type {
@@ -2249,6 +2250,7 @@ fn reads_field(body: &[Spanned<Statement>], class_name: &str, field: &str) -> bo
         Statement::WhileLoop { condition, body } => re(condition) || reads_field(body, class_name, field),
         Statement::TryCatch { try_body, catch_body } => reads_field(try_body, class_name, field) || reads_field(catch_body, class_name, field),
         Statement::ScopedTryCall { catch_body, .. } => reads_field(catch_body, class_name, field),
+        Statement::ReturnCaptures(_) => false,
         Statement::ForLoop { iterable, body, .. } => re(iterable) || reads_field(body, class_name, field),
         Statement::Match { expr, arms } => {
             re(expr) || arms.iter().any(|a| reads_field(&a.body, class_name, field))

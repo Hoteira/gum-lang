@@ -1,0 +1,14 @@
+use gum.defaults.String
+
+contract C:
+    export fn f(u256 a) -> String:
+        mut u256 count = a
+        mut u8 small = 1
+        try:
+            count = count + 10
+            small = 5
+            assert(a < 3, "bad")
+            return "returned"
+        catch:
+            count = count + 100
+        return count.to_string()

@@ -144,6 +144,7 @@ fn stmt_effect(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &MutMap)
         }
         // A scoped try runs its body via a self-call, so at least NonPayable.
         Statement::ScopedTryCall { catch_body, .. } => Mut::NonPayable.max(body(catch_body)),
+        Statement::ReturnCaptures(_) => Mut::NonPayable,
         Statement::Expression(e) => sub(e),
         // A raw call target(payload), and raw Yul, can do anything.
         Statement::Call { .. } => Mut::NonPayable,
@@ -276,6 +277,7 @@ fn stmt_calls_out(tc: &TypeChecker, class: &ClassDecl, s: &Statement, map: &Hash
         Statement::TryCatch { try_body, catch_body } => body(try_body) || body(catch_body),
         // A scoped try reaches its body through a self-call, so it calls out.
         Statement::ScopedTryCall { .. } => true,
+        Statement::ReturnCaptures(_) => false,
         Statement::Expression(e) => sub(e),
         // A raw low-level call and raw Yul can reach anywhere.
         Statement::Call { .. } => true,

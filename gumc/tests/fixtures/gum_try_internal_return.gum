@@ -1,0 +1,13 @@
+contract C:
+    fn helper(u256 a) -> u256:
+        mut u256 r = a
+        try:
+            r = r + 4
+            assert(a < 2, "m")
+            return r
+        catch:
+            r = r + 3
+        return r
+
+    export fn f(u256 a) -> u256:
+        return C.helper(a)

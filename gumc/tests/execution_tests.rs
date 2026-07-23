@@ -5149,6 +5149,229 @@ fn fuzz_dynamic_abi_roundtrip_matches_solidity() {
     }
 }
 
+// Number of accumulator variables the control-flow fuzzer works with. A try body
+// that mutates several of them writes them all back as one ABI tuple, so keeping
+// this above one exercises the multi-field write-back path.
+const CTRL_VARS: usize = 3;
+
+// One generated control-flow statement. The generator emits these; the same tree
+// is rendered to gum source and evaluated by a reference oracle, so the two can
+// never drift. Add mutates one variable, Assert reverts when it fails, Ret returns
+// the running total, and Try wraps a body plus a catch handler.
+#[derive(Clone)]
+enum CtrlStmt {
+    Add(usize, u64),
+    Assert(u64),
+    Ret,
+    Try(Vec<CtrlStmt>, Vec<CtrlStmt>),
+}
+
+// A random non-empty block, nested up to `depth` levels of try/catch. A try body
+// may end in a return (the propagate-out path); a catch never does, so code after
+// a try stays reachable through the caught path and gum's return analysis holds.
+fn gen_ctrl_block(rng: &mut Rng, depth: u32) -> Vec<CtrlStmt> {
+    let n = 1 + (rng.next_u64() % 3) as usize;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pick = rng.next_u64() % 100;
+        if depth > 0 && pick < 35 {
+            let mut b = gen_ctrl_block(rng, depth - 1);
+            if rng.next_u64() % 3 == 0 {
+                b.push(CtrlStmt::Ret);
+            }
+            let h = gen_ctrl_block(rng, depth - 1);
+            v.push(CtrlStmt::Try(b, h));
+        } else if pick < 67 {
+            v.push(CtrlStmt::Assert(1 + rng.next_u64() % 24));
+        } else {
+            let vi = (rng.next_u64() as usize) % CTRL_VARS;
+            v.push(CtrlStmt::Add(vi, 1 + rng.next_u64() % 4));
+        }
+    }
+    v
+}
+
+// Render a block to gum source at the given indent level.
+fn render_ctrl(stmts: &[CtrlStmt], level: usize, out: &mut String) {
+    let ind = "    ".repeat(level);
+    let sum = (0..CTRL_VARS).map(|i| format!("r{}", i)).collect::<Vec<_>>().join(" + ");
+    for s in stmts {
+        match s {
+            CtrlStmt::Add(vi, c) => out.push_str(&format!("{ind}r{vi} = r{vi} + {c}\n")),
+            CtrlStmt::Assert(k) => out.push_str(&format!("{ind}assert(a < {k}, \"m\")\n")),
+            CtrlStmt::Ret => out.push_str(&format!("{ind}return {sum}\n")),
+            CtrlStmt::Try(b, h) => {
+                out.push_str(&format!("{ind}try:\n"));
+                render_ctrl(b, level + 1, out);
+                out.push_str(&format!("{ind}catch:\n"));
+                render_ctrl(h, level + 1, out);
+            }
+        }
+    }
+}
+
+// The reference oracle outcome for a block: fell through, returned a value out of
+// the function, or reverted.
+enum CtrlFlow {
+    Fell,
+    Returned(U256),
+    Reverted,
+}
+
+// A try runs its body; on revert the catch runs with the pre-try variables
+// restored, exactly as an EVM self-call frame rolls back its locals. A return
+// inside a try propagates out of the whole function.
+fn eval_ctrl(stmts: &[CtrlStmt], a: U256, vars: &mut [U256; CTRL_VARS]) -> CtrlFlow {
+    for s in stmts {
+        match s {
+            CtrlStmt::Add(vi, c) => vars[*vi] += U256::from(*c),
+            CtrlStmt::Assert(k) => {
+                if a >= U256::from(*k) {
+                    return CtrlFlow::Reverted;
+                }
+            }
+            CtrlStmt::Ret => return CtrlFlow::Returned(vars.iter().copied().fold(U256::ZERO, |x, y| x + y)),
+            CtrlStmt::Try(b, h) => {
+                let snapshot = *vars;
+                match eval_ctrl(b, a, vars) {
+                    CtrlFlow::Fell => {}
+                    CtrlFlow::Returned(v) => return CtrlFlow::Returned(v),
+                    CtrlFlow::Reverted => {
+                        *vars = snapshot;
+                        match eval_ctrl(h, a, vars) {
+                            CtrlFlow::Fell => {}
+                            CtrlFlow::Returned(v) => return CtrlFlow::Returned(v),
+                            CtrlFlow::Reverted => return CtrlFlow::Reverted,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CtrlFlow::Fell
+}
+
+// Random nested try/catch diffed against a reference oracle. gum has no Solidity
+// twin for internal try/catch (Solidity only guards external calls), so the
+// oracle is the reference. Each try becomes a hoisted self-call frame: this
+// exercises capturing the accumulator in, writing it back on success, and rolling
+// it back on a caught revert, plus revert propagation to the right catch level.
+#[test]
+fn fuzz_try_catch_control_flow_matches_reference() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping fuzz: no solc");
+            return;
+        }
+    };
+
+    for prog in 0..80u64 {
+        let mut rng = Rng(0x7c0f_0000 ^ prog);
+        let body = gen_ctrl_block(&mut rng, 3);
+        // The function declares CTRL_VARS accumulators, all seeded to a, and
+        // returns their sum, so a try that mutates several of them must write
+        // every one back for the total to match.
+        let decls: String = (0..CTRL_VARS).map(|i| format!("        mut u256 r{} = a\n", i)).collect();
+        let sum = (0..CTRL_VARS).map(|i| format!("r{}", i)).collect::<Vec<_>>().join(" + ");
+        // Half the programs put the body in a non-entry helper reached by an
+        // internal call, so the non-entry return/write-back lowering is covered
+        // too; the call is transparent, so the oracle is identical either way.
+        let via_helper = rng.next_u64() % 2 == 0;
+        let mut src = String::from("contract C:\n");
+        if via_helper {
+            src.push_str(&format!("    fn g(u256 a) -> u256:\n{}", decls));
+            render_ctrl(&body, 2, &mut src);
+            src.push_str(&format!("        return {sum}\n\n    export fn f(u256 a) -> u256:\n        return C.g(a)\n"));
+        } else {
+            src.push_str(&format!("    export fn f(u256 a) -> u256:\n{}", decls));
+            render_ctrl(&body, 2, &mut src);
+            src.push_str(&format!("        return {sum}\n"));
+        }
+
+        let mut db: Db = CacheDB::new(EmptyDB::default());
+        let c = deploy(&mut db, gum_creation_bytecode(&src, &solc, false));
+
+        for _ in 0..16 {
+            let a = U256::from(rng.next_u64() % 25);
+            let mut d = selector("f(uint256)").to_vec();
+            d.extend_from_slice(&a.to_be_bytes::<32>());
+            let r = call(&mut db, c, d);
+            let mut vars = [a; CTRL_VARS];
+            let expected = match eval_ctrl(&body, a, &mut vars) {
+                CtrlFlow::Fell => vars.iter().copied().fold(U256::ZERO, |x, y| x + y),
+                CtrlFlow::Returned(v) => v,
+                CtrlFlow::Reverted => {
+                    assert!(!r.success, "prog {}: a={} expected revert got success\nsrc:\n{}", prog, a, src);
+                    continue;
+                }
+            };
+            assert!(r.success, "prog {}: a={} expected {} got revert\nsrc:\n{}", prog, a, expected, src);
+            assert_eq!(U256::from_be_slice(&r.output), expected, "prog {}: a={} value diverged\nsrc:\n{}", prog, a, src);
+        }
+    }
+}
+
+// A try body that both mutates a captured local and returns, inside a non-entry
+// helper called internally. Regression for a silent try-downgrade the control-flow
+// fuzzer surfaced: this shape could not be hoisted, so it stayed on the inline path
+// that cannot catch an internal revert, and the assert reverted the whole call
+// instead of reaching the catch. Both the return path and the caught path must work.
+#[test]
+fn try_that_returns_and_writes_back_is_caught_through_an_internal_call() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = include_str!("fixtures/gum_try_internal_return.gum");
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+    let call_f = |db: &mut Db, a: u64| -> (bool, U256) {
+        let mut d = selector("f(uint256)").to_vec();
+        d.extend_from_slice(&U256::from(a).to_be_bytes::<32>());
+        let r = call(db, c, d);
+        (r.success, U256::from_be_slice(&r.output))
+    };
+    // a < 2: assert holds, the try returns r = a + 4 from inside the frame.
+    assert_eq!(call_f(&mut db, 0), (true, U256::from(4u64)));
+    assert_eq!(call_f(&mut db, 1), (true, U256::from(5u64)));
+    // a >= 2: the assert reverts inside the try, the frame rolls r back to a, the
+    // catch runs (r = a + 3) and the helper returns it. A revert here would mean
+    // the catch was silently skipped.
+    assert_eq!(call_f(&mut db, 5), (true, U256::from(8u64)));
+    assert_eq!(call_f(&mut db, 20), (true, U256::from(23u64)));
+}
+
+// A try body that mutates two variables of different types (a u256 and a u8) and
+// returns a value of a third type (String). Exercises the multi-field, mixed-type
+// write-back tuple plus a differently-typed return, all in one try: on the caught
+// path both variables roll back and the write-back tuple carries their post-catch
+// values, on the return path the String propagates out.
+#[test]
+fn try_writes_back_multiple_mixed_type_variables_and_returns_another_type() {
+    let solc = match solc_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let src = include_str!("fixtures/gum_try_multi_writeback.gum");
+    let mut db: Db = CacheDB::new(EmptyDB::default());
+    let c = deploy(&mut db, gum_creation_bytecode(src, &solc, false));
+    let call_f = |db: &mut Db, a: u64| -> (bool, String) {
+        let mut d = selector("f(uint256)").to_vec();
+        d.extend_from_slice(&U256::from(a).to_be_bytes::<32>());
+        let r = call(db, c, d);
+        // Decode an ABI string return: [offset][len][bytes].
+        let len = U256::from_be_slice(&r.output[32..64]).to::<usize>();
+        (r.success, String::from_utf8(r.output[64..64 + len].to_vec()).unwrap())
+    };
+    // a < 3: assert holds, the try returns the String directly.
+    assert_eq!(call_f(&mut db, 0), (true, "returned".to_string()));
+    // a >= 3: the assert reverts inside the try, count rolls back to a, the catch
+    // runs (count = a + 100) and the write-back carries it out; f returns its text.
+    assert_eq!(call_f(&mut db, 5), (true, "105".to_string()));
+    assert_eq!(call_f(&mut db, 42), (true, "142".to_string()));
+}
+
 // Narrow signed integers in every container must round-trip through a read +
 // checked-arithmetic exactly as Solidity: a negative iN is read sign-extended, so
 // its underflow is caught, not silently wrapped. A regression for the bug the
