@@ -79,8 +79,8 @@ contract ERC20:
         Account spender = Message.sender()
         u256 current_allowance = self.allowances[from][spender]
         
-        // 115792089237316195423570985008687907853269984665640564039457584007913129639935 is used for infinite allowance
-        if current_allowance != 115792089237316195423570985008687907853269984665640564039457584007913129639935:
+        
+        if current_allowance != u256.max():
             if current_allowance < value:
                 revert ERC20Errors.ERC20InsufficientAllowance(spender, current_allowance, value)
             self.allowances[from][spender] = current_allowance - value
@@ -90,7 +90,7 @@ contract ERC20:
             
         u256 from_balance = self.balances[from]
         if from_balance < value:
-            revert ERC20InsufficientBalance(from, from_balance, value)
+            revert ERC20Errors.ERC20InsufficientBalance(from, from_balance, value)
             
         self.balances[from] = from_balance - value
         self.balances[to] = self.balances[to] + value
@@ -100,7 +100,7 @@ contract ERC20:
 
     export fn _mint(Account account, u256 value):
         if account == Account(0):
-            revert ERC20InvalidReceiver(account)
+            revert ERC20Errors.ERC20InvalidReceiver(account)
             
         self.total_supply = self.total_supply + value
         self.balances[account] = self.balances[account] + value
@@ -108,11 +108,11 @@ contract ERC20:
 
     export fn _burn(Account account, u256 value):
         if account == Account(0):
-            revert ERC20InvalidSender(account)
-            
+            revert ERC20Errors.ERC20InvalidSender(account)
+
         u256 account_balance = self.balances[account]
         if account_balance < value:
-            revert ERC20InsufficientBalance(account, account_balance, value)
+            revert ERC20Errors.ERC20InsufficientBalance(account, account_balance, value)
             
         self.balances[account] = account_balance - value
         self.total_supply = self.total_supply - value

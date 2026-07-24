@@ -1,0 +1,14 @@
+use gum.defaults.pow
+use gum.defaults.sqrt
+use gum.defaults.gcd
+use gum.defaults.average
+
+contract App:
+    export fn f_pow(u256 b, u256 n) -> u256:
+        return pow(b, n)
+    export fn f_sqrt(u256 x) -> u256:
+        return sqrt(x)
+    export fn f_gcd(u256 a, u256 b) -> u256:
+        return gcd(a, b)
+    export fn f_avg(u256 a, u256 b) -> u256:
+        return average(a, b)

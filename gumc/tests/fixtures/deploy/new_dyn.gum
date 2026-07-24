@@ -23,5 +23,5 @@ contract Deployer:
     Account last
 
     export fn make(String n, u256 s, String sym) -> Account:
-        Deployer.last = new Token(n, s, sym)
+        Deployer.last = Token.new(n, s, sym)
         return Deployer.last

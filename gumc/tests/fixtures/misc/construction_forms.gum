@@ -1,0 +1,57 @@
+class Point:
+    u256 x
+    u256 y
+
+    fn new(self, u256 a, u256 b):
+        self.x = a
+        self.y = b
+
+    fn origin(self):
+        self.x = 0
+        self.y = 0
+
+    fn diag(self, u256 v):
+        self.x = v
+        self.y = v
+
+    fn unit() -> Point:
+        return Point.new(1, 1)
+
+    fn sum(self) -> u256:
+        return self.x + self.y
+
+class Box(All <T>):
+    T value
+
+    fn new(self, T v):
+        self.value = v
+
+    fn get(self) -> T:
+        return self.value
+
+    fn tag() -> u256:
+        return 7
+
+contract C:
+    export fn from_new() -> u256:
+        var p = Point.new(3, 4)
+        return p.sum()
+
+    export fn from_origin() -> u256:
+        var p = Point.origin()
+        return p.sum() + 7
+
+    export fn from_diag() -> u256:
+        var p = Point.diag(5)
+        return p.sum()
+
+    export fn from_factory() -> u256:
+        var p = Point.unit()
+        return p.sum()
+
+    export fn generic_ctor() -> u256:
+        var b = Box(u256).new(42)
+        return b.get()
+
+    export fn generic_assoc() -> u256:
+        return Box(u256).tag()

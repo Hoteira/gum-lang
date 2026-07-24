@@ -2,7 +2,7 @@ use gum.defaults.Account
 
 class P:
     i32 s
-    fn new(i32 v):
+    fn new(self, i32 v):
         self.s = v
 
 contract C:

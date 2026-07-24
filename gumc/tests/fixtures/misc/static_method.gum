@@ -1,0 +1,20 @@
+class Point:
+    u256 x
+    u256 y
+
+    fn build(self, u256 a, u256 b):
+        self.x = a
+        self.y = b
+
+    fn origin(self):
+        self.x = 0
+        self.y = 0
+
+contract C:
+    export fn go() -> u256:
+        var p = Point.build(7, 5)
+        return p.x + p.y
+
+    export fn zero() -> u256:
+        var p = Point.origin()
+        return p.x + p.y + 1

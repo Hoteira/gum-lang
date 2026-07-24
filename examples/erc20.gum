@@ -125,7 +125,7 @@ contract ERC20:
 
     fn _spendAllowance(Account owner, Account spender, u256 value):
         u256 currentAllowance = ERC20.allowance(owner, spender)
-        if currentAllowance != 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff:
+        if currentAllowance != u256.max():
             if currentAllowance < value:
                 revert IERC20Errors.ERC20InsufficientAllowance(spender, currentAllowance, value)
             ERC20._approveWithEmit(owner, spender, currentAllowance - value, false)

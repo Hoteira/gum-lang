@@ -20,7 +20,10 @@ pub fn preprocess(source: &str) -> Result<String, String> {
 
         if stripped.is_empty() || stripped.starts_with("//") {
             let (code, comment) = split_trailing_comment(raw_line);
-            lines.push(OutLine { code: code.to_string(), comment: comment.map(str::to_string) });
+            lines.push(OutLine {
+                code: code.to_string(),
+                comment: comment.map(str::to_string),
+            });
             continue;
         }
 
@@ -29,7 +32,10 @@ pub fn preprocess(source: &str) -> Result<String, String> {
         if let Some(header_indent) = unsafe_header_indent {
             if indent > header_indent {
                 let (code, comment) = split_trailing_comment(raw_line);
-                lines.push(OutLine { code: code.trim_end().to_string(), comment: comment.map(str::to_string) });
+                lines.push(OutLine {
+                    code: code.trim_end().to_string(),
+                    comment: comment.map(str::to_string),
+                });
                 continue;
             }
             push_closer(&mut lines);
@@ -78,7 +84,10 @@ pub fn preprocess(source: &str) -> Result<String, String> {
             emitted.push_str(code_trimmed);
             emitted.push(';');
         }
-        lines.push(OutLine { code: emitted, comment: comment.map(str::to_string) });
+        lines.push(OutLine {
+            code: emitted,
+            comment: comment.map(str::to_string),
+        });
     }
 
     if unsafe_header_indent.is_some() {
@@ -106,9 +115,6 @@ pub fn preprocess(source: &str) -> Result<String, String> {
     Ok(out)
 }
 
-// A parent-list attribute, [Owned] on its own line above a class.
-// It gets no trailing ';' unlike every other code line: parser/mod.rs splits top-level declarations at ';', so one here would tear the attribute off the class it annotates.
-// Nothing else is written as a line that both opens with '[' and closes with ']', so this cannot swallow a real statement.
 fn is_attribute(code: &str) -> bool {
     code.starts_with('[') && code.ends_with(']')
 }
@@ -117,8 +123,6 @@ fn leading_indent(line: &str) -> usize {
     line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
 }
 
-// Splits a line into (code, Some(comment)) if it has a top-level "//" that is
-// not inside a string literal; comments fully inside a string are left alone.
 fn split_trailing_comment(line: &str) -> (&str, Option<&str>) {
     let mut in_string = false;
     let bytes = line.as_bytes();

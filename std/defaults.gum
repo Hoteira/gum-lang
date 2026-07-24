@@ -1,133 +1,125 @@
 class Serializable:
-    // Marker: gives a shape for the synthesized serialize()
+    
 
-// Marker trait for types that can be hashed in mappings
+
 class Hashable:
-    // Marker: constrains HashMap's key parameter
+    
 
-// An EVM address.
-//
-// Account's interesting methods are intrinsics, not declared here: they
-// compile straight to EVM opcodes and precompiles rather than to calls on this
-// class, so they read live chain state instead of a field. This class exists to
-// give the type a name and a serializable shape.
-//
-// a.balance()        -> u256     the account's wei balance (BALANCE)
-// a.code.len()       -> u256     the account's bytecode size in bytes (EXTCODESIZE)
-// a.pay(amount)      -> bool     send ETH; hands you the success flag to check
-// a.transfer(amount)             send ETH; reverts on failure
-// a.delegated_to()   -> Account  EIP-7702 delegate, or 0 if none
-// a.is_delegated()   -> bool
+
+
+
+
+
+
+
+
+
+
+
+
+
 [Serializable]
 class Account:
     u256 address
 
-    fn new(mut u256 starting_balance):
+    fn new(self, u256 addr):
+        self.address = addr
 
 class String:
     u64 length
-    // The actual bytes follow the length in memory, managed via Yul by the compiler.
+    
 
-// A dynamically-sized byte string, ABI-encoded as Solidity bytes. Same
-// in-memory shape as String: a u64 length (high 8 bytes of word 0), then the
-// raw bytes at +32. Codegen decodes/encodes it on the dynamic ABI path.
+
+
+
 class Bytes:
     u64 length
 
-// The message this call received: who sent it, what they attached, and who is
-// running. All three are properties of this execution frame, not of the
-// transaction: every CALL makes a new one, and a DELEGATECALL inherits the
+
+
+
 class Message:
     Account sender
     u256 value
 
     fn sender() -> Account:
-        // Intercepted by codegen: compiles to the CALLER opcode
-        return self.sender
-
-    fn value() -> u256:
-        // Intercepted by codegen: compiles to the CALLVALUE opcode
-        return self.value
-
-    fn address() -> Account:
-        // Intercepted by codegen: compiles to the ADDRESS opcode. This body is
-        // never executed; the return is a placeholder so it still type-checks.
-        //
-        // Frame-scoped like sender() and value(), which is why it lives here:
-        // under DELEGATECALL this is the calling contract's address.
         return 0
 
-// The block this transaction is in. Unlike Message, these are identical in
-// every frame of the transaction.
+    fn value() -> u256:
+        return 0
+
+    fn address() -> Account:
+        return 0
+
+
+
 class Block:
     u256 timestamp
     u256 number
 
     fn timestamp() -> u256:
-        // Intercepted by codegen: compiles to the TIMESTAMP opcode
-        return self.timestamp
+        return 0
 
     fn number() -> u256:
-        // Intercepted by codegen: compiles to the NUMBER opcode
-        return self.number
+        return 0
 
 fn keccak256([u8] data) -> u256:
-    // Intercepted by codegen to compile to keccak256 opcode
+    
     return 0
 
 fn ecrecover(u256 hash, u8 v, u256 r, u256 s) -> Account:
-    // Intercepted by codegen. The stub must still type-check: Account's
-    // constructor takes a starting balance, so new Account() (as this
-    // previously read) made the whole module fail to import.
-    return new Account(0)
+    
+    
+    
+    return Account.new(0)
 
-// Precompile-backed primitives, called as Crypto.<method>(...).
-//
-// verify_p256 verifies an ECDSA signature over the secp256r1 (P-256) curve,
+
+
+
 class Crypto:
     fn verify_p256(u256 hash, u256 r, u256 s, u256 qx, u256 qy) -> bool
 
 class HashMap(Hashable <K>, All <V>):
     fn set(K key, V value):
         unsafe:
-            // Using keccak256 as native EVM opcode is incredibly cheaper than sha256
-            // We hash the slot and the key to avoid collisions
+            
+            
             let slot := keccak256(key, 0x00)
             sstore(slot, value)
 
     fn get(K key) -> V:
-        // Only reached if HashMap.get() is somehow called without codegen's
-        // direct gum_hash_slot interception (see Translator::translate_method_call):
-        // that path uses the field's real reserved storage slot; this generic
-        // body's slot 0x00 is just a placeholder so it still type-checks.
+        
+        
+        
+        
         mut u256 val = 0
         unsafe:
             let slot := keccak256(key, 0x00)
             val := sload(slot)
         return val
 
-// A real growable array: [length: 32][capacity: 32][data: capacity32...],
-// all elements stored as plain 32-byte words (same simplification the rest
-// of this compiler makes for arrays generally).
+
+
+
 class Vec(All <T>):
     u256 length
     u256 capacity
 
-    fn new():
+    fn new(self):
         self.length = 0
         self.capacity = 0
 
-    fn len() -> u256:
+    fn len(self) -> u256:
         return self.length
 
-    fn get(u256 index) -> T:
+    fn get(self, u256 index) -> T:
         assert(index < self.length, "Vec: index out of bounds")
         mut u256 result = 0
         unsafe:
             result := mload(add(add(self, 64), mul(index, 32)))
         return result
 
-    fn push(T value) -> Vec(T):
+    fn push(self, T value) -> Vec(T):
         mut u256 result = self
         unsafe:
             let len := mload(self)
@@ -149,3 +141,73 @@ class Vec(All <T>):
             mstore(add(result, add(64, mul(len, 32))), value)
             mstore(result, add(len, 1))
         return result
+
+    fn is_empty(self) -> bool:
+        return self.length == 0
+
+    fn set(self, u256 index, T value):
+        assert(index < self.length, "Vec: index out of bounds")
+        unsafe:
+            mstore(add(add(self, 64), mul(index, 32)), value)
+
+    fn pop(self) -> T:
+        assert(self.length > 0, "Vec: pop from empty")
+        mut u256 result = 0
+        unsafe:
+            let len := mload(self)
+            result := mload(add(add(self, 64), mul(sub(len, 1), 32)))
+            mstore(self, sub(len, 1))
+        return result
+
+fn min(u256 a, u256 b) -> u256:
+    if a < b:
+        return a
+    return b
+
+fn max(u256 a, u256 b) -> u256:
+    if a > b:
+        return a
+    return b
+
+fn clamp(u256 x, u256 lo, u256 hi) -> u256:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+fn average(u256 a, u256 b) -> u256:
+    if a > b:
+        return b + (a - b) / 2
+    return a + (b - a) / 2
+
+fn pow(u256 base, u256 power) -> u256:
+    mut u256 result = 1
+    mut u256 b = base
+    mut u256 n = power
+    while n > 0:
+        if n % 2 == 1:
+            result = result * b
+        n = n / 2
+        if n > 0:
+            b = b * b
+    return result
+
+fn sqrt(u256 x) -> u256:
+    if x == 0:
+        return 0
+    mut u256 z = x
+    mut u256 y = x / 2 + 1
+    while y < z:
+        z = y
+        y = (x / y + y) / 2
+    return z
+
+fn gcd(u256 a, u256 b) -> u256:
+    mut u256 x = a
+    mut u256 y = b
+    while y > 0:
+        mut u256 t = y
+        y = x % y
+        x = t
+    return x

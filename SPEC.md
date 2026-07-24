@@ -18,9 +18,21 @@ Storage layout details live in [STORAGE.md](STORAGE.md).
 - **Identifiers** match `[A-Za-z_][A-Za-z0-9_]*` and are not keywords.
 - **Naming convention is load-bearing:** *types* start with an uppercase
   letter (`Account`, `Vec`, `TokenState`); *values* (locals, params, fields,
-  functions) are lowercase/snake_case. The parser relies on this to
-  distinguish a constructor call `new Counter(start)` from a generic
-  instantiation `new Vec(u256)`. Do not name a value with a leading capital.
+  functions) are lowercase/snake_case. The parser relies on this to tell a
+  construction `Counter.new(start)` (a `.new(...)` on a type) from a method call
+  `counter.get()` (on a value). Do not name a value with a leading capital.
+- **Construction** is an instance method (one taking `self`) called on the *type*:
+  `Type.new(args)` allocates and initializes an instance. The name `new` is only a
+  convention — any self-taking function works (`Point.origin()`), and there is no
+  `new` keyword or built-in constructor. A plain class allocates in memory, a
+  contract deploys via `CREATE`; generics work too, e.g. `Vec(u256).new()`.
+- **Call forms:** a free (top-level) function is called `f(args)`; an associated
+  function (declares no `self`) is called on the type, `Type.f(args)`; an instance
+  method (declares `self`) is called on a value, `value.m(args)`, or on the type to
+  construct. Nothing is `pub` — everything is visible by default.
+- **Numeric bounds:** `T.max()` / `T.min()` are compile-time constants for any
+  integer type (`u256.max()`, `u8.max()`, `i8.min()`, ...), so contracts never
+  hand-write a 256-bit sentinel.
 - **Number literals** are decimal (`42`) or hex (`0x2a`). All integer literals
   are typed `u256` until assigned/coerced to a narrower type.
 - **String literals** `"..."` are `String` values (length-prefixed, ABI-encoded as `string`).
@@ -199,7 +211,7 @@ contract Factory:
     Account last
 
     export fn make(u256 x) -> Account:
-        Factory.last = new Child(x)      # a real deployment
+        Factory.last = Child.new(x)      # a real deployment
         return Factory.last
 ```
 
@@ -212,7 +224,7 @@ checks that for you, so a failed deploy can never be mistaken for an address.)
 
 Constructor arguments may be `String`/`Bytes` as well as scalars. They are
 encoded head/tail exactly as the child's decoder expects, so
-`new Token("Gum Token", supply, "GUM")` works:
+`Token.new("Gum Token", supply, "GUM")` works:
 
 ```
 contract Token:
@@ -258,12 +270,41 @@ extern class IERC20:
     fn transfer(Account to, u256 amount) -> bool
 ```
 
-Arguments share the encoder `new Child(...)` uses, and results share the
+Arguments share the encoder `Child.new(...)` uses, and results share the
 decoders that read constructor arguments, so neither pair can drift apart. A
 scalar return stays on a one-word fast path and costs nothing extra.
 
-Methods (`fn` inside a class) take an implicit `self`. A `fn new(...)` is a
-constructor invoked by `new ClassName(args)`.
+Functions inside a class come in two kinds, told apart by whether they declare
+`self` as their first parameter — the same distinction Rust draws, with no magic
+`new` and no scanning of the body:
+
+- **Instance method** — declares `self` (`fn balance(self) -> u256`). `self` is a
+  real first argument, so the function is called on a value, `x.balance()`, and
+  reads/writes that value through `self.field`.
+- **Associated function** — no `self` (`fn square(u256 a) -> u256`). It is called
+  on the type, `Math.square(3)`, and returns its declared value directly, exactly
+  like a free function.
+
+A **constructor is not special**: it is any instance method called on the *type*
+rather than a value. `Point.new(1, 2)`, `Point.origin()`, `Vec(u256).new()` —
+each allocates a fresh instance, runs the named function with `self` bound to it,
+and yields the instance. So a constructor is just
+
+```
+class Point:
+    u256 x
+    u256 y
+    fn new(self, u256 a, u256 b):   # ordinary self-taking function...
+        self.x = a
+        self.y = b                  # ...called as Point.new(1, 2) to construct
+```
+
+The name `new` carries no meaning of its own; any self-taking function works as a
+constructor, and a class may have several. Because construction allocates the
+concrete type, an inherited constructor builds the child (with the child's
+fields), not the parent. A `contract` is the exception: it is a storage singleton,
+so its methods reach storage through an implicit `self` and need not declare one,
+and `SomeContract.new(args)` deploys via `CREATE` rather than allocating memory.
 
 ### Recovering from a failed call (`try` / `catch`)
 
@@ -367,8 +408,12 @@ contract Vault:
         return Vault.Ledger.cap()   # 100, Ledger's version
 ```
 
-A bare class name is not a receiver: `Ledger.cap()` is a compile error (call it
-as `Vault.Ledger.cap()` or on an instance).
+A bare parent-class name does not reach into the current contract's storage: for a
+`self`-taking method, `Ledger.m()` would *construct* a fresh `Ledger` (§methods),
+not run `m` on this contract. To run a named ancestor's version on the contract's
+own storage, use the qualified form `Vault.Ledger.m()`. (An associated function —
+one with no `self`, like `cap` above — has no receiver either way, so
+`Ledger.cap()` simply returns `100`.)
 
 ### Interfaces as parents (`implements`)
 
@@ -634,7 +679,7 @@ Indexing is bounds-checked in memory as well as in storage (`Panic(0x32)` under
 
 A `class` whose fields are all scalars crosses the ABI as a `tuple`, as an
 argument, a return, or a constructor argument, including one passed to
-`new Child(...)`. Like an array, it is converted rather than copied, and for two
+`Child.new(...)`. Like an array, it is converted rather than copied, and for two
 independent reasons:
 
 | | ABI (the wire) | gum memory |
@@ -670,7 +715,7 @@ copies its bytes rather than storing the pointer.
 offset and no count: `[P; 2]` of a one-field tuple makes the next argument start
 at byte 64, not 32.
 
-Where it works: arguments, returns, constructor arguments, `new Child(...)`
+Where it works: arguments, returns, constructor arguments, `Child.new(...)`
 arguments, and `interface` calls, the last three share one encoder, so they
 cannot drift apart.
 
@@ -709,7 +754,7 @@ is a compile error. `--rich-reverts` is independent of this, it governs
 whether *arithmetic* and *bounds* failures carry `Panic(uint256)` data.
 
 A custom error's fields are a normal ABI argument list, encoded by the same code
-the `interface` and `new Child(...)` paths use, so an array, a nested array or a
+the `interface` and `Child.new(...)` paths use, so an array, a nested array or a
 `tuple` field is laid out head/tail exactly as Solidity lays it out and `ethers`
 and `viem` decode it from the ABI JSON.
 
@@ -801,7 +846,7 @@ log(TokenLogs.Transfer, indexed(from), indexed(to), amount)
   `String` or an array would have to be hashed to fit; that is a compile error
   rather than a guess.
 - The data area is a normal ABI argument list, encoded by the same code the
-  `interface` and `new Child(...)` paths use, so a `String`, an array, a nested
+  `interface` and `Child.new(...)` paths use, so a `String`, an array, a nested
   array or a `tuple` in an event is laid out head/tail exactly as Solidity lays
   it out.
 

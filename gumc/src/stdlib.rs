@@ -9,8 +9,6 @@ pub fn lookup(module: &str) -> Option<&'static str> {
     MODULES.iter().find(|(k, _)| *k == key).map(|(_, src)| *src)
 }
 
-// Splits a use path into the longest prefix that names a module, plus the symbol after it.
-// Tried longest-first so a module whose name happens to prefix another still wins, and so use gum.defaults with no symbol is a module import of the whole thing.
 pub fn split_module(path: &str) -> Option<(String, Option<String>)> {
     if lookup(path).is_some() {
         return Some((path.to_string(), None));
@@ -22,7 +20,6 @@ pub fn split_module(path: &str) -> Option<(String, Option<String>)> {
     None
 }
 
-// Every module path, for the "available" line on a bad import.
 pub fn known_modules() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = MODULES.iter().map(|(k, _)| *k).collect();
     v.sort_unstable();
@@ -33,7 +30,6 @@ pub fn known_modules() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    // The spellings contracts actually write. Each names a symbol out of gum.defaults, not a file, which is the whole point of split_module.
     #[test]
     fn the_paths_contracts_write_all_split_into_module_and_symbol() {
         for (p, want) in [
@@ -52,7 +48,10 @@ mod tests {
 
     #[test]
     fn a_bare_module_path_has_no_symbol() {
-        assert_eq!(split_module("gum.defaults"), Some(("gum.defaults".to_string(), None)));
+        assert_eq!(
+            split_module("gum.defaults"),
+            Some(("gum.defaults".to_string(), None))
+        );
     }
 
     #[test]

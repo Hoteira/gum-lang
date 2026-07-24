@@ -4,7 +4,7 @@ use gum.defaults.Message
 class Ledger:
     u256 total
 
-    export fn credit(u256 v):
+    export fn credit(self, u256 v):
         self.total = self.total + v
 
     fn cap() -> u256:
@@ -14,7 +14,7 @@ class Ledger:
 class Owned:
     Account owner
 
-    export fn claim():
+    export fn claim(self):
         self.owner = Message.sender()
 
 [Owned]

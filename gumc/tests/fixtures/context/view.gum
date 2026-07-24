@@ -8,8 +8,8 @@ contract V:
     u256 total
     HashMap(Account, u256) balances
 
-    // Makes the contract external-call-bearing, so every entry point would
-    // otherwise carry a reentrancy guard.
+    
+    
     export fn forward(Account t, u256 x) -> bool:
         V.total = V.total + x
         return ISink(t).poke(x)

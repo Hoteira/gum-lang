@@ -1,0 +1,20 @@
+use gum.defaults.String
+
+contract App:
+    export fn cat(String a, String b) -> String:
+        return a.concat(b)
+
+    export fn same(String a, String b) -> bool:
+        return a == b
+
+    export fn at(String a, u256 i) -> u8:
+        return a[i]
+
+    export fn cut(String a, u256 s, u256 e) -> String:
+        return a.slice(s, e)
+
+    export fn len(String a) -> u256:
+        return a.length
+
+    export fn numstr(u256 n) -> String:
+        return n.to_string()

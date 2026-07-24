@@ -1,17 +1,22 @@
 pub mod abi;
 pub mod layout;
 pub mod mutability;
+pub mod tr_binop;
+pub mod tr_codec;
+pub mod tr_extcall;
+pub mod tr_field;
+pub mod tr_methodcall;
+pub mod tr_storage;
 pub mod translator;
+pub mod yul;
 
 use crate::ast::*;
 use crate::semantic::TypeChecker;
 use abi::AbiGenerator;
 use layout::{LayoutEngine, immutable_key};
 use std::collections::{HashMap, HashSet};
-use translator::{
-    Ctx, SelfCtx, Translator, immutable_deploy_local, immutable_local, is_enum_type, is_str_type,
-    is_struct_type,
-};
+use translator::{Ctx, SelfCtx, Translator};
+use yul::{immutable_deploy_local, immutable_local, is_enum_type, is_str_type, is_struct_type};
 
 pub trait Backend {
     fn generate(
@@ -38,7 +43,6 @@ fn hash_slot(key: &str) -> String {
     s
 }
 
-// same trick namespaced storage uses
 fn once_flag_slot(fn_name: &str) -> String {
     hash_slot(&format!("gum.once:{}", fn_name))
 }
@@ -47,9 +51,6 @@ fn reentrancy_lock_slot() -> String {
     hash_slot("gum.reentrancy")
 }
 
-// A short, Yul-identifier-safe name for a concrete type, used to build
-// specialized function names for monomorphized generic classes
-// (e.g. Vec(u256)'s push becomes Vec_u256_push).
 pub fn type_suffix(t: &Type) -> String {
     match t {
         Type::Primitive(name) => name.clone(),
@@ -63,8 +64,6 @@ pub fn generic_suffix(args: &[Type]) -> String {
     args.iter().map(type_suffix).collect::<Vec<_>>().join("_")
 }
 
-// Replaces occurrences of a generic class's own parameter names (e.g. Vec's
-// T, HashMap's K/V) with the concrete types from one specific instantiation.
 fn substitute_type(t: &Type, subst: &HashMap<String, Type>) -> Type {
     match t {
         Type::Primitive(name) => subst.get(name).cloned().unwrap_or_else(|| t.clone()),
@@ -82,6 +81,7 @@ fn substitute_method(m: &FnDecl, subst: &HashMap<String, Type>) -> FnDecl {
         modifiers: m.modifiers.clone(),
         attributes: m.attributes.clone(),
         name: m.name.clone(),
+        has_self: m.has_self,
         parameters: m
             .parameters
             .iter()
@@ -140,7 +140,6 @@ fn scan_stmts_for_generics(
     }
 }
 
-// Finds every concrete instantiation of every generic class actually used in the program
 fn collect_generic_instantiations(
     program: &Program,
     type_checker: &TypeChecker,
@@ -150,7 +149,7 @@ fn collect_generic_instantiations(
         for f in &class_decl.fields {
             note_generic(&f.type_def, &mut found);
         }
-        // Deliberately not scanning method parameter/return types here.
+
         for m in &class_decl.methods {
             scan_stmts_for_generics(&m.body, &mut found);
         }
@@ -169,9 +168,6 @@ fn collect_generic_instantiations(
     found
 }
 
-// Every contract these method bodies deploy with new X(...), in first-seen
-// order. Each one's creation code has to be embedded as a sub-object of the
-// deployer, so codegen needs to know the set before it emits the parent.
 fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Vec<String>) {
     fn expr(e: &Expr, tc: &TypeChecker, out: &mut Vec<String>) {
         match e {
@@ -190,6 +186,7 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
                     expr(a, tc, out);
                 }
             }
+            Expr::StaticCall { args, .. } => args.iter().for_each(|a| expr(a, tc, out)),
             Expr::FnCall { args, .. } => args.iter().for_each(|a| expr(a, tc, out)),
             Expr::MethodCall { base, args, .. } => {
                 expr(base, tc, out);
@@ -297,21 +294,14 @@ fn collect_deployed_contracts(methods: &[FnDecl], tc: &TypeChecker, out: &mut Ve
     }
 }
 
-// A top-level function is externally callable iff it is marked export.
-// Everything else is an internal helper.
 fn is_exported(f: &FnDecl) -> bool {
     f.modifiers.iter().any(|m| m == "export")
 }
 
-// A [Test] function is a runnable test: gumc --test deploys and calls it.
-// It is treated as an entry point so it gets a dispatcher selector without
-// needing export; a plain fn in the same contract stays an internal helper.
 pub(crate) fn is_test(f: &FnDecl) -> bool {
     f.attributes.iter().any(|a| a == "Test")
 }
 
-// A payable function may receive ETH; every other entry point rejects any
-// value-bearing call.
 fn is_payable(f: &FnDecl) -> bool {
     f.modifiers.iter().any(|m| m == "payable")
 }
@@ -320,9 +310,6 @@ fn is_unsafe(f: &FnDecl) -> bool {
     f.modifiers.iter().any(|m| m == "unsafe")
 }
 
-// receive and fallback are entry points reached by shape of the call
-// rather than by selector, so they never appear in the dispatcher's switch and
-// have no ABI selector of their own:
 fn is_receive(f: &FnDecl) -> bool {
     is_exported(f) && f.name == "receive"
 }
@@ -335,44 +322,24 @@ fn is_selector_entry(f: &FnDecl) -> bool {
     (is_exported(f) || is_test(f)) && !is_receive(f) && !is_fallback(f)
 }
 
-// A synthesized try-scope thunk (produced by hoist_try_blocks). It is a real
-// selector entry so a self-call can reach it, but it is not part of the public
-// ABI and its capability guard makes a forged self-call revert.
 fn is_try_thunk(f: &FnDecl) -> bool {
     f.attributes.iter().any(|a| a == "TryThunk")
 }
 
-// Transient slot holding the try-scope capability. A try site sets it only
-// immediately around its self-call; the thunk requires it and clears it. A
-// forged self-call routed through some arbitrary-call sink never sets it, so it
-// cannot reach a thunk body. Distinct from the reentrancy lock and the old
-// exception slot.
 pub(crate) const TRY_CAPABILITY_SLOT: &str =
     "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe";
 
-// Transient discriminator for a try body that both returns and writes back a
-// mutated variable. The thunk sets it to 1 on a real return and 0 on a
-// fall-through write-back, so the site can tell the two apart in returndata.
 pub(crate) const TRY_RETURNED_SLOT: &str =
     "0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd";
 
-// Rewrites every try/catch into a guarded self-call: the try body is lifted into
-// a synthesized entry fn and the site becomes a ScopedTryCall run in its own
-// frame, so any revert is caught and its state rolls back before catch runs.
 fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
     let mut thunks: Vec<FnDecl> = Vec::new();
     let mut counter = 0usize;
     for m in &mut class.methods {
-        // Names bound in the enclosing method (params + every local it declares).
-        // A try body only reads names in this set from the outer frame; those
-        // that are parameters are marshalled into the thunk as arguments.
         let mut base_locals: HashSet<String> =
             m.parameters.iter().map(|p| p.name.clone()).collect();
         collect_var_decls(&m.body, &mut base_locals);
-        // Explicitly-typed locals the method declares, so a try body that reads
-        // one can marshal it into the thunk the same way a parameter is. An
-        // inferred var local is absent here (this pass runs before type
-        // inference), so a body capturing one stays on the old inline path.
+
         let mut local_types: HashMap<String, Type> = HashMap::new();
         collect_var_types(&m.body, &mut local_types);
         let enclosing = EnclosingFn {
@@ -392,8 +359,6 @@ fn hoist_try_blocks(mut class: ClassDecl) -> ClassDecl {
     class
 }
 
-// What the try-hoisting pass needs to know about the function a try sits in, to
-// marshal captured parameters and locals and propagate a return out of the frame.
 struct EnclosingFn {
     params: Vec<Parameter>,
     return_type: Option<Type>,
@@ -412,9 +377,6 @@ fn hoist_in_body(
     }
 }
 
-// Decides whether a try body can be scoped into its own frame, and if so what it
-// captures and writes back. A body this pass can't marshal stays on the old
-// inline external-call path (returns None).
 fn plan_capture(
     try_body: &[Spanned<Statement>],
     base_locals: &HashSet<String>,
@@ -425,19 +387,11 @@ fn plan_capture(
     let mut refs: HashSet<String> = HashSet::new();
     body_idents(try_body, &mut refs);
 
-    // Outer names the body reads: base locals it references without re-binding.
     let captured: HashSet<&String> = refs
         .iter()
         .filter(|r| base_locals.contains(*r) && !inner.contains(*r))
         .collect();
 
-    // Resolve every captured name to a type and marshal it into the frame. A
-    // parameter's type comes from the signature; an enclosing local's from its
-    // explicit declaration. A captured name with no type here is an inferred
-    // var (or a loop/match binding) this pass can't marshal, so the whole try
-    // stays on the old inline path. Params keep signature order and locals sort
-    // by name, so the site, the thunk and the selector agree and the emitted
-    // bytecode stays reproducible.
     let param_names: HashSet<&String> = enclosing.params.iter().map(|p| &p.name).collect();
     let mut captures: Vec<Parameter> = enclosing
         .params
@@ -466,11 +420,6 @@ fn plan_capture(
     local_caps.sort_by(|a, b| a.name.cmp(&b.name));
     captures.extend(local_caps);
 
-    // Every captured variable the body reassigns has its new value travel back out
-    // of the frame. On the fall-through path the thunk returns them all as one ABI
-    // tuple, which the site decodes and reassigns. A return propagates separately (a
-    // transient flag tells the two apart), so a body may both return and write back
-    // any number of variables of any types.
     let mut assigned: HashSet<String> = HashSet::new();
     collect_assigned_idents(try_body, &mut assigned);
     let writeback: Vec<(String, Type)> = captures
@@ -480,10 +429,6 @@ fn plan_capture(
         .collect();
     let has_ret = body_has_return(try_body);
 
-    // A return inside the try must become the enclosing function's return, so the
-    // enclosing function needs a declared return type to encode/decode through. An
-    // entry propagates the thunk's returndata directly; a non-entry decodes it into
-    // its own return slot (handled at the site), so both are supported.
     if has_ret && enclosing.return_type.is_none() {
         return None;
     }
@@ -495,9 +440,6 @@ fn plan_capture(
     })
 }
 
-// The outcome of planning a try body's capture: which variables to marshal in
-// (parameters and explicitly-typed locals), whether a return propagates out, and
-// an optional single variable to write back.
 struct Capture {
     captures: Vec<Parameter>,
     has_ret: bool,
@@ -532,7 +474,6 @@ fn hoist_in_stmt(
             try_body,
             catch_body,
         } => {
-            // Hoist any nested trys in both branches first.
             hoist_in_body(try_body, base_locals, enclosing, thunks, counter);
             hoist_in_body(catch_body, base_locals, enclosing, thunks, counter);
             let Capture {
@@ -541,13 +482,13 @@ fn hoist_in_stmt(
                 writeback,
             } = match plan_capture(try_body, base_locals, enclosing) {
                 Some(p) => p,
-                // leave on the existing path
+
                 None => return,
             };
             let id = *counter;
             *counter += 1;
             let thunk_name = format!("__try_thunk_{}", id);
-            // The thunk body: capability guard, then the original try body.
+
             let guard = format!(
                 "{{\nif iszero(tload({slot})) {{ revert(0, 0) }}\ntstore({slot}, 0)\n}}",
                 slot = TRY_CAPABILITY_SLOT
@@ -557,20 +498,20 @@ fn hoist_in_stmt(
                 line: 0,
                 col: 0,
             }];
-            // When the body both returns and writes back, each real return is
-            // flagged so the site can distinguish it from the fall-through below.
+
             let combined = has_ret && !writeback.is_empty();
             if combined {
                 mark_returns_with_flag(try_body);
             }
             thunk_body.append(try_body);
-            // Fall-through: return the mutated variables as one ABI tuple so the
-            // site can decode and reassign them. In the combined case, clear the
-            // flag first to mark this as a fall-through rather than a real return.
+
             if !writeback.is_empty() {
                 if combined {
                     thunk_body.push(Spanned {
-                        node: Statement::UnsafeBlock(format!("{{ tstore({}, 0) }}", TRY_RETURNED_SLOT)),
+                        node: Statement::UnsafeBlock(format!(
+                            "{{ tstore({}, 0) }}",
+                            TRY_RETURNED_SLOT
+                        )),
                         line: 0,
                         col: 0,
                     });
@@ -585,8 +526,7 @@ fn hoist_in_stmt(
                 .iter()
                 .map(|p| (p.name.clone(), p.type_def.clone()))
                 .collect();
-            // Only a returning body needs a declared return type (its user returns
-            // encode through it); a write-back returns its tuple explicitly.
+
             let thunk_ret = if has_ret {
                 enclosing.return_type.clone()
             } else {
@@ -596,6 +536,7 @@ fn hoist_in_stmt(
                 modifiers: vec!["export".to_string()],
                 attributes: vec!["TryThunk".to_string()],
                 name: thunk_name.clone(),
+                has_self: false,
                 parameters: captures
                     .iter()
                     .map(|p| Parameter {
@@ -623,9 +564,6 @@ fn hoist_in_stmt(
     }
 }
 
-// Explicitly-typed locals a body declares, recursively. An inferred var (the
-// _infer sentinel) is skipped: its type isn't known until after this pass, so a
-// try capturing one stays on the old inline path. Loop/match bindings too.
 fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type>) {
     for s in body {
         match &s.node {
@@ -665,7 +603,6 @@ fn collect_var_types(body: &[Spanned<Statement>], out: &mut HashMap<String, Type
     }
 }
 
-// Names bound by a body: locals it declares, loop iterators, match payloads.
 fn collect_var_decls(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
     for s in body {
         match &s.node {
@@ -706,9 +643,6 @@ fn collect_var_decls(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
     }
 }
 
-// Bare-identifier assignment targets in a body: locals it writes (x = ..,
-// x += .., or a bitwise-flip on x). Storage (C.x) and elements (a[i]) are not
-// bare identifiers, so they are not collected.
 fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
     for s in body {
         match &s.node {
@@ -744,8 +678,7 @@ fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String
                 collect_assigned_idents(try_body, out);
                 collect_assigned_idents(catch_body, out);
             }
-            // A hoisted inner try writes its mutated variables back into this
-            // frame, so they count as assignments here too.
+
             Statement::ScopedTryCall {
                 writeback,
                 catch_body,
@@ -761,7 +694,6 @@ fn collect_assigned_idents(body: &[Spanned<Statement>], out: &mut HashSet<String
     }
 }
 
-// Whether a body executes a return anywhere in its own control flow.
 fn body_has_return(body: &[Spanned<Statement>]) -> bool {
     body.iter().any(|s| match &s.node {
         Statement::Return { .. } => true,
@@ -776,8 +708,7 @@ fn body_has_return(body: &[Spanned<Statement>]) -> bool {
             try_body,
             catch_body,
         } => body_has_return(try_body) || body_has_return(catch_body),
-        // A hoisted inner try that propagates a return forwards it out of this
-        // frame too, so the enclosing try must treat its body as returning.
+
         Statement::ScopedTryCall {
             propagate_return,
             catch_body,
@@ -787,10 +718,6 @@ fn body_has_return(body: &[Spanned<Statement>]) -> bool {
     })
 }
 
-// Prefix every direct return in a body with the returned-discriminator flag set
-// to 1, so a combined write-back thunk can tell a real return from a fall-through.
-// Nested trys are already their own frames (ScopedTryCall sets the flag at its own
-// propagate site), so they are left alone here.
 fn mark_returns_with_flag(body: &mut Vec<Spanned<Statement>>) {
     let mut i = 0;
     while i < body.len() {
@@ -799,7 +726,10 @@ fn mark_returns_with_flag(body: &mut Vec<Spanned<Statement>>) {
                 body.insert(
                     i,
                     Spanned {
-                        node: Statement::UnsafeBlock(format!("{{ tstore({}, 1) }}", TRY_RETURNED_SLOT)),
+                        node: Statement::UnsafeBlock(format!(
+                            "{{ tstore({}, 1) }}",
+                            TRY_RETURNED_SLOT
+                        )),
                         line: 0,
                         col: 0,
                     },
@@ -807,7 +737,9 @@ fn mark_returns_with_flag(body: &mut Vec<Spanned<Statement>>) {
                 i += 2;
                 continue;
             }
-            Statement::IfElse { if_body, else_body, .. } => {
+            Statement::IfElse {
+                if_body, else_body, ..
+            } => {
                 mark_returns_with_flag(if_body);
                 if let Some(e) = else_body {
                     mark_returns_with_flag(e);
@@ -821,7 +753,10 @@ fn mark_returns_with_flag(body: &mut Vec<Spanned<Statement>>) {
                     mark_returns_with_flag(&mut a.body);
                 }
             }
-            Statement::TryCatch { try_body, catch_body } => {
+            Statement::TryCatch {
+                try_body,
+                catch_body,
+            } => {
                 mark_returns_with_flag(try_body);
                 mark_returns_with_flag(catch_body);
             }
@@ -831,9 +766,6 @@ fn mark_returns_with_flag(body: &mut Vec<Spanned<Statement>>) {
     }
 }
 
-// Every identifier name read anywhere in a body (including the bases of property
-// and method access, which is safe: contract/namespace bases are never local
-// names, so they can't cause a false capture match).
 fn body_idents(body: &[Spanned<Statement>], out: &mut HashSet<String>) {
     for s in body {
         stmt_idents(&s.node, out);
@@ -904,10 +836,7 @@ fn stmt_idents(s: &Statement, out: &mut HashSet<String>) {
             body_idents(try_body, out);
             body_idents(catch_body, out);
         }
-        // A hoisted inner try reads its captured args and writes back its mutated
-        // variables in the enclosing frame, so an outer try around it must capture
-        // those names too, otherwise the outer thunk references a variable it was
-        // never handed. (The inner body itself is gone into its own thunk.)
+
         Statement::ScopedTryCall {
             args,
             writeback,
@@ -933,7 +862,9 @@ fn expr_idents(x: &Expr, out: &mut HashSet<String>) {
             out.insert(n.clone());
         }
         Expr::FnCall { args, .. } => args.iter().for_each(|a| expr_idents(a, out)),
-        Expr::Instantiation { args, .. } => args.iter().for_each(|a| expr_idents(a, out)),
+        Expr::Instantiation { args, .. } | Expr::StaticCall { args, .. } => {
+            args.iter().for_each(|a| expr_idents(a, out))
+        }
         Expr::PropertyAccess { base, .. } => expr_idents(base, out),
         Expr::MethodCall { base, args, .. } => {
             expr_idents(base, out);
@@ -960,9 +891,6 @@ fn expr_idents(x: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-// Message/Block params are synthesized from opcodes at the call
-// boundary rather than decoded from calldata (or from constructor args), so
-// they never occupy a slot in the ABI head.
 fn is_context_param(t: &Type) -> bool {
     matches!(t, Type::Primitive(n) if n == "Message" || n == "Block")
 }
@@ -989,7 +917,7 @@ fn compile_class_methods(
         }
 
         let mut params: Vec<String> = Vec::new();
-        if !is_global {
+        if !is_global && method.has_self {
             params.push("self".to_string());
         }
         params.extend(method.parameters.iter().map(|p| p.name.clone()));
@@ -1132,9 +1060,6 @@ impl EvmYulBackend {
         abi_gen: &AbiGenerator,
         stack: &mut Vec<String>,
     ) -> Result<(String, String), String> {
-        // Lift every try/catch into a guarded self-call thunk before anything
-        // downstream (dispatcher, mutability, method compile) looks at the
-        // methods, so they all see the transformed form.
         let hoisted = hoist_try_blocks(global_class.clone());
         let global_class = &hoisted;
         {
@@ -1183,6 +1108,12 @@ impl EvmYulBackend {
                 .map(|f| f.name.clone())
                 .collect();
 
+            let free_fns: HashSet<String> = type_checker
+                .loaded_functions
+                .iter()
+                .map(|f| f.name.clone())
+                .collect();
+
             let mut yul = format!(
                 "object \"{}\" {{
 ",
@@ -1197,8 +1128,13 @@ impl EvmYulBackend {
 ",
             );
 
-            let translator =
-                Translator::new(&layout_engine, &abi_gen, &top_level_fns, self.rich_reverts);
+            let translator = Translator::new(
+                &layout_engine,
+                &abi_gen,
+                &top_level_fns,
+                &free_fns,
+                self.rich_reverts,
+            );
 
             let constructor_decl = global_class
                 .methods
@@ -1283,13 +1219,13 @@ impl EvmYulBackend {
                             offset += 32;
                             continue;
                         }
-                        // Same as the dispatcher: one wire word holding the tag, rebuilt into the [tag][payload] pair the body expects.
+
                         if is_enum_type(layout_engine.type_checker, &p.type_def) {
                             yul.push_str(&format!(
                                 "    let {}_raw := mload(add(args_mem, {}))\n",
                                 arg_name, offset
                             ));
-                            // Reject an out-of-range tag, matching Solidity's enum bounds check.
+
                             if let Type::Primitive(enum_name) = &p.type_def {
                                 if let Some(ed) =
                                     layout_engine.type_checker.loaded_enums.get(enum_name)
@@ -1310,8 +1246,6 @@ impl EvmYulBackend {
                         }
                         if let Type::Primitive(name) = &p.type_def {
                             if is_struct_type(layout_engine.type_checker, &p.type_def) {
-                                // A dynamic struct constructor arg sits behind an offset
-                                // word, like a dynamic array; a static one is inline.
                                 if translator.abi_is_dynamic(&p.type_def) {
                                     if let Some(helper) = translator.ensure_abi_dyn_struct_mem(name)
                                     {
@@ -1334,7 +1268,7 @@ impl EvmYulBackend {
                                 }
                             }
                         }
-                        // The dispatcher's array path, reading the blob the creation code appended instead of calldata.
+
                         if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
                             if let Some(helper) = translator.ensure_abi_mem(&p.type_def) {
                                 if translator.abi_is_dynamic(&p.type_def) {
@@ -1412,7 +1346,6 @@ impl EvmYulBackend {
                 r = runtime_obj
             ));
 
-            // End of deployment block
             yul.push_str("  }\n");
 
             yul.push_str(&format!("  object \"{}\" {{\n", runtime_obj));
@@ -1422,7 +1355,7 @@ impl EvmYulBackend {
 
             let has_ext = type_checker.has_external_calls.get();
             let muts = mutability::analyze_class(type_checker, global_class);
-            // Per-function refinement of has_ext: a state-changing entry point that never hands control away cannot be re-entered, so it needs no lock. Gated behind the contract-wide flag, so a guard is only ever dropped, never added.
+
             let ext = mutability::analyze_external_calls(type_checker, global_class);
 
             let find_fn = |pred: fn(&FnDecl) -> bool| -> Option<&FnDecl> {
@@ -1499,11 +1432,6 @@ impl EvmYulBackend {
                     let selector = abi_gen.calculate_selector(f);
                     yul.push_str(&format!("      case {} /* {} */ {{\n", selector, f.name));
 
-                    // A read-only function gets no guard, for two reasons that agree.
-                    // It cannot be harmed by reentrancy, since it writes nothing. And the ABI calls it view, which invites callers to use eth_call: the guard's tstore would revert inside that STATICCALL, making the getter uncallable.
-                    // A try thunk is entered only via a self-call from a site that
-                    // already holds the reentrancy lock, so re-checking it here would
-                    // make the self-call revert. Its capability guard is its gate.
                     let requires_guard = has_ext
                         && mutability::makes_external_call(f, &ext)
                         && !is_unsafe(f)
@@ -1606,15 +1534,12 @@ impl EvmYulBackend {
                                 }
                             }
 
-                            // An enum is one uint8 word on the wire holding the tag, but a pointer to [tag][payload] in memory, so it is rebuilt rather than copied.
-                            // Copying size_of(enum) = 64 bytes instead read the next argument as the payload and then read every later one past the end of calldata as zero.
                             if is_enum_type(layout_engine.type_checker, &p.type_def) {
                                 yul.push_str(&format!(
                                     "          let {}_raw := calldataload({})\n",
                                     arg_name, offset
                                 ));
-                                // Reject an out-of-range tag on the full word, matching Solidity's
-                                // enum bounds check, so no invalid variant can enter from calldata.
+
                                 if let Type::Primitive(enum_name) = &p.type_def {
                                     if let Some(ed) =
                                         layout_engine.type_checker.loaded_enums.get(enum_name)
@@ -1634,12 +1559,8 @@ impl EvmYulBackend {
                                 continue;
                             }
 
-                            // A static struct is inline in the head, so it advances the cursor by its whole wire width rather than the one word an offset would take.
                             if let Type::Primitive(name) = &p.type_def {
                                 if is_struct_type(layout_engine.type_checker, &p.type_def) {
-                                    // A dynamic struct (a struct with a String/Bytes/array
-                                    // field) sits behind an offset word like a dynamic
-                                    // array, decoded at add(4, that offset).
                                     if translator.abi_is_dynamic(&p.type_def) {
                                         if let Some(helper) =
                                             translator.ensure_abi_dyn_struct_cd(name)
@@ -1665,8 +1586,6 @@ impl EvmYulBackend {
                                 }
                             }
 
-                            // Every array shape resolves through one codec lookup, which recurses into its element, so a nested array decodes by the same path a flat one does.
-                            // A dynamic value sits behind an offset word and is decoded at add(4, that offset); a static one is inline and is decoded where the cursor already points.
                             if matches!(&p.type_def, Type::Array(_) | Type::FixedArray(..)) {
                                 if let Some(helper) = translator.ensure_abi_cd(&p.type_def) {
                                     if translator.abi_is_dynamic(&p.type_def) {
@@ -1747,7 +1666,7 @@ impl EvmYulBackend {
             }
 
             yul.push_str("    }\n");
-            // End of runtime object
+
             yul.push_str("  }\n");
 
             let mut shared_functions = String::new();
@@ -1762,10 +1681,6 @@ impl EvmYulBackend {
                     continue;
                 }
                 {
-                    // Must agree with the dispatcher's guard decision above: this is the other half of the same lock, the clear on the return path.
-                    // A read-only function takes neither, or its body would still TSTORE and revert under the STATICCALL its view invites.
-                    // A try thunk never owns the lock: it runs inside a site that
-                    // already holds it, so touching it here would double-manage it.
                     let requires_guard = has_ext
                         && mutability::makes_external_call(f, &ext)
                         && !is_unsafe(f)
@@ -1827,10 +1742,36 @@ impl EvmYulBackend {
                 "      function Block_number() -> ret {\n          ret := number()\n      }\n\n",
             );
 
+            for f in &type_checker.loaded_functions {
+                let fctx = Ctx::helper(None).with_return_type(f.return_type.clone());
+                for p in &f.parameters {
+                    fctx.declare(&p.name, &p.type_def);
+                }
+                let params: Vec<String> = f.parameters.iter().map(|p| p.name.clone()).collect();
+                let sig = if f.return_type.is_some() {
+                    format!(
+                        "      function gumfn_{}({}) -> ret {{\n",
+                        f.name,
+                        params.join(", ")
+                    )
+                } else {
+                    format!(
+                        "      function gumfn_{}({}) {{\n",
+                        f.name,
+                        params.join(", ")
+                    )
+                };
+                shared_functions.push_str(&sig);
+                for stmt in &f.body {
+                    for line in translator.translate_statement(&stmt.node, &fctx).lines() {
+                        shared_functions.push_str(&format!("          {}\n", line));
+                    }
+                }
+                shared_functions.push_str("      }\n\n");
+            }
+
             let instantiations = collect_generic_instantiations(program, type_checker);
-            // Walk class_order, the order classes were registered in, rather than loaded_classes directly.
-            // loaded_classes is a HashMap and Rust randomizes its iteration per process, so iterating it here emitted these functions in a different order on every run: same source, different (equivalent) bytecode, and no way to verify a deployed contract against its source.
-            // layout.rs already walks class_order for the same reason; this is the other half of it.
+
             let ordered: Vec<(&String, &ClassDecl)> = type_checker
                 .class_order
                 .iter()
@@ -1848,10 +1789,6 @@ impl EvmYulBackend {
                 }
 
                 if class_decl.generic_params.is_empty() {
-                    // The global contract's methods must come from the hoisted copy,
-                    // so an internally-called method with a try/catch gets the same
-                    // guarded self-call lowering as its entry does, not the inline
-                    // path that cannot catch internal reverts.
                     let methods = if class_name == &global_class_name {
                         &global_class.methods
                     } else {

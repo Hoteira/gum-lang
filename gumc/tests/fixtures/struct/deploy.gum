@@ -16,5 +16,5 @@ contract Child:
 
 contract Parent:
     export fn make_and_read(P p) -> u256:
-        var c = new Child(p)
+        var c = Child.new(p)
         return IChild(c).get_b()

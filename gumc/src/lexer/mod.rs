@@ -1,11 +1,9 @@
 use logos::Logos;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
-// skip whitespace and single-line comments
 #[logos(skip r"[ \t\n\f]+")]
 #[logos(skip(r"//.*", allow_greedy = true))]
 pub enum Token {
-    // Keywords
     #[token("use")]
     Use,
     #[token("global")]
@@ -39,7 +37,6 @@ pub enum Token {
     #[token("return")]
     Return,
 
-    // Types
     #[token("u8")]
     #[token("u16")]
     #[token("u32")]
@@ -58,7 +55,6 @@ pub enum Token {
     #[token("Account")]
     TypeKeyword,
 
-    // Symbols
     #[token("(")]
     LParen,
     #[token(")")]
@@ -77,8 +73,7 @@ pub enum Token {
     Comma,
     #[token(".")]
     Dot,
-    
-    // Operators
+
     #[token("=>")]
     FatArrow,
     #[token("->")]
@@ -110,7 +105,6 @@ pub enum Token {
     #[token("&&")]
     And,
 
-    // Literals and Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Identifier(String),
 
@@ -119,8 +113,4 @@ pub enum Token {
 
     #[regex(r#""([^"\\]|\\t|\\u|\\n|\\")*""#, |lex| lex.slice().to_string())]
     StringLiteral(String),
-
-    // Logos requires an error variant for unknown character sequences
-    // In newer logos versions, it returns a Result<Token, Error>, but we can keep it simple here.
-    // If you are using logos 0.13 or newer, errors are handled generically by lex.next() returning Result<Token, ()>.
 }

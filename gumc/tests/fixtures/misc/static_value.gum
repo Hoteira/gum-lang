@@ -1,0 +1,25 @@
+class MathBox:
+    u256 seed
+
+    fn new(self, u256 s):
+        self.seed = s
+
+    fn double(u256 a) -> u256:
+        return a * 2
+
+    fn combine(u256 a, u256 b) -> u256:
+        return MathBox.double(a) + b
+
+    fn scaled(self, u256 a) -> u256:
+        return self.seed * a
+
+contract C:
+    export fn run() -> u256:
+        return MathBox.combine(10, 5)
+
+    export fn nested() -> u256:
+        return MathBox.double(MathBox.double(3))
+
+    export fn on_instance() -> u256:
+        var m = MathBox.new(100)
+        return m.double(4) + m.scaled(2)

@@ -4,7 +4,7 @@ class Meta:
     u256 id
     String name
 
-    fn new(u256 i, String n):
+    fn new(self, u256 i, String n):
         self.id = i
         self.name = n
 

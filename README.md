@@ -154,6 +154,38 @@ contract Vault:                       // the on-chain state singleton
         return Vault.stakes[who].amount
 ```
 
+A plain `class` (no `contract`) is a value that lives in memory — a struct with
+methods, told apart the way Rust does it: a function that takes `self` is an
+instance method, called on a value; a function without `self` is an associated
+function, called on the type. A **constructor is not special** — it is any
+`self`-taking function called on the type, so a class can have several, named
+whatever you like, and there is no built-in `new`:
+
+```
+class Rational:                       // a value type, lives in memory
+    u256 num
+    u256 den
+
+    fn new(self, u256 n, u256 d):     // a constructor — Rational.new(1, 2)
+        self.num = n
+        self.den = d
+
+    fn whole(self, u256 n):           // another constructor — Rational.whole(3)
+        self.num = n
+        self.den = 1
+
+    fn scale(self, u256 k) -> u256:   // instance method — r.scale(10)
+        return self.num * k / self.den
+
+    fn half() -> Rational:            // associated fn (no self): a factory
+        return Rational.new(1, 2)
+
+contract C:
+    export fn f() -> u256:
+        var r = Rational.whole(3)     // construct via a named constructor
+        return r.scale(10)            // 30
+```
+
 Everything else you would expect:
 
 ```
@@ -183,7 +215,7 @@ catch:                                // on failure, the block's state rolled
 mut u256 x = 0                        // mutable local (immutable is the default)
 delete Vault.stakes[who]              // reset to zero, release the slots
 revert Insufficient(amt)              // custom error
-var c = new Child(arg)                // deploy another contract (CREATE)
+var c = Child.new(arg)                // deploy another contract (CREATE)
 to.transfer(amount)                   // send ETH; reverts on failure
 f"balance: {amt}"                     // interpolation, produces a String
 ```
@@ -302,7 +334,7 @@ deploying from many keys:
 ```
 [Test]
 fn only_owner_can_pause():
-    var v = new Vault()
+    var v = Vault.new()
     Vm.sender = 0x00000000000000000000000000000000000000AA   # not the owner
     IVault(v).pause()                                        # this call is from 0xAA
 ```
@@ -333,9 +365,9 @@ against, so they are verified against the EVM's own behaviour instead.
 | Storage vectors | a `Vec(T)` `contract` field is a storage vector: the same layout as `[T]`, and it takes either spelling (`v[i]`/`v.get(i)`, `.length`/`.len()`) |
 | `delete` | resets a scalar, packed field, mapping entry, array element, whole array, storage string, or struct, releasing the slots Solidity releases |
 | Control flow | `if/else`, `while`, `for ... in <array>` (memory or storage), `match` over enums |
-| Events | `log(Event, indexed(x), ...)` becomes a real `LOG1`-`LOG4` with canonical topic hashes, plus matching `"type": "event"` entries in the ABI JSON, so wallets, ethers/viem and Etherscan decode the logs. The schema is recorded at the `log()` site from the same values `topic0` is hashed from, so the ABI cannot describe an event the bytecode does not emit. The data area shares the ABI encoder the `interface` and `new Child(...)` paths use, so a string, an array or a tuple field is encoded head/tail rather than as a pointer. An indexed field must be one word, since a topic is 32 bytes |
+| Events | `log(Event, indexed(x), ...)` becomes a real `LOG1`-`LOG4` with canonical topic hashes, plus matching `"type": "event"` entries in the ABI JSON, so wallets, ethers/viem and Etherscan decode the logs. The schema is recorded at the `log()` site from the same values `topic0` is hashed from, so the ABI cannot describe an event the bytecode does not emit. The data area shares the ABI encoder the `interface` and `Child.new(...)` paths use, so a string, an array or a tuple field is encoded head/tail rather than as a pointer. An indexed field must be one word, since a topic is 32 bytes |
 | External calls | `interface` types (compiled to `CALL`), low-level `call target(payload)`, `to.pay(amount)` (returns success) and `to.transfer(amount)` (reverts on failure) to send ETH. A failing call bubbles the callee's own revert reason, byte for byte as Solidity does. A `try:` / `catch:` block recovers from a revert instead of bubbling it — and unlike Solidity's (external-calls-only) `try`, gum's wraps an **arbitrary block** and catches *any* revert inside it, internal or external (a failed `assert`, an overflow, an internal call, as well as an external one): the body runs in a self-call frame that rolls its state back on failure, then `catch` runs. `addr.code.len()` gives the callee's code size (`EXTCODESIZE`), e.g. to skip the `onERC721Received` hook for a plain wallet |
-| Deploying contracts | `new SomeContract(args)` becomes `CREATE`, with the child's creation code embedded in the deployer; or `Account.create`/`create2`/`create2_address` from raw bytecode, for proxies and EIP-1167 clones |
+| Deploying contracts | `SomeContract.new(args)` becomes `CREATE`, with the child's creation code embedded in the deployer; or `Account.create`/`create2`/`create2_address` from raw bytecode, for proxies and EIP-1167 clones |
 | Bare ETH | `export payable fn receive():` for a plain send, `export fn fallback():` for an unmatched selector |
 | Const fields | `const` `contract` fields, assigned once in `fn new`, never storage. One keyword, and the compiler picks the mechanism: a value it can evaluate is inlined (byte for byte the same code as writing the literal); a value that only exists at deploy, like a constructor argument, is written into the runtime bytecode there (Yul `setimmutable`). Either way a read is ~3 gas, not a cold `SLOAD`: measured 21,160 vs 23,246, and ~15.8k cheaper to deploy. Assignment is checked on every path through the constructor. Not usable behind a proxy, see [STORAGE.md](STORAGE.md) |
 | Transient storage | `transient` `contract` fields (EIP-1153): scalars, mappings, arrays and strings, with the same layout as their persistent twins in their own keyspace. ~100 gas against `SSTORE`'s 2,900-20,000. Solidity's `transient` is value-types-only, so the collections have no twin to diff against |
@@ -344,7 +376,7 @@ against, so they are verified against the EVM's own behaviour instead.
 | Safety | checked arithmetic, reentrancy guards on by default (transient storage; `unsafe fn` opts out), nonpayable guard, calldata-length validation, address masking, returndata checks, array-bounds `Panic(0x32)` in memory and storage |
 | Upgrades | storage-layout lockfile (`--lock`) pins committed fields and errors on unsafe changes |
 | Reproducible builds | the same source always compiles to byte-identical bytecode, which is what lets a deployed contract be verified against its source. Emission order is stable everywhere (slots, helpers, class methods), never a randomized hash-map walk. Asserted by a test that compiles a reference contract in separate processes and diffs the output |
-| ABI | standard 4-byte selectors; `address`/`uintN`/`bytesN`/`bool`, `string`/`bytes`, `T[]`, `T[N]`, an `enum` as `uint8`, a `class` as a `tuple` — of scalar fields (a static tuple) or with `string`/`bytes`/array fields (a dynamic tuple, head/tail encoded) — and arrays of any of those nested to any depth (`T[][]`, `T[][2]`, `T[3][]`, `tuple[2]`, `tuple[][]`), including arrays of dynamic elements (`string[]`, `string[N]`, `string[][]`). Each works in every direction: arguments, returns, constructor arguments, `new Child(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied. `stateMutability` is inferred: a function that writes nothing is `view`, one that touches no chain state at all is `pure`, so wallets and explorers render getters as reads rather than as write buttons. The inference is a whitelist, so anything it cannot prove read-only stays `nonpayable` |
+| ABI | standard 4-byte selectors; `address`/`uintN`/`bytesN`/`bool`, `string`/`bytes`, `T[]`, `T[N]`, an `enum` as `uint8`, a `class` as a `tuple` — of scalar fields (a static tuple) or with `string`/`bytes`/array fields (a dynamic tuple, head/tail encoded) — and arrays of any of those nested to any depth (`T[][]`, `T[][2]`, `T[3][]`, `tuple[2]`, `tuple[][]`), including arrays of dynamic elements (`string[]`, `string[N]`, `string[][]`). Each works in every direction: arguments, returns, constructor arguments, `Child.new(...)` arguments, and `interface` calls both out and back. A struct's fields cross in declaration order while memory packs them widest-first, so each field is moved individually rather than block-copied. `stateMutability` is inferred: a function that writes nothing is `view`, one that touches no chain state at all is `pure`, so wallets and explorers render getters as reads rather than as write buttons. The inference is a whitelist, so anything it cannot prove read-only stays `nonpayable` |
 
 Reference contracts live in [`examples/`](examples/): [`token`](examples/token.gum),
 [`amm`](examples/amm.gum), [`erc20`](examples/erc20.gum),

@@ -21,7 +21,7 @@ contract Factory:
 
     export fn make(u256 x) -> Account:
         Factory.count = Factory.count + 1
-        var c = new Child(x)
+        var c = Child.new(x)
         Factory.last = c
         return c
 

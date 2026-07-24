@@ -11,8 +11,7 @@ pub struct AbiInput {
     pub type_name: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub components: Vec<AbiInput>,
-    // Event fields only: whether this field is a LOG topic rather than data.
-    // None for function and constructor inputs, where the key must be absent because indexed is not part of their ABI shape.
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub indexed: Option<bool>,
 }
@@ -31,17 +30,15 @@ impl AbiInput {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AbiEntry {
     #[serde(rename = "type")]
-    // "function", "constructor", "error", "event"
     pub entry_type: String,
     pub name: String,
     pub inputs: Vec<AbiInput>,
-    // Option rather than always emitted, so an event omits these keys
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<AbiInput>>,
     #[serde(rename = "stateMutability", skip_serializing_if = "Option::is_none")]
-    // "nonpayable", "view", "pure", "payable"
     pub state_mutability: Option<String>,
-    // Events only, and always Some(false): gum has no anonymous event syntax, but the key is required for the entry to be well formed
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
 }
@@ -55,51 +52,44 @@ impl<'a> AbiGenerator<'a> {
         Self { type_checker }
     }
 
-    // Account maps to address, the u256 field is only a storage convenience and gets masked to 160 bits
     pub fn map_type(&self, type_def: &Type) -> String {
         match type_def {
-            Type::Primitive(name) => {
-                match name.as_str() {
-                    "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => {
-                        format!("uint{}", name[1..].to_string())
-                    }
-                    "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => {
-                        format!("int{}", name[1..].to_string())
-                    }
-                    "Address" | "Account" => "address".to_string(),
-                    "bool" => "bool".to_string(),
-                    // fp types are turned to i256 for WAD ops and ABI comp
-                    "f32" | "f64" => "int256".to_string(),
-                    "Message" => "Message".to_string(),
-                    "Block" => "Block".to_string(),
-                    _ if crate::codegen::translator::byte_width(name).is_some() => {
-                        format!(
-                            "bytes{}",
-                            crate::codegen::translator::byte_width(name).unwrap()
-                        )
-                    }
-                    _ => {
-                        if name == "String" {
-                            "string".to_string()
-                        } else if name == "Bytes" {
-                            "bytes".to_string()
-                        } else if self.type_checker.loaded_classes.contains_key(name) {
-                            "tuple".to_string()
-                        } else if self.type_checker.loaded_enums.contains_key(name) {
-                            "uint8".to_string()
-                        } else {
-                            "uint256".to_string()
-                        }
+            Type::Primitive(name) => match name.as_str() {
+                "u8" | "u16" | "u32" | "u64" | "u128" | "u256" => {
+                    format!("uint{}", name[1..].to_string())
+                }
+                "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => {
+                    format!("int{}", name[1..].to_string())
+                }
+                "Address" | "Account" => "address".to_string(),
+                "bool" => "bool".to_string(),
+
+                "f32" | "f64" => "int256".to_string(),
+                "Message" => "Message".to_string(),
+                "Block" => "Block".to_string(),
+                _ if crate::codegen::yul::byte_width(name).is_some() => {
+                    format!("bytes{}", crate::codegen::yul::byte_width(name).unwrap())
+                }
+                _ => {
+                    if name == "String" {
+                        "string".to_string()
+                    } else if name == "Bytes" {
+                        "bytes".to_string()
+                    } else if self.type_checker.loaded_classes.contains_key(name) {
+                        "tuple".to_string()
+                    } else if self.type_checker.loaded_enums.contains_key(name) {
+                        "uint8".to_string()
+                    } else {
+                        "uint256".to_string()
                     }
                 }
-            }
+            },
             Type::Array(inner) => format!("{}[]", self.map_type(inner)),
             Type::FixedArray(inner, size) => format!("{}[{}]", self.map_type(inner), size),
             _ => "uint256".to_string(),
         }
     }
 
-    // The type as it appears in a function signature -> structs are spelled out as their component tuple
     pub fn signature_type(&self, type_def: &Type) -> String {
         match type_def {
             Type::Array(inner) => format!("{}[]", self.signature_type(inner)),
@@ -122,7 +112,6 @@ impl<'a> AbiGenerator<'a> {
         }
     }
 
-    // Unwraps to the element type first so an array of structs still reports the struct's fields
     pub fn generate_components(&self, type_def: &Type) -> Vec<AbiInput> {
         if let Type::Array(inner) | Type::FixedArray(inner, _) = type_def {
             return self.generate_components(inner);
@@ -147,7 +136,6 @@ impl<'a> AbiGenerator<'a> {
         Vec::new()
     }
 
-    // The ABI JSON for one contract: constructor, exported functions and errors, with events appended by the caller from the translator's registry.
     pub fn generate_abi(&self, program: &Program, class: &ClassDecl) -> Vec<AbiEntry> {
         let mut entries = Vec::new();
         let muts = analyze_class(self.type_checker, class);
@@ -169,7 +157,7 @@ impl<'a> AbiGenerator<'a> {
 
             entries.push(AbiEntry {
                 entry_type: "constructor".to_string(),
-                // constructors do not have a name in the ABI
+
                 name: "".to_string(),
                 inputs,
                 outputs: Some(Vec::new()),
@@ -254,8 +242,6 @@ impl<'a> AbiGenerator<'a> {
         entries
     }
 
-    // Builds the ABI entry for one event, from the schema the translator
-    // recorded at its log() site
     pub fn event_entry(name: &str, inputs: Vec<AbiInput>) -> AbiEntry {
         AbiEntry {
             entry_type: "event".to_string(),
@@ -267,7 +253,6 @@ impl<'a> AbiGenerator<'a> {
         }
     }
 
-    // The 4-byte selector for an entry point, with any tuple expanded to its component types, e.g. (uint256,address).
     pub fn calculate_selector(&self, f: &FnDecl) -> String {
         let mut sig = format!("{}(", f.name);
 

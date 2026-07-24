@@ -1,5 +1,0 @@
-use gum.defaults.Account
-
-contract Test:
-    fn is_contract(Account addr) -> bool:
-        return addr.code.len() > 0

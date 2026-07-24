@@ -92,7 +92,7 @@ contract ERC721:
                 if !self.operator_approvals[owner][sender]:
                     revert ERC721Errors.ERC721InsufficientApproval(sender, token_id)
                     
-        // Clear approval
+        
         self.token_approvals[token_id] = Account(0)
         
         self.balances[from] = self.balances[from] - 1
@@ -107,7 +107,7 @@ contract ERC721:
             
         Account existing_owner = self.owners[token_id]
         if existing_owner != Account(0):
-            revert ERC721Errors.ERC721InvalidSender(Account(0)) // already minted
+            revert ERC721Errors.ERC721InvalidSender(Account(0)) 
             
         self.balances[to] = self.balances[to] + 1
         self.owners[token_id] = to

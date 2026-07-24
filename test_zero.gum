@@ -1,5 +1,0 @@
-use gum.defaults.Account
-
-contract Test:
-    fn zeroAccount() -> Account:
-        return 0

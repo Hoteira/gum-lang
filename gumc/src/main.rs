@@ -1,20 +1,17 @@
-pub mod lexer;
-pub mod indent;
-pub mod stdlib;
-pub mod parser;
 pub mod ast;
-pub mod semantic;
 pub mod codegen;
+pub mod indent;
+pub mod lexer;
+pub mod parser;
 pub mod runner;
+pub mod semantic;
+pub mod stdlib;
 
 use clap::{Arg, ArgAction, Command};
 use codegen::Backend;
 use std::fs;
 use std::path::Path;
 
-// Assembles a Yul object into deployable EVM bytecode by driving solc
-// --strict-assembly. gumc's own backend stops at Yul (the standard portable
-// EVM IR); solc's battle-tested Yul->EVM pipeline (optimizer + assembler) is
 fn assemble_yul(yul: &str, solc_path: &str) -> Result<String, String> {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("gumc_{}.yul", std::process::id()));
@@ -38,7 +35,10 @@ fn assemble_yul(yul: &str, solc_path: &str) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if !output.status.success() {
-        return Err(format!("solc rejected the generated Yul:\n{}{}", stdout, stderr));
+        return Err(format!(
+            "solc rejected the generated Yul:\n{}{}",
+            stdout, stderr
+        ));
     }
 
     stdout
@@ -48,7 +48,12 @@ fn assemble_yul(yul: &str, solc_path: &str) -> Result<String, String> {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| format!("could not find bytecode in solc output:\n{}{}", stdout, stderr))
+        .ok_or_else(|| {
+            format!(
+                "could not find bytecode in solc output:\n{}{}",
+                stdout, stderr
+            )
+        })
 }
 
 fn main() {
@@ -92,7 +97,7 @@ fn main() {
         .get_matches();
 
     let file_path = matches.get_one::<String>("file").unwrap();
-    // Only local imports need a root, and the source file's own directory is the only sensible one. The standard library is compiled in, so nothing has to be found on disk for use gum. to work.
+
     let base_dir = Path::new(file_path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -114,7 +119,11 @@ fn main() {
             let mut type_checker = semantic::TypeChecker::new();
             if let Err(errors) = type_checker.check(ast.clone(), &base_dir) {
                 let n = errors.len();
-                println!("\n{} semantic error{} found:", n, if n == 1 { "" } else { "s" });
+                println!(
+                    "\n{} semantic error{} found:",
+                    n,
+                    if n == 1 { "" } else { "s" }
+                );
                 for (i, e) in errors.iter().enumerate() {
                     println!("  {}. {}", i + 1, e);
                 }
@@ -138,8 +147,7 @@ fn main() {
                                 Some(c) => c,
                                 None => continue,
                             };
-                            // A test is any [Test] function taking no
-                            // arguments; a plain fn beside it is a helper.
+
                             let test_fns: Vec<String> = class
                                 .methods
                                 .iter()
@@ -174,7 +182,11 @@ fn main() {
                                             println!("  ok    {}", o.name);
                                         } else {
                                             failed += 1;
-                                            println!("  FAIL  {} -- {}", o.name, o.reason.as_deref().unwrap_or(""));
+                                            println!(
+                                                "  FAIL  {} -- {}",
+                                                o.name,
+                                                o.reason.as_deref().unwrap_or("")
+                                            );
                                         }
                                     }
                                 }
@@ -185,7 +197,9 @@ fn main() {
                             }
                         }
                         if total == 0 {
-                            println!("\nno tests found. Mark a no-argument function with '[Test]' to run it as a test.");
+                            println!(
+                                "\nno tests found. Mark a no-argument function with '[Test]' to run it as a test."
+                            );
                         } else {
                             println!(
                                 "\n{} test{}, {} passed, {} failed",
@@ -209,14 +223,20 @@ fn main() {
                                 .unwrap_or("solc");
                             match assemble_yul(&yul, solc) {
                                 Ok(hex) => {
-                                    println!("\n--> [Assembler] {} EVM bytecode ({} bytes):", name, hex.len() / 2);
+                                    println!(
+                                        "\n--> [Assembler] {} EVM bytecode ({} bytes):",
+                                        name,
+                                        hex.len() / 2
+                                    );
                                     if let Some(out_path) = matches.get_one::<String>("output") {
                                         let file_path = if out_path.ends_with(".bin") {
                                             out_path.replace(".bin", &format!("_{}.bin", name))
                                         } else {
                                             format!("{}_{}.bin", out_path, name)
                                         };
-                                        if let Err(e) = fs::write(&file_path, format!("0x{}\n", hex)) {
+                                        if let Err(e) =
+                                            fs::write(&file_path, format!("0x{}\n", hex))
+                                        {
                                             eprintln!("Could not write '{}': {}", file_path, e);
                                             std::process::exit(1);
                                         }
@@ -241,7 +261,11 @@ fn main() {
         }
         Err(errors) => {
             let n = errors.len();
-            println!("\n{} syntax error{} found:", n, if n == 1 { "" } else { "s" });
+            println!(
+                "\n{} syntax error{} found:",
+                n,
+                if n == 1 { "" } else { "s" }
+            );
             for (i, e) in errors.iter().enumerate() {
                 println!("  {}. {}", i + 1, e);
             }

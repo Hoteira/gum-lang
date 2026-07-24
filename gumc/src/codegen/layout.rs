@@ -4,7 +4,6 @@ use crate::semantic::TypeChecker;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-// One field's committed on-chain position, as persisted in the storage lock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldLoc {
     pub slot: usize,
@@ -19,11 +18,6 @@ pub struct ClassLayout {
     pub fields: BTreeMap<String, FieldLoc>,
 }
 
-// The storage-layout lockfile. Written at deploy time and thereafter treated
-// as immutable ground truth: existing fields keep their exact slot/offset
-// across recompiles (so an upgraded implementation reads the same storage the
-// proxy already holds), new fields are appended into free space, and any
-// change that would move or reinterpret a committed field is a hard error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageManifest {
     pub version: u32,
@@ -49,24 +43,15 @@ impl StorageManifest {
     }
 }
 
-// Where a storage-backed field lives: a 32-byte-aligned slot number, plus
-// the byte range within that slot it occupies (so several small fields can
-// share one slot, the classic Solidity-style packing optimization).
 #[derive(Debug, Clone, Copy)]
 pub struct StorageField {
     pub slot: usize,
     pub offset_in_slot: usize,
     pub size: usize,
-    // Transient storage (EIP-1153) rather than persistent. THey have separate
-    // keyspace, so this slot number is only meaningful together with this
-    // flag, tslot 0 and sslot 0 are different locations.
+
     pub is_transient: bool,
 }
 
-// Where a memory-backed (non-global class instance) field lives: a byte
-// offset from the struct's base pointer, plus its width. Memory is
-// byte-addressable, so unlike storage this needs no slot bookkeeping
-// fields are packed back-to-back with no padding.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryField {
     pub offset: usize,
@@ -77,17 +62,11 @@ pub struct LayoutEngine<'a> {
     pub type_checker: &'a TypeChecker,
     pub storage_fields: HashMap<String, StorageField>,
     pub memory_fields: HashMap<String, MemoryField>,
-    // Total packed size of each class's own memory representation, keyed by
-    // class name. Used by size_of instead of a naive "32 bytes per field".
+
     packed_class_size: HashMap<String, usize>,
-    // Per-class relative storage layout (slots numbered from 0), keyed
-    // "Class.field". Used for structs living in storage, e.g. a struct value
-    // inside a mapping, where each field sits at base_slot + this slot, with
-    // this offset/size within that slot. Distinct from storage_fields, which
-    // is the absolute layout of global singleton classes.
+
     struct_storage_fields: HashMap<String, StorageField>,
-    // If a storage lock was supplied, this is the layout actually used
-    // committed fields honored, new fields placed, ready to be written back.
+
     pub manifest_out: StorageManifest,
 }
 
@@ -117,9 +96,6 @@ impl<'a> LayoutEngine<'a> {
         Ok(engine)
     }
 
-    // Relative storage layout for every class (slots from 0), so a struct held
-    // in storage, e.g. as a mapping's value, knows each field's slot offset
-    // and packing. Same packer as global storage, just base slot 0.
     fn allocate_struct_layouts(&mut self) {
         for (class_name, class_decl) in self.ordered_classes() {
             let (fields, _next) = self.pack_storage_fields(&class_decl.fields, 0, false);
@@ -136,9 +112,6 @@ impl<'a> LayoutEngine<'a> {
             .copied()
     }
 
-    // Real byte width of a scalar integer/bool type. Everything else (u256,
-    // i256, f32/f64, these represent full-width fixed-point values, not
-    // native 32/64-bit floats, classes, enums, arrays, generics) keeps
     fn scalar_byte_width(type_def: &Type) -> Option<usize> {
         if let Type::Primitive(name) = type_def {
             return match name.as_str() {
@@ -164,9 +137,6 @@ impl<'a> LayoutEngine<'a> {
         Self::scalar_byte_width(type_def).unwrap_or_else(|| self.size_of(type_def))
     }
 
-    // Shared by both packers: order fields largest-first (stable on
-    // declaration order for ties) so the greedy bin-fill below packs well
-    // without needing a smarter bin-packing algorithm.
     fn size_sorted_indices(&self, fields: &[ClassField]) -> Vec<usize> {
         let mut order: Vec<usize> = (0..fields.len()).collect();
         order.sort_by(|&a, &b| {
@@ -177,9 +147,6 @@ impl<'a> LayoutEngine<'a> {
         order
     }
 
-    // Packs a class's fields into 32-byte storage slots, largest fields
-    // first, filling in smaller ones wherever they still fit, this is the
-    // manual optimization Solidity asks the author to do by hand; here the
     fn pack_storage_fields(
         &self,
         fields: &[ClassField],
@@ -228,8 +195,6 @@ impl<'a> LayoutEngine<'a> {
         (layout, next_free_slot)
     }
 
-    // Packs a class's fields into a contiguous memory buffer, largest first.
-    // No slot alignment needed, mload/mstore can address any byte offset.
     fn pack_memory_fields(&self, fields: &[ClassField]) -> (HashMap<String, MemoryField>, usize) {
         let mut layout = HashMap::new();
         let mut offset = 0usize;
@@ -242,9 +207,6 @@ impl<'a> LayoutEngine<'a> {
         (layout, offset)
     }
 
-    // Both passes below walk class_order, the order classes were first
-    // registered in (declaration order locally, then import order), rather
-    // than loaded_classes directly. loaded_classes is a HashMap, and Rust
     fn ordered_classes(&self) -> Vec<(String, ClassDecl)> {
         self.type_checker
             .class_order
@@ -297,7 +259,7 @@ impl<'a> LayoutEngine<'a> {
                     committed,
                     &mut append,
                 )?,
-                // The returned next-free slot is discarded: append is per-class, and the transient pass below starts its own keyspace at 0.
+
                 None => self.pack_storage_fields(&persistent, append, false).0,
             };
             let (tlayout, _) = self.pack_storage_fields(&transient, 0, true);
@@ -332,9 +294,6 @@ impl<'a> LayoutEngine<'a> {
         Ok(())
     }
 
-    // Packs a class under an existing storage lock: every committed field keeps
-    // its exact slot/offset; new fields are placed into leftover space (a tail
-    // gap in a committed slot, or a fresh slot beyond all committed storage).
     fn pack_storage_fields_locked(
         &self,
         class_name: &str,
@@ -440,24 +399,18 @@ impl<'a> LayoutEngine<'a> {
         Ok(layout)
     }
 
-    // Computes the memory size (in bytes) of a given type.
-    // This groups variables into structs so we avoid the 16-var EVM stack limit.
     pub fn size_of(&self, type_def: &Type) -> usize {
         match type_def {
             Type::Primitive(name) => {
                 if let Some(w) = Self::scalar_byte_width(type_def) {
                     w
                 } else if name == "u256" || name == "i256" || name == "f32" || name == "f64" {
-                    // full EVM word
                     32
                 } else if let Some(&packed) = self.packed_class_size.get(name) {
                     packed
                 } else if self.type_checker.loaded_classes.contains_key(name) {
-                    // class known but not yet laid out
                     32
                 } else if self.type_checker.loaded_enums.contains_key(name) {
-                    // A payload-free enum is a tag and nothing else, so it is one byte, exactly as Solidity lays an enum out. Saying 64 here was the root of a family of bugs: it burned two storage slots instead of one byte, displaced every field after it, and made the mapping/log paths write the memory pointer instead of the value.
-                    // A payload-carrying enum keeps the [tag][payload] pair, which only exists in memory; it is rejected anywhere that needs a size, so this number is never used to lay one out.
                     if self.type_checker.enum_has_payload(name) {
                         64
                     } else {
@@ -468,10 +421,7 @@ impl<'a> LayoutEngine<'a> {
                 }
             }
             Type::FixedArray(inner, size) => self.size_of(inner) * size,
-            Type::Array(_) => {
-                // dynamic arrays are a 32-byte pointer
-                32
-            }
+            Type::Array(_) => 32,
             Type::Generic { .. } => 32,
         }
     }
@@ -488,9 +438,6 @@ impl<'a> LayoutEngine<'a> {
             .copied()
     }
 
-    // The type of class_name.property if it is an immutable field.
-    //
-    // Immutables own no slot, so storage_field returns None for them, the
     pub fn immutable_field(&self, class_name: &str, property: &str) -> Option<Type> {
         let class = self.type_checker.loaded_classes.get(class_name)?;
         class
@@ -500,7 +447,6 @@ impl<'a> LayoutEngine<'a> {
             .map(|f| f.type_def.clone())
     }
 
-    // Every const field of a contract, in declaration order.
     pub fn immutable_fields(&self, class_name: &str) -> Vec<ClassField> {
         self.type_checker
             .loaded_classes
@@ -509,9 +455,6 @@ impl<'a> LayoutEngine<'a> {
             .unwrap_or_default()
     }
 
-    // The const fields that still need a deploy-time patch, i.e. those the
-    // compiler could not fold to a compile-time value.
-    //
     pub fn patched_immutables(&self, class_name: &str) -> Vec<String> {
         self.immutable_fields(class_name)
             .iter()
@@ -520,7 +463,6 @@ impl<'a> LayoutEngine<'a> {
             .collect()
     }
 
-    // The compile-time value of a const field, when the constructor gives it
     pub fn const_field_value(&self, class_name: &str, field: &str) -> Option<String> {
         let class = self.type_checker.loaded_classes.get(class_name)?;
         let f = class
@@ -550,7 +492,6 @@ impl<'a> LayoutEngine<'a> {
             _ => return None,
         };
         if signed {
-            // two's-complement bounds need their own reasoning
             return None;
         }
         if bits < 128 && n > (1u128 << bits) - 1 {
@@ -560,7 +501,6 @@ impl<'a> LayoutEngine<'a> {
     }
 }
 
-// Whether e names Class.field (or self.field inside a method).
 fn targets(e: &Expr, class_name: &str, field: &str) -> bool {
     match e {
         Expr::PropertyAccess { base, property } => {
@@ -571,7 +511,6 @@ fn targets(e: &Expr, class_name: &str, field: &str) -> bool {
     }
 }
 
-// How many times body assigns Class.field, at any depth.
 fn count_assignments(body: &[Spanned<Statement>], class_name: &str, field: &str) -> usize {
     body.iter()
         .map(|s| match &s.node {
@@ -596,7 +535,6 @@ fn count_assignments(body: &[Spanned<Statement>], class_name: &str, field: &str)
         .sum()
 }
 
-// Width and signedness of a primitive integer type name.
 fn numeric_meta(name: &str) -> Option<(usize, bool)> {
     match name {
         "u8" => Some((8, false)),
@@ -610,9 +548,6 @@ fn numeric_meta(name: &str) -> Option<(usize, bool)> {
     }
 }
 
-// The Yul loadimmutable/setimmutable key for a field. Namespaced by class
-// so two contracts in one file (one nested inside the other's object) cannot
-// collide on a bare field name.
 pub fn immutable_key(class_name: &str, field: &str) -> String {
     format!("{}_{}", class_name, field)
 }

@@ -1,8 +1,8 @@
 use gum.defaults.Account
 use gum.defaults.Message
 
-// The indexed fields become searchable LOG topics, so wallets and indexers can
-// filter transfers by account.
+
+
 enum TokenLogs:
     Transfer
     Mint
@@ -37,7 +37,7 @@ contract TokenState:
 
         log(TokenLogs.Mint, indexed(to), amount)
 
-    // No export, so this is internal and gets no ABI selector.
+    
     fn calculate_bonus(u256 amount) -> u256:
         return amount / 100
 

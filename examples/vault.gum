@@ -1,8 +1,8 @@
 use gum.defaults.Account
 use gum.defaults.Message
 
-// A staking vault. Exercises a struct stored inside a mapping
-// (mapping(address => Stake)), the pattern behind vaults, orders, positions.
+
+
 class Stake:
     u256 amount
     u256 since

@@ -71,9 +71,11 @@ pub struct Spanned<T> {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub modifiers: Vec<String>,
-    // attributes over the fn body, es. [Test]
+
     pub attributes: Vec<String>,
     pub name: String,
+
+    pub has_self: bool,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<Type>,
     pub body: Vec<Spanned<Statement>>,
@@ -147,8 +149,7 @@ pub enum Statement {
         writeback: Vec<(String, Type)>,
         catch_body: Vec<Spanned<Statement>>,
     },
-    // Synthesized only: return the given captured variables as an ABI tuple, the
-    // fall-through payload of a try thunk that writes variables back to its caller.
+
     ReturnCaptures(Vec<(String, Type)>),
     Match {
         expr: Expr,
@@ -181,6 +182,11 @@ pub enum Expr {
     },
     Instantiation {
         type_def: Type,
+        args: Vec<Expr>,
+    },
+    StaticCall {
+        type_def: Type,
+        method: String,
         args: Vec<Expr>,
     },
     PropertyAccess {

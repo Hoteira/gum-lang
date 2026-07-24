@@ -1,0 +1,29 @@
+use gum.defaults.vec
+use gum.defaults.min
+use gum.defaults.max
+use gum.defaults.clamp
+
+contract App:
+    export fn vec_ops() -> u256:
+        mut Vec(u256) v = Vec(u256).new()
+        v = v.push(10)
+        v = v.push(20)
+        v.set(0, 99)
+        mut u256 last = v.pop()
+        return last + v.get(0)
+
+    export fn is_empty_check() -> bool:
+        mut Vec(u256) v = Vec(u256).new()
+        return v.is_empty()
+
+    export fn math(u256 a, u256 b) -> u256:
+        return min(a, b) + max(a, b) + clamp(a, 5, 15)
+
+    export fn umax() -> u256:
+        return u256.max()
+
+    export fn umin() -> u256:
+        return u256.min()
+
+    export fn small_max() -> u8:
+        return u8.max()
